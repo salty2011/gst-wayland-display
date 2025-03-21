@@ -162,6 +162,7 @@ impl ElementImpl for WaylandDisplaySrc {
         static PAD_TEMPLATES: Lazy<Vec<gst::PadTemplate>> = Lazy::new(|| {
             let caps = gst_video::VideoCapsBuilder::new()
                 .format(VideoFormat::Rgbx)
+                .format(VideoFormat::Rgb10a2)
                 .height_range(..i32::MAX)
                 .width_range(..i32::MAX)
                 .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
@@ -211,6 +212,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
     fn caps(&self, filter: Option<&gst::Caps>) -> Option<gst::Caps> {
         let mut caps = VideoCapsBuilder::new()
             .format(VideoFormat::Rgbx)
+            .format(VideoFormat::Rgb10a2)
             .height_range(..i32::MAX)
             .width_range(..i32::MAX)
             .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
@@ -314,6 +316,44 @@ impl BaseSrcImpl for WaylandDisplaySrc {
 
     fn set_caps(&self, caps: &gst::Caps) -> Result<(), gst::LoggableError> {
         let video_info = gst_video::VideoInfo::from_caps(caps).expect("failed to get video info");
+        
+        // Handle HDR metadata if present
+        if let Some(structure) = caps.structure(0) {
+            if let Ok(mastering_display_info) = structure.get::<gst::Structure>("mastering-display-info") {
+                let hdr_meta = HdrMetadata {
+                    eotf: Eotf::St2084, // Default to HDR10
+                    mastering_display_info: Some(MasteringDisplayInfo {
+                        display_primaries: [
+                            DisplayPrimary {
+                                x: mastering_display_info.get::<u16>("red-x").unwrap_or(0),
+                                y: mastering_display_info.get::<u16>("red-y").unwrap_or(0),
+                            },
+                            DisplayPrimary {
+                                x: mastering_display_info.get::<u16>("green-x").unwrap_or(0),
+                                y: mastering_display_info.get::<u16>("green-y").unwrap_or(0),
+                            },
+                            DisplayPrimary {
+                                x: mastering_display_info.get::<u16>("blue-x").unwrap_or(0),
+                                y: mastering_display_info.get::<u16>("blue-y").unwrap_or(0),
+                            },
+                        ],
+                        white_point: ChromaticityCoordinate {
+                            x: mastering_display_info.get::<u16>("white-x").unwrap_or(0),
+                            y: mastering_display_info.get::<u16>("white-y").unwrap_or(0),
+                        },
+                        max_display_mastering_luminance: mastering_display_info.get::<u32>("max-luminance").unwrap_or(100),
+                        min_display_mastering_luminance: mastering_display_info.get::<u32>("min-luminance").unwrap_or(0),
+                    }),
+                    content_light_level: Some(ContentLightLevel {
+                        max_content_light_level: mastering_display_info.get::<u16>("max-content-light-level").unwrap_or(100),
+                        max_frame_average_light_level: mastering_display_info.get::<u16>("max-frame-average-light-level").unwrap_or(100),
+                    }),
+                };
+                
+                self.state.lock().unwrap().as_mut().unwrap().display.set_hdr_metadata(hdr_meta);
+            }
+        }
+
         self.state
             .lock()
             .unwrap()

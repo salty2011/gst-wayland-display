@@ -500,6 +500,19 @@ pub(crate) fn init(
                     let time: Duration = state.clock.now().into();
                     state.pointer_axis(time.as_millis() as u32, AxisSource::Wheel, horizontal_amount * 3.0 / 120.0, vertical_amount * 3.0 / 120.0, Some(horizontal_amount), Some(vertical_amount));
                 }
+                Event::Msg(Command::HdrMetadata(metadata)) => {
+                    // Update HDR state
+                    if let Some(output) = &state.output {
+                        // Set HDR metadata on the output
+                        output.set_hdr_metadata(metadata);
+                        
+                        // Update buffer format if needed
+                        if let Some(video_info) = &mut state.video_info {
+                            // Update video info with HDR format
+                            video_info.set_format(gst_video::VideoFormat::Rgb10a2);
+                        }
+                    }
+                }
             };
         })
         .unwrap();
@@ -551,5 +564,13 @@ pub(crate) fn init(
         }
     }) {
         tracing::error!(?err, "Event loop broke.");
+    }
+}
+
+impl Output {
+    pub fn set_hdr_metadata(&mut self, metadata: HdrMetadata) {
+        // Set HDR metadata on the output
+        // This will be used by clients to configure their rendering
+        self.set_hdr_metadata(metadata);
     }
 }

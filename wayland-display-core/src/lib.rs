@@ -26,6 +26,7 @@ pub(crate) enum Command {
     PointerButton(u32, ButtonState),
     PointerAxis(f64, f64),
     Quit,
+    HdrMetadata(HdrMetadata),
 }
 
 #[derive(Clone)]
@@ -73,6 +74,7 @@ pub struct WaylandDisplay {
     pub tracer: Option<Tracer>,
     pub devices: MaybeRecv<Vec<CString>>,
     pub envs: MaybeRecv<Vec<CString>>,
+    hdr_state: HdrState,
 }
 
 pub enum MaybeRecv<T: Clone> {
@@ -120,6 +122,7 @@ impl WaylandDisplay {
             tracer: None,
             devices: MaybeRecv::Rx(devices_rx),
             envs: MaybeRecv::Rx(envs_rx),
+            hdr_state: HdrState::new(),
         })
     }
 
@@ -186,6 +189,18 @@ impl WaylandDisplay {
                 Err(gst::FlowError::Error)
             }
         }
+    }
+
+    pub fn set_hdr_metadata(&mut self, metadata: HdrMetadata) {
+        self.hdr_state.set_metadata(metadata);
+        // Send HDR metadata update to the compositor thread
+        if let Err(e) = self.command_tx.send(Command::HdrMetadata(metadata)) {
+            tracing::error!("Failed to send HDR metadata: {}", e);
+        }
+    }
+
+    pub fn supports_hdr(&self) -> bool {
+        self.hdr_state.supports_hdr()
     }
 }
 
