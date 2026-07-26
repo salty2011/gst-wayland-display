@@ -12,6 +12,7 @@ pub use smithay::backend::input::{ButtonState, KeyState};
 use smithay::utils::{Logical, Point};
 use std::ffi::{CString, c_char, c_void};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -109,6 +110,7 @@ pub struct WaylandDisplay {
     /// OUTPUT HDR state changes. Empty unless `WOLF_HDR_CM` is set; drained by
     /// [`WaylandDisplay::poll_hdr_state`].
     hdr_state_rx: Receiver<Command>,
+    app_surface_commits: Arc<AtomicU64>,
 
     pub tracer: Option<Tracer>,
     pub devices: MaybeRecv<Vec<CString>>,
@@ -140,6 +142,8 @@ impl WaylandDisplay {
         let (envs_tx, envs_rx) = std::sync::mpsc::channel();
         // Reverse channel (compositor -> element) for HDR-state notifications.
         let (hdr_state_tx, hdr_state_rx) = std::sync::mpsc::channel();
+        let app_surface_commits = Arc::new(AtomicU64::new(0));
+        let compositor_commits = Arc::clone(&app_surface_commits);
         let render_target = RenderTarget::from_str(
             &render_node.unwrap_or_else(|| String::from("/dev/dri/renderD128")),
         )?;
@@ -155,6 +159,7 @@ impl WaylandDisplay {
                     devices_tx,
                     envs_tx,
                     hdr_state_tx,
+                    compositor_commits,
                 );
             }) {
                 tracing::error!(?err, "Compositor thread panic'ed!");
@@ -166,6 +171,7 @@ impl WaylandDisplay {
             thread_handle: Some(thread_handle),
             command_tx,
             hdr_state_rx,
+            app_surface_commits,
             tracer: None,
             devices: MaybeRecv::Rx(devices_rx),
             envs: MaybeRecv::Rx(envs_rx),
@@ -181,6 +187,8 @@ impl WaylandDisplay {
         let (envs_tx, envs_rx) = std::sync::mpsc::channel();
         // Reverse channel (compositor -> element) for HDR-state notifications.
         let (hdr_state_tx, hdr_state_rx) = std::sync::mpsc::channel();
+        let app_surface_commits = Arc::new(AtomicU64::new(0));
+        let compositor_commits = Arc::clone(&app_surface_commits);
         let render_target = RenderTarget::from_str(
             &render_node.unwrap_or_else(|| String::from("/dev/dri/renderD128")),
         )?;
@@ -192,6 +200,7 @@ impl WaylandDisplay {
                 devices_tx,
                 envs_tx,
                 hdr_state_tx,
+                compositor_commits,
             );
         });
 
@@ -199,6 +208,7 @@ impl WaylandDisplay {
             thread_handle: Some(thread_handle),
             command_tx,
             hdr_state_rx,
+            app_surface_commits,
             tracer: None,
             devices: MaybeRecv::Rx(devices_rx),
             envs: MaybeRecv::Rx(envs_rx),
@@ -217,6 +227,11 @@ impl WaylandDisplay {
             .get()
             .iter()
             .map(|string| string.to_str().unwrap())
+    }
+
+    /// Lifetime count of new buffers committed by mapped top-level app surfaces.
+    pub fn app_surface_commits(&self) -> u64 {
+        self.app_surface_commits.load(Ordering::Relaxed)
     }
 
     pub fn add_input_device(&self, path: impl Into<String>) {

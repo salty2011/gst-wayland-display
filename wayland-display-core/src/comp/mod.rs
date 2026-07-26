@@ -66,6 +66,7 @@ use smithay::{
 };
 use std::os::fd::OwnedFd;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
 use std::{
     collections::HashSet,
     ffi::CString,
@@ -172,6 +173,9 @@ pub struct State {
     /// Last OUTPUT HDR state signalled. The stored-bool compare is the debounce: we only
     /// log + signal on an actual change. Defaults to `false` (SDR).
     last_hdr_state: bool,
+    /// Shared lifetime counter exported by waylanddisplaysrc. Only mapped
+    /// top-level application buffer commits increment it.
+    pub(crate) app_surface_commits: Arc<AtomicU64>,
     /// When the current candidate HDR<->SDR flip was first observed; the flip is only
     /// committed (TV switched) once it has held for [`HDR_DEBOUNCE`]. `None` = no pending
     /// flip. See [`State::update_hdr_state`].
@@ -437,6 +441,7 @@ impl State {
             frog_color_mgmt_global,
             hdr_state_tx: None,
             last_hdr_state: false,
+            app_surface_commits: Arc::new(AtomicU64::new(0)),
             hdr_candidate_since: None,
         }
     }
@@ -752,6 +757,7 @@ pub(crate) fn init(
     devices_tx: Sender<Vec<CString>>,
     envs_tx: Sender<Vec<CString>>,
     hdr_state_tx: Sender<Command>,
+    app_surface_commits: Arc<AtomicU64>,
 ) {
     let render_target = render.into();
     let _ = devices_tx.send(render_target.clone().as_devices());
@@ -768,6 +774,7 @@ pub(crate) fn init(
     let libinput_backend = LibinputInputBackend::new(libinput_context);
 
     let mut state = State::new(&render_target, &dh, &input_context, event_loop.handle());
+    state.app_surface_commits = app_surface_commits;
 
     // Wire the compositor -> element HDR-state reverse channel only under WOLF_HDR_CM;
     // unset leaves `hdr_state_tx` as `None`, making the per-frame HDR check a no-op.

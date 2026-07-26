@@ -329,6 +329,15 @@ impl ObjectImpl for WaylandDisplaySrc {
                     )
                     .default_value(false)
                     .build(),
+                glib::ParamSpecUInt64::builder("app-surface-commits")
+                    .nick("Application surface buffer commits")
+                    .blurb(
+                        "Lifetime count of new buffers committed by the mapped fullscreen \
+                         top-level application surface; excludes cursor, popup and \
+                         configure-only commits.",
+                    )
+                    .read_only()
+                    .build(),
             ]
         });
 
@@ -450,6 +459,14 @@ impl ObjectImpl for WaylandDisplaySrc {
                 let settings = self.settings.lock().unwrap();
                 settings.hdr.to_value()
             }
+            "app-surface-commits" => self
+                .state
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|state| state.display.app_surface_commits())
+                .unwrap_or(0)
+                .to_value(),
             _ => unreachable!(),
         }
     }
@@ -1769,6 +1786,23 @@ mod tests {
             ),
             Some("RA24:0x0300000000000013".to_string())
         );
+    }
+
+    #[test]
+    fn app_surface_commit_counter_is_read_only_and_starts_zero() {
+        use gst::prelude::*;
+
+        test_init();
+        crate::plugin_register_static().expect("register plugin");
+        let source = gst::ElementFactory::make("waylanddisplaysrc")
+            .build()
+            .expect("make waylanddisplaysrc");
+        let pspec = source
+            .find_property("app-surface-commits")
+            .expect("counter property");
+        assert!(pspec.flags().contains(glib::ParamFlags::READABLE));
+        assert!(!pspec.flags().contains(glib::ParamFlags::WRITABLE));
+        assert_eq!(source.property::<u64>("app-surface-commits"), 0);
     }
 
     /// Run a gst-launch description to EOS, failing on any bus ERROR. Reusable
