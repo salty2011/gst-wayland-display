@@ -221,6 +221,17 @@ impl State {
             [0.0, 0.0, 0.0, 1.0],
         )?;
 
+        // The NV12/VulkanImage paths import this GLES render target as external Vulkan
+        // memory and sample it during `to_gs_buffer`. Waiting in the caller after
+        // `create_frame` returns is too late: the converter has already submitted its
+        // Vulkan read by then. On drivers which do not accidentally serialize the two APIs
+        // (observed as NVIDIA Xid 13/32 followed by VK_ERROR_DEVICE_LOST), that is a real
+        // read/write race on the dmabuf. Complete the GLES render before any hardware
+        // conversion or hand-off consumes the target.
+        render_output_result
+            .sync
+            .wait()
+            .expect("Error during render_result.sync");
         // HDR render-path spike ISOLATION probe: read the fp16 RGBA dmabuf straight off the GLES
         // framebuffer (after render_output, before the Vulkan converter in to_gs_buffer) and log
         // the bar-center float values -- proving whether GLES kept >1.0 or clamped. Gated behind
