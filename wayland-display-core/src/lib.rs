@@ -111,6 +111,10 @@ pub struct WaylandDisplay {
     /// [`WaylandDisplay::poll_hdr_state`].
     hdr_state_rx: Receiver<Command>,
     app_surface_commits: Arc<AtomicU64>,
+    /// Shared with the compositor thread: lifetime count of renderer-degradation events
+    /// (rate-limited client-buffer import failures). Delta-sampled by the gst element to post
+    /// a `quasar-renderer-degraded` bus warning (#378).
+    renderer_degraded: Arc<AtomicU64>,
 
     pub tracer: Option<Tracer>,
     pub devices: MaybeRecv<Vec<CString>>,
@@ -144,6 +148,8 @@ impl WaylandDisplay {
         let (hdr_state_tx, hdr_state_rx) = std::sync::mpsc::channel();
         let app_surface_commits = Arc::new(AtomicU64::new(0));
         let compositor_commits = Arc::clone(&app_surface_commits);
+        let renderer_degraded = Arc::new(AtomicU64::new(0));
+        let compositor_degraded = Arc::clone(&renderer_degraded);
         let render_target = RenderTarget::from_str(
             &render_node.unwrap_or_else(|| String::from("/dev/dri/renderD128")),
         )?;
@@ -160,6 +166,7 @@ impl WaylandDisplay {
                     envs_tx,
                     hdr_state_tx,
                     compositor_commits,
+                    compositor_degraded,
                 );
             }) {
                 tracing::error!(?err, "Compositor thread panic'ed!");
@@ -172,6 +179,7 @@ impl WaylandDisplay {
             command_tx,
             hdr_state_rx,
             app_surface_commits,
+            renderer_degraded,
             tracer: None,
             devices: MaybeRecv::Rx(devices_rx),
             envs: MaybeRecv::Rx(envs_rx),
@@ -189,6 +197,8 @@ impl WaylandDisplay {
         let (hdr_state_tx, hdr_state_rx) = std::sync::mpsc::channel();
         let app_surface_commits = Arc::new(AtomicU64::new(0));
         let compositor_commits = Arc::clone(&app_surface_commits);
+        let renderer_degraded = Arc::new(AtomicU64::new(0));
+        let compositor_degraded = Arc::clone(&renderer_degraded);
         let render_target = RenderTarget::from_str(
             &render_node.unwrap_or_else(|| String::from("/dev/dri/renderD128")),
         )?;
@@ -201,6 +211,7 @@ impl WaylandDisplay {
                 envs_tx,
                 hdr_state_tx,
                 compositor_commits,
+                compositor_degraded,
             );
         });
 
@@ -209,6 +220,7 @@ impl WaylandDisplay {
             command_tx,
             hdr_state_rx,
             app_surface_commits,
+            renderer_degraded,
             tracer: None,
             devices: MaybeRecv::Rx(devices_rx),
             envs: MaybeRecv::Rx(envs_rx),
@@ -232,6 +244,13 @@ impl WaylandDisplay {
     /// Lifetime count of new buffers committed by mapped top-level app surfaces.
     pub fn app_surface_commits(&self) -> u64 {
         self.app_surface_commits.load(Ordering::Relaxed)
+    }
+
+    /// Lifetime count of renderer-degradation events (rate-limited client-buffer import
+    /// failures on the GPU renderer). The gst element delta-samples this to post a
+    /// `quasar-renderer-degraded` bus WARNING the node-agent's fail-closed hook reads (#378).
+    pub fn renderer_degraded_count(&self) -> u64 {
+        self.renderer_degraded.load(Ordering::Relaxed)
     }
 
     pub fn add_input_device(&self, path: impl Into<String>) {

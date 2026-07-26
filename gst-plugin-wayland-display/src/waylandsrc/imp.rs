@@ -13,7 +13,7 @@ use gst_video::{NavigationEvent, VideoCapsBuilder, VideoFormat, VideoInfo, Video
 use once_cell::sync::Lazy;
 use std::collections::HashMap;
 use std::ops::DerefMut;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use tracing_subscriber::Registry;
 use tracing_subscriber::layer::SubscriberExt;
@@ -47,6 +47,11 @@ pub struct WaylandDisplaySrc {
     /// `caps()` falls back to the hardcoded `HDR_MASTERING` / `HDR_CLL` defaults. Driven in
     /// `create()`, read in `caps()`. Never consulted when WOLF_HDR_CM is unset.
     hdr_meta: Mutex<(Option<String>, Option<String>)>,
+    /// Last `WaylandDisplay::renderer_degraded_count()` value observed in `create()`. When the
+    /// compositor's shared counter advances past this, the element posts a
+    /// `quasar-renderer-degraded` bus WARNING (tracing does not reach the gst bus, so this
+    /// delta-sample is the bridge to the node-agent's fail-closed hook). Default 0 (#378).
+    renderer_degraded_seen: AtomicU64,
 }
 
 impl Default for WaylandDisplaySrc {
@@ -59,6 +64,7 @@ impl Default for WaylandDisplaySrc {
             command_rx: Mutex::new(Some(command_rx)),
             hdr_active: AtomicBool::new(false),
             hdr_meta: Mutex::new((None, None)),
+            renderer_degraded_seen: AtomicU64::new(0),
         }
     }
 }
@@ -1385,6 +1391,23 @@ impl PushSrcImpl for WaylandDisplaySrc {
         let Some(state) = state_guard.as_mut() else {
             return Err(gst::FlowError::Eos);
         };
+
+        // Renderer-degradation bridge (#378): the compositor increments a shared counter
+        // (rate-limited to <=1 per 5s) whenever a client buffer import fails on the GPU
+        // renderer. tracing does not reach the gst bus, so delta-sample the counter here and
+        // surface each new event as a bus WARNING carrying the `quasar-renderer-degraded`
+        // marker -- the node-agent matches this to fail a session that requires hardware
+        // rendering. Unconditional (independent of WOLF_HDR_CM).
+        let degraded = state.display.renderer_degraded_count();
+        if degraded > self.renderer_degraded_seen.swap(degraded, Ordering::Relaxed) {
+            let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
+            gst::element_warning!(
+                elem,
+                gst::LibraryError::Failed,
+                ("quasar-renderer-degraded"),
+                ["quasar-renderer-degraded: a client buffer import failed on the GPU renderer; see compositor log"]
+            );
+        }
 
         // WOLF_HDR_CM: surface compositor OUTPUT HDR-state changes on the bus so Wolf can
         // drive dynamic HDR<->SDR switching. The compositor only signals on an actual

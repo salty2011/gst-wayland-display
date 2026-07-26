@@ -66,7 +66,8 @@ use smithay::{
 };
 use std::os::fd::OwnedFd;
 use std::sync::Mutex;
-use std::sync::atomic::AtomicU64;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{
     collections::HashSet,
     ffi::CString,
@@ -118,6 +119,28 @@ pub struct State {
     pub(crate) output_buffer: Option<GsBufferType>,
     render_node: Option<DrmNode>,
     pub renderer: GlesRenderer,
+    /// True iff `renderer.bind_wl_display()` succeeded in `State::new`. Gates the explicit
+    /// `unbind_wl_display()` at teardown so we only unbind what we bound -- and so a
+    /// back-to-back session does not inherit a deferred unbind (#378).
+    egl_bound: bool,
+    /// Shared lifetime count of renderer-degradation *emission events* (not raw failures --
+    /// see `renderer_degraded_active`), incremented by `note_renderer_degraded` (first
+    /// failure) and `tick_renderer_degraded` (periodic re-emit while the condition stays
+    /// active). The gst element delta-samples it (via
+    /// `WaylandDisplay::renderer_degraded_count`) to post a `quasar-renderer-degraded` bus
+    /// WARNING -- tracing does not reach the gst bus, so this counter is the compositor ->
+    /// element bridge (#378).
+    pub(crate) renderer_degraded: Arc<AtomicU64>,
+    /// Renderer-degradation CONDITION state, not a one-shot event: `Some(last_emit)` means a
+    /// client buffer import has failed and NO client buffer has succeeded since. A client
+    /// that backs off permanently after one rejected import (observed live with gamescope,
+    /// #378 T6) never produces another failure to re-trigger on, so a one-shot marker would
+    /// never satisfy the node-agent's 2-in-30s debounce and the black-screen session would
+    /// stay `running` forever. `tick_renderer_degraded` re-emits every 5s while `Some`;
+    /// `clear_renderer_degraded` resets to `None` the moment any client buffer (dmabuf or
+    /// SHM/other) is handled successfully, since that proves the client is alive and any
+    /// earlier failure was transient.
+    renderer_degraded_active: Option<Instant>,
     dmabuf_global: Option<(DmabufGlobal, GlobalId)>,
     last_render: Option<Instant>,
     /// WOLF_HDR_CM per-frame PQ-passthrough selector: true when the active fullscreen surface's
@@ -199,6 +222,25 @@ const HDR_IMPORT_FOURCCS: [Fourcc; 6] = [
     Fourcc::Argb2101010,
     Fourcc::Xrgb2101010,
 ];
+
+/// Test-only fault-injection hook for #378 T6 (see
+/// `docs/design/plans/2026-07-19-378-multisession-fail-closed-spec.md`). When
+/// `QUASAR_DEBUG_FAIL_DMABUF_IMPORT` is `"1"` or `"true"`, every dmabuf import in
+/// `handlers/dmabuf.rs` and `handlers/wl_drm.rs` is treated as failed WITHOUT calling the
+/// real `renderer.import_dmabuf` -- deterministically exercising the
+/// `quasar-renderer-degraded` bus-warning / fail-closed path without needing a client that
+/// actually submits an unimportable buffer. Read once (mirrors `wolf_hdr_cm()` in
+/// `utils/vulkan_nv12.rs`). Unset/any-other-value == byte-identical prior behavior.
+/// NEVER set this in production.
+pub(crate) fn debug_fail_dmabuf_import() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| {
+        matches!(
+            std::env::var("QUASAR_DEBUG_FAIL_DMABUF_IMPORT").as_deref(),
+            Ok("1") | Ok("true")
+        )
+    })
+}
 
 /// Add the HDR-capable dmabuf formats (fp16 / 10-bit) the GLES renderer can actually
 /// *import* (queried from `ImportDma::dmabuf_formats`, i.e. the EGL texture-import set) to
@@ -302,6 +344,10 @@ impl State {
         let mut renderer = setup_renderer(render_node);
 
         let shm_state = ShmState::new::<State>(&dh, vec![]);
+        // Whether `renderer.bind_wl_display()` below succeeds (only attempted on a hardware
+        // render target). Threaded into `State.egl_bound` so teardown can `unbind_wl_display`
+        // exactly what it bound (#378).
+        let mut egl_bound = false;
         let dmabuf_global = if let RenderTarget::Hardware(node) = render_target {
             let mut formats = Bind::<Dmabuf>::supported_formats(&renderer)
                 .expect("Failed to query formats")
@@ -326,9 +372,23 @@ impl State {
                 dmabuf_state.create_global::<State>(&dh, formats.clone())
             };
 
+            // The ONLY product of this bind is the EGLBufferReader (legacy wl_drm / EGL-image
+            // import). Both client buffer routes here go through `import_dmabuf`
+            // (`handlers/dmabuf.rs`, `handlers/wl_drm.rs` -- mesa's wl_drm is implemented over
+            // dmabuf), and smithay's `buffer_type()` dispatch checks dmabuf before EGL, so a
+            // failed bind loses NO client capability. On NVIDIA the per-device EGLDisplay is
+            // process-shared and allows exactly one wl_display, so a 2nd concurrent compositor's
+            // bind ALWAYS fails here -- logging that as loss of "hardware-acceleration" cost a
+            // full diagnostic detour, hence `debug!` (#378).
             match renderer.bind_wl_display(&dh) {
-                Ok(_) => tracing::info!("EGL hardware-acceleration enabled"),
-                Err(err) => tracing::info!(?err, "Failed to initialize EGL hardware-acceleration"),
+                Ok(_) => {
+                    egl_bound = true;
+                    tracing::info!("EGL hardware-acceleration enabled");
+                }
+                Err(err) => tracing::debug!(
+                    ?err,
+                    "EGL wl_display bind unavailable (legacy wl_drm/EGL-image import disabled; dmabuf import unaffected)"
+                ),
             }
 
             // wl_drm (mesa protocol, so we don't need EGL_WL_bind_display)
@@ -401,6 +461,9 @@ impl State {
             clock,
 
             renderer,
+            egl_bound,
+            renderer_degraded: Arc::new(AtomicU64::new(0)),
+            renderer_degraded_active: None,
             dtr: None,
             output_buffer: None,
             render_node,
@@ -443,6 +506,57 @@ impl State {
             last_hdr_state: false,
             app_surface_commits: Arc::new(AtomicU64::new(0)),
             hdr_candidate_since: None,
+        }
+    }
+
+    /// Enter (or refresh) the renderer-degradation CONDITION: a client buffer import failed
+    /// on the GPU renderer (`handlers/dmabuf.rs`, `handlers/wl_drm.rs`, or the
+    /// `QUASAR_DEBUG_FAIL_DMABUF_IMPORT` T6 injection hook). The FIRST failure since the
+    /// condition was last clear emits immediately (bumps `renderer_degraded` + logs); a
+    /// repeat failure while already active does not re-emit here -- `tick_renderer_degraded`
+    /// covers "still broken" via periodic re-emission, so a client retrying every frame can't
+    /// flood the log/bus, and a client that backs off after exactly one failed import (the
+    /// #378 T6 gamescope case: no retry, ever) still gets covered by the tick path instead of
+    /// going silent forever. See the `renderer_degraded_active` field doc for the condition
+    /// model this implements.
+    pub(crate) fn note_renderer_degraded(&mut self, detail: &str) {
+        let now = Instant::now();
+        if self.renderer_degraded_active.is_none() {
+            self.renderer_degraded.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!("quasar-renderer-degraded: {detail}");
+        }
+        self.renderer_degraded_active = Some(now);
+    }
+
+    /// Clear the renderer-degradation condition: a client buffer was subsequently handled
+    /// successfully (a dmabuf import succeeded -- `handlers/dmabuf.rs` / `handlers/wl_drm.rs`
+    /// -- or a non-dmabuf/SHM buffer was committed -- `handlers/compositor.rs::commit`). This
+    /// proves the client is alive and any earlier import failure(s) were transient (e.g. an
+    /// SHM fallback after a rejected dmabuf), so stop re-emitting. A client that backs off
+    /// permanently instead (never produces another buffer) never reaches this call, so the
+    /// condition -- and `tick_renderer_degraded`'s periodic re-emission -- stays active until
+    /// the node-agent acts on it (#378).
+    pub(crate) fn clear_renderer_degraded(&mut self) {
+        self.renderer_degraded_active = None;
+    }
+
+    /// Re-emit the degradation marker every 5s while the condition remains active. Called
+    /// from the per-frame `render` closure in `init` (driven by the encode pipeline pulling
+    /// frames, so it runs continuously regardless of whether the offending client ever
+    /// submits another buffer -- unlike `note_renderer_degraded`, which only runs when a
+    /// client actually attempts an import). This is what turns a single rejected import into
+    /// a periodic, debounce-surviving signal for a client that backs off for good (#378 T6).
+    pub(crate) fn tick_renderer_degraded(&mut self) {
+        let Some(last_emit) = self.renderer_degraded_active else {
+            return;
+        };
+        let now = Instant::now();
+        if now.duration_since(last_emit) >= Duration::from_secs(5) {
+            self.renderer_degraded_active = Some(now);
+            self.renderer_degraded.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                "quasar-renderer-degraded: condition still active (periodic re-emit)"
+            );
         }
     }
 
@@ -758,6 +872,7 @@ pub(crate) fn init(
     envs_tx: Sender<Vec<CString>>,
     hdr_state_tx: Sender<Command>,
     app_surface_commits: Arc<AtomicU64>,
+    renderer_degraded: Arc<AtomicU64>,
 ) {
     let render_target = render.into();
     let _ = devices_tx.send(render_target.clone().as_devices());
@@ -775,6 +890,7 @@ pub(crate) fn init(
 
     let mut state = State::new(&render_target, &dh, &input_context, event_loop.handle());
     state.app_surface_commits = app_surface_commits;
+    state.renderer_degraded = renderer_degraded;
 
     // Wire the compositor -> element HDR-state reverse channel only under WOLF_HDR_CM;
     // unset leaves `hdr_state_tx` as `None`, making the per-frame HDR check a no-op.
@@ -827,6 +943,14 @@ pub(crate) fn init(
                         // WOLF_HDR_CM is set). Runs before the buffer check so transitions
                         // are observed even on frames that fail to produce a buffer.
                         state.update_hdr_state();
+                        // #378 T6: periodic re-emission of an active renderer-degradation
+                        // condition. This runs every frame the encode pipeline pulls
+                        // (independent of client behavior), which is the only reliable
+                        // periodic tick available to a client that backed off after one
+                        // rejected import and never submits another buffer to re-trigger on.
+                        // No-op unless the condition is active (see `renderer_degraded_active`
+                        // doc); internally rate-limited to one emission per 5s.
+                        state.tick_renderer_degraded();
                         // apply_video_info may have been unable to set up the output buffer
                         // (e.g. a downstream Vulkan encoder that never shared its
                         // GstVulkanDevice). Fail the frame cleanly instead of letting
@@ -1128,5 +1252,16 @@ pub(crate) fn init(
         }
     }) {
         tracing::error!(?err, "Event loop broke.");
+    }
+
+    // Explicitly release the EGL wl_display bind (if we ever took it) before `state` -- and
+    // with it the GlesRenderer -- drops at the end of this function. smithay otherwise unbinds
+    // only when the last EGLBufferReader Arc drops, which drains asynchronously with renderer
+    // teardown, so the per-device EGLDisplay can stay transiently bound and race the NEXT
+    // session's bind (OtherEGLDisplayAlreadyBound on a back-to-back launch). unbind_wl_display()
+    // runs eglUnbindWaylandDisplayWL promptly. Gated on egl_bound so we only unbind what we
+    // bound. `ImportEgl` is already in scope (imported at the top of this module). (#378)
+    if state.egl_bound {
+        state.renderer.unbind_wl_display();
     }
 }
