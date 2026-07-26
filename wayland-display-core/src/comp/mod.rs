@@ -85,6 +85,7 @@ pub use self::input::*;
 pub use self::rendering::*;
 #[cfg(feature = "cuda")]
 use crate::utils::allocator::GsCUDABuf;
+use crate::utils::vulkan_share::VulkanShare;
 use crate::utils::allocator::{
     GsBuffer, GsBufferType, GsDmaBuf, GsGlesbuffer, GsNv12Buf, GsVulkanBuf, VideoInfoTypes,
     gst_video_format_to_drm_fourcc, gst_video_format_to_drm_modifier, new_gbm_device,
@@ -199,6 +200,12 @@ pub struct State {
     /// Shared lifetime counter exported by waylanddisplaysrc. Only mapped
     /// top-level application buffer commits increment it.
     pub(crate) app_surface_commits: Arc<AtomicU64>,
+    /// This element's Vulkan-encode device share (8th gwd patch). A clone of the gst element's
+    /// own `Arc<VulkanShare>`, so the compositor thread reads the SAME per-element device the
+    /// element mints — not a process-global singleton. Read in `apply_video_info` when building
+    /// the `memory:VulkanImage` output ring. Replaced by the real share in [`init`]; the
+    /// `State::new` default is an empty placeholder.
+    pub(crate) vulkan_share: Arc<VulkanShare>,
     /// When the current candidate HDR<->SDR flip was first observed; the flip is only
     /// committed (TV switched) once it has held for [`HDR_DEBOUNCE`]. `None` = no pending
     /// flip. See [`State::update_hdr_state`].
@@ -505,6 +512,7 @@ impl State {
             hdr_state_tx: None,
             last_hdr_state: false,
             app_surface_commits: Arc::new(AtomicU64::new(0)),
+            vulkan_share: VulkanShare::new(),
             hdr_candidate_since: None,
         }
     }
@@ -781,7 +789,11 @@ pub(crate) fn apply_video_info(
                     // of panicking when it merely hasn't been shared yet. If it never comes,
                     // leave output_buffer unset -- the render loop turns that into a clean
                     // FlowError rather than aborting the process.
-                    if crate::utils::vulkan_share::wait_for_shared_device(Duration::from_secs(5))
+                    // Per-element share (8th gwd patch): clone the Arc so we can pass it to
+                    // GsVulkanBuf::new while `state.renderer` is borrowed mutably below.
+                    let vulkan_share = Arc::clone(&state.vulkan_share);
+                    if vulkan_share
+                        .wait_for_shared_device(Duration::from_secs(5))
                         .is_some()
                     {
                         match GsVulkanBuf::new(
@@ -789,6 +801,7 @@ pub(crate) fn apply_video_info(
                             node,
                             params.video_info,
                             params.profile,
+                            &vulkan_share,
                         ) {
                             Some(allocator) => {
                                 state.output_buffer = Some(GsBufferType::VULKAN(allocator))
@@ -873,6 +886,7 @@ pub(crate) fn init(
     hdr_state_tx: Sender<Command>,
     app_surface_commits: Arc<AtomicU64>,
     renderer_degraded: Arc<AtomicU64>,
+    vulkan_share: Arc<VulkanShare>,
 ) {
     let render_target = render.into();
     let _ = devices_tx.send(render_target.clone().as_devices());
@@ -891,6 +905,7 @@ pub(crate) fn init(
     let mut state = State::new(&render_target, &dh, &input_context, event_loop.handle());
     state.app_surface_commits = app_surface_commits;
     state.renderer_degraded = renderer_degraded;
+    state.vulkan_share = vulkan_share;
 
     // Wire the compositor -> element HDR-state reverse channel only under WOLF_HDR_CM;
     // unset leaves `hdr_state_tx` as `None`, making the per-frame HDR check a no-op.

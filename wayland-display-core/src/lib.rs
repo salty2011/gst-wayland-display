@@ -5,6 +5,7 @@ pub use smithay::reexports::calloop::channel::{Channel, Sender, channel};
 #[cfg(feature = "cuda")]
 use crate::utils::allocator::cuda::CUDABufferPool;
 use crate::utils::device::gpu::GPUDevice;
+use crate::utils::vulkan_share::VulkanShare;
 pub use smithay::backend::allocator::{
     Format as DrmFormat, Fourcc, Modifier as DrmModifier, Vendor as DrmVendor, format::FormatSet,
 };
@@ -150,6 +151,12 @@ impl WaylandDisplay {
         let compositor_commits = Arc::clone(&app_surface_commits);
         let renderer_degraded = Arc::new(AtomicU64::new(0));
         let compositor_degraded = Arc::clone(&renderer_degraded);
+        // Per-element Vulkan share (8th gwd patch). This constructor has no gst element to
+        // answer context queries, so nothing outside the compositor thread mints on it — but
+        // comp::init still needs one, and making it per-instance keeps the process-global
+        // singleton gone on this path too.
+        let vulkan_share = VulkanShare::new();
+        let compositor_vulkan_share = Arc::clone(&vulkan_share);
         let render_target = RenderTarget::from_str(
             &render_node.unwrap_or_else(|| String::from("/dev/dri/renderD128")),
         )?;
@@ -167,6 +174,7 @@ impl WaylandDisplay {
                     hdr_state_tx,
                     compositor_commits,
                     compositor_degraded,
+                    compositor_vulkan_share,
                 );
             }) {
                 tracing::error!(?err, "Compositor thread panic'ed!");
@@ -190,6 +198,7 @@ impl WaylandDisplay {
         render_node: Option<String>,
         command_tx: Sender<Command>,
         commands_rx: Channel<Command>,
+        vulkan_share: Arc<VulkanShare>,
     ) -> Result<WaylandDisplay, CreateDrmNodeError> {
         let (devices_tx, devices_rx) = std::sync::mpsc::channel();
         let (envs_tx, envs_rx) = std::sync::mpsc::channel();
@@ -199,6 +208,11 @@ impl WaylandDisplay {
         let compositor_commits = Arc::clone(&app_surface_commits);
         let renderer_degraded = Arc::new(AtomicU64::new(0));
         let compositor_degraded = Arc::clone(&renderer_degraded);
+        // Per-element Vulkan share (8th gwd patch): the gst element owns it (for its
+        // set_context / context-query / teardown calls) and hands the compositor thread a
+        // clone, so producer + encoder + compositor all see THIS element's device — mirrors
+        // the app_surface_commits / renderer_degraded Arcs threaded just above.
+        let compositor_vulkan_share = Arc::clone(&vulkan_share);
         let render_target = RenderTarget::from_str(
             &render_node.unwrap_or_else(|| String::from("/dev/dri/renderD128")),
         )?;
@@ -212,6 +226,7 @@ impl WaylandDisplay {
                 hdr_state_tx,
                 compositor_commits,
                 compositor_degraded,
+                compositor_vulkan_share,
             );
         });
 

@@ -52,6 +52,15 @@ pub struct WaylandDisplaySrc {
     /// `quasar-renderer-degraded` bus WARNING (tracing does not reach the gst bus, so this
     /// delta-sample is the bridge to the node-agent's fail-closed hook). Default 0 (#378).
     renderer_degraded_seen: AtomicU64,
+    /// This element's OWN Vulkan-encode device share (8th gwd patch — per-element device
+    /// ownership). Replaces the old process-global `vulkan_share` `OnceLock` slots so N
+    /// concurrent Vulkan sessions in one process each mint/own/destroy their own `VkDevice`
+    /// (an isolated failure domain). Lives for the element's whole lifetime (created in
+    /// `Default`) so `set_context` / the context query / `set_caps` can reach it regardless of
+    /// start/stop ordering; a clone is handed to this element's compositor thread in `start()`
+    /// (`WaylandDisplay::new_with_channel`), and `stop()` calls `clear()` to destroy the device
+    /// per session so N sessions don't leak N devices.
+    vulkan_share: Arc<waylanddisplaycore::utils::vulkan_share::VulkanShare>,
 }
 
 impl Default for WaylandDisplaySrc {
@@ -65,6 +74,7 @@ impl Default for WaylandDisplaySrc {
             hdr_active: AtomicBool::new(false),
             hdr_meta: Mutex::new((None, None)),
             renderer_degraded_seen: AtomicU64::new(0),
+            vulkan_share: waylanddisplaycore::utils::vulkan_share::VulkanShare::new(),
         }
     }
 }
@@ -592,7 +602,7 @@ impl ElementImpl for WaylandDisplaySrc {
     fn set_context(&self, context: &Context) {
         // Absorb a downstream encoder's shared GstVulkanDevice so the Vulkan-encode path can
         // mint encode-src images on the same device (best-effort; no-op for other contexts).
-        if waylanddisplaycore::utils::vulkan_share::handle_set_context(context) {
+        if self.vulkan_share.handle_set_context(context) {
             tracing::info!("waylandsrc: absorbed shared GstVulkanDevice for Vulkan encode path");
         }
 
@@ -728,7 +738,7 @@ impl WaylandDisplaySrc {
         }
         let node = render_node.unwrap_or_else(|| "/dev/dri/renderD128".into());
         let minor = waylanddisplaycore::utils::vulkan_nv12::render_node_minor(&node);
-        waylanddisplaycore::utils::vulkan_share::provide_context(
+        self.vulkan_share.provide_context(
             self.obj().upcast_ref::<gst::Element>(),
             query,
             minor,
@@ -1190,7 +1200,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                 .clone()
                 .unwrap_or_else(|| "/dev/dri/renderD128".into());
             let minor = waylanddisplaycore::utils::vulkan_nv12::render_node_minor(&node);
-            waylanddisplaycore::utils::vulkan_share::ensure_owned_device(minor);
+            self.vulkan_share.ensure_owned_device(minor);
             let base_video_info =
                 gst_video::VideoInfo::from_caps(caps).expect("failed to get vulkan video info");
             // P010 ⇒ the Vulkan HEVC encoder (vulkanh265enc) Main-10; NV12 ⇒ vulkanh264enc.
@@ -1293,6 +1303,10 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                 render_node.clone(),
                 self.command_tx.clone(),
                 command_rx.deref_mut().take().unwrap(),
+                // Hand this element's compositor thread a clone of OUR per-element Vulkan share
+                // (8th gwd patch), so producer + compositor + encoder resolve THIS element's
+                // device — not a process-global singleton.
+                Arc::clone(&self.vulkan_share),
             )
         }) else {
             return Err(gst::error_msg!(
@@ -1374,6 +1388,11 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             let subscriber = Registry::default().with(GstLayer);
             tracing::subscriber::with_default(subscriber, || drop(state.display));
         }
+        // Destroy this session's owned Vulkan device+instance alongside the compositor teardown
+        // (8th gwd patch). The old process-global slots leaked by design; per-element ownership
+        // means a retired session must take its VkDevice with it so N sessions don't leak N
+        // devices. Safe to call unconditionally (no-op when the Vulkan path was never used).
+        self.vulkan_share.clear();
         Ok(())
     }
 
