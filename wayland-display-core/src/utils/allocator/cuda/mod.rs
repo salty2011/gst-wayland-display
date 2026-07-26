@@ -280,6 +280,28 @@ impl CUDABufferPool {
                 ptr::null_mut(),
                 ptr::null_mut(),
             );
+            // `gst_buffer_pool_get_config()` is (transfer full): it hands back a fresh
+            // `gst_structure_copy()` of the pool's config, which the caller must free
+            // (unlike `configure()` above, where `gst_buffer_pool_set_config()` consumes
+            // it). Copying the config also re-refs every field value -- including the
+            // `cuda-stream` `GstCudaStream` that `configure()` installed, and a
+            // `GstCudaStream` holds a `gst_object_ref()` on its `GstCudaContext`. So
+            // leaking this structure pins the element's whole CUDA context for the
+            // lifetime of the process: with an application-injected context (one per
+            // session) that is ~500 MiB of VRAM plus one `cuda-EvtHandlr` driver thread
+            // leaked per session, and nothing can ever reclaim it -- the retaining
+            // structure is detached from every object, so no teardown hook reaches it,
+            // and `leaks(filters=GstObject)` cannot even see it (a `GstStructure` is not
+            // refcounted and `GstCudaStream` is a `GstMiniObject`).
+            //
+            // MUST land together with the `Caps::from_glib_none` fix in
+            // `waylandsrc/imp.rs::decide_allocation`: that borrowed-caps pointer was being
+            // adopted with `from_glib_full`, leaving the negotiated caps one reference
+            // short. This config copy holds a ref on the SAME caps, so freeing it here
+            // while that over-unref is still in place takes the caps below its true count
+            // and destabilises the running pipeline (verified on Tower: buffers are never
+            // released and every session's pipelines are retained).
+            gst::ffi::gst_structure_free(config);
         }
         Ok(size)
     }

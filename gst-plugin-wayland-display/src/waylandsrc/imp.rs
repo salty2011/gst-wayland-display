@@ -1149,7 +1149,14 @@ impl BaseSrcImpl for WaylandDisplaySrc {
 
         match pool {
             Ok(pool) => {
-                let caps = unsafe { gst::Caps::from_glib_full(outcaps.unwrap().as_ptr()) };
+                // The allocation query only LENDS us its caps (`query.get()` borrows), so
+                // adopt it with `from_glib_none` (take a ref) -- `from_glib_full` would
+                // consume a reference we never owned, leaving the negotiated caps one
+                // short for the rest of the session. Load-bearing for the
+                // `gst_structure_free` in `CUDABufferPool::get_updated_size()`: the pool
+                // config holds a ref on this same caps, so with the over-unref still
+                // present, releasing the config copy drops the caps below its true count.
+                let caps = unsafe { gst::Caps::from_glib_none(outcaps.unwrap().as_ptr()) };
                 let stream = cuda_ctx.stream().expect("failed to get CUDA stream");
                 pool.configure(&caps, &stream, size, min, max)
                     .expect("failed to configure CUDA pool");
