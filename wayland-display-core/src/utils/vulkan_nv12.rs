@@ -65,6 +65,7 @@ use ash::vk;
 use gst::Buffer as GstBuffer;
 use gst_video::{VideoFormat, VideoInfoDmaDrm, VideoMeta};
 use gstreamer_allocators::{DmaBufAllocator, DmaBufAllocatorExtManual, FdMemoryFlags};
+use gstreamer_vulkan::prelude::VulkanQueueExtManual;
 use smithay::backend::allocator::Buffer as _;
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::drm::DrmNode;
@@ -459,6 +460,9 @@ pub struct VulkanNv12 {
     /// Keeps the shared `GstVulkanDevice` alive for the converter's lifetime (the encode-src
     /// images are allocated on it).
     _shared_device: Option<gstreamer_vulkan::VulkanDevice>,
+    /// The exact GStreamer graphics queue used by `queue`; retained so every custom
+    /// `vkQueueSubmit` participates in GStreamer's external-submit lock.
+    shared_queue: Option<gstreamer_vulkan::VulkanQueue>,
     outputs: Vec<Nv12Out>,
     next: usize, // next ring slot to write
     cur: usize,  // last slot written (the one to_gst_buffer returns)
@@ -714,6 +718,7 @@ impl VulkanNv12 {
             direct,
             encode_src: false,
             _shared_device: None,
+            shared_queue: None,
             outputs,
             next: 0,
             cur: 0,
@@ -770,7 +775,7 @@ impl VulkanNv12 {
         let entry = ash::Entry::load()?;
         let instance = ash::Instance::load(entry.static_fn(), raw.instance);
         let device = ash::Device::load(instance.fp_v1_0(), raw.device);
-        let queue = device.get_device_queue(raw.gfx_queue_family, 0);
+        let queue = raw.queue;
         let memp = instance.get_physical_device_memory_properties(raw.physical);
 
         // ---- compute pipeline(s) (same as the dmabuf path, on the shared device) ----
@@ -868,6 +873,7 @@ impl VulkanNv12 {
             direct: false,
             encode_src: true,
             _shared_device: Some(device_gst),
+            shared_queue: Some(raw.gfx_queue),
             outputs,
             next: 0,
             cur: 0,
@@ -903,17 +909,11 @@ impl VulkanNv12 {
             self.outputs[idx].in_flight = false;
         }
 
-        // Fan-out safety (encode-src path): one produced buffer can be referenced by several
-        // downstream encoders at once (interpipe delivers it to every consumer). Our own
-        // graphics fence above only proves *our* last write to this slot finished -- it says
-        // nothing about the consumers' encode *reads*, which run on the encode queue with no
-        // shared sync to us. Overwriting the slot's image while an encode still reads it is a
-        // GPU data hazard that wedges the encoder. Block until every consumer has dropped its
-        // ref (the buffer is writable again, refcount back to 1) before reusing the slot.
+        // vulkanh26x waits its GstVulkanOperation before returning from encode, and retains
+        // the input buffer until then. Writability is therefore the PR #37 completion gate.
         if self.encode_src {
             let mut waited = 0u32;
             while self.outputs[idx].buffer.get_mut().is_none() {
-                // ~1s cap so a paused/stalled consumer can't deadlock the producer forever.
                 if waited >= 10_000 {
                     tracing::warn!(
                         "VulkanNv12: encode-src slot {idx} still referenced after 1s; reusing anyway"
@@ -1172,7 +1172,12 @@ impl VulkanNv12 {
         if self.implicit_sync {
             submit = submit.signal_semaphores(&sems);
         }
-        self.device.queue_submit(self.queue, &[submit], fence)?;
+        // VkQueue is externally synchronized. Participate in the same submit lock used by
+        // GstVulkanOperation instead of racing GStreamer on the shared graphics queue.
+        {
+            let _queue_guard = self.shared_queue.as_ref().map(|q| q.submit_lock());
+            self.device.queue_submit(self.queue, &[submit], fence)?;
+        }
 
         if self.implicit_sync {
             // Hand the export dmabuf's BO the submit's completion as a *write* fence, so
@@ -1303,11 +1308,16 @@ impl VulkanNv12 {
             .device
             .create_fence(&vk::FenceCreateInfo::default(), None)?;
         let cbs = [cmd];
-        self.device.queue_submit(
-            self.queue,
-            &[vk::SubmitInfo::default().command_buffers(&cbs)],
-            fence,
-        )?;
+        // The diagnostic dump is normally disabled, but its raw ash submit must still join
+        // the exact same external-synchronization domain as the converter and encoder.
+        {
+            let _queue_guard = self.shared_queue.as_ref().map(|q| q.submit_lock());
+            self.device.queue_submit(
+                self.queue,
+                &[vk::SubmitInfo::default().command_buffers(&cbs)],
+                fence,
+            )?;
+        }
         self.device.wait_for_fences(&[fence], true, u64::MAX)?;
 
         let ptr = self
