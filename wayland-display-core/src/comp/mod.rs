@@ -48,7 +48,10 @@ use smithay::{
             backend::{ClientData, ClientId, DisconnectReason, GlobalId},
         },
     },
-    utils::{Clock, DeviceFd, Logical, Monotonic, Physical, Point, Rectangle, Size, Transform},
+    utils::{
+        Clock, DeviceFd, Logical, Monotonic, Physical, Point, Rectangle, SERIAL_COUNTER, Size,
+        Transform,
+    },
     wayland::{
         compositor::{CompositorClientState, CompositorState, with_states},
         dmabuf::{DmabufGlobal, DmabufState},
@@ -515,6 +518,45 @@ impl State {
             vulkan_share: VulkanShare::new(),
             hdr_candidate_since: None,
         }
+    }
+
+    /// Release the seat's keyboard before the compositor state is dropped.
+    ///
+    /// smithay mints one sealed `memfd:smithay-keymap` per [`Seat::add_keyboard`]
+    /// (`KeymapFile::new`) and keeps it in the `Arc<KbdRc>` behind the seat's
+    /// `KeyboardHandle`. Dropping `State` is NOT guaranteed to close it, because the
+    /// keyboard's *own* grab slot lives inside that same `KbdRc`
+    /// (smithay `input/keyboard/mod.rs`: `KbdInternal::grab`) while every grab smithay
+    /// hands us carries a clone of the handle it is installed on -- `PopupKeyboardGrab`
+    /// wraps a `PopupGrab`, whose `keyboard_handle` field is exactly that clone
+    /// (`desktop/wayland/popup/grab.rs`), and we install one for every `xdg_popup.grab`
+    /// (`wayland/handlers/xdg.rs`). A grab still active when the session ends is therefore
+    /// an `Arc` pointing at itself: no drop of ours can reach it, and the keymap memfd
+    /// stays open for the lifetime of the *process*, not the session.
+    ///
+    /// That is the shape the node-agent measured (quasar#400): 136 back-to-back sessions
+    /// leaked exactly one `smithay-keymap` fd each, while everything else the compositor
+    /// owns -- renderer, EGL, wayland sockets, and even the sibling
+    /// `smithay-dmabuffeedback-format-table` memfd that lives in the same `Display` --
+    /// was released on schedule. A leaked `State` or `Display` would have taken those with
+    /// it; a self-referential `Arc` inside the keyboard takes only the keymap.
+    ///
+    /// So end the session by hand instead of relying on the object graph unwinding:
+    /// unset any surviving grab (this is what breaks the cycle), clear focus, and drop
+    /// the seat's own handle. Whatever the client left behind, the fd is closed here.
+    /// Upstream candidate: smithay could unset the grab when the last non-grab reference
+    /// to a `KeyboardHandle` goes away, or hold the grab's handle weakly.
+    pub(crate) fn release_seat(&mut self) {
+        let Some(keyboard) = self.seat.get_keyboard() else {
+            return;
+        };
+        if keyboard.is_grabbed() {
+            tracing::debug!("Unsetting a keyboard grab still active at shutdown.");
+            keyboard.unset_grab(self);
+        }
+        keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
+        drop(keyboard);
+        self.seat.remove_keyboard();
     }
 
     /// Enter (or refresh) the renderer-degradation CONDITION: a client buffer import failed
@@ -1268,6 +1310,11 @@ pub(crate) fn init(
     }) {
         tracing::error!(?err, "Event loop broke.");
     }
+
+    // Close the seat's keymap memfd before `state` drops. A grab left active by the client
+    // makes the keyboard's Arc self-referential, so dropping `state` alone can leak one
+    // `memfd:smithay-keymap` per session -- see [`State::release_seat`]. (#400)
+    state.release_seat();
 
     // Explicitly release the EGL wl_display bind (if we ever took it) before `state` -- and
     // with it the GlesRenderer -- drops at the end of this function. smithay otherwise unbinds
