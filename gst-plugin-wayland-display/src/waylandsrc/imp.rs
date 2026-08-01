@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::ops::DerefMut;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use tracing::Dispatch;
 use tracing_subscriber::Registry;
 use tracing_subscriber::layer::SubscriberExt;
 #[cfg(feature = "cuda")]
@@ -29,6 +30,32 @@ use waylanddisplaycore::{
     ButtonState, Channel, Command, DrmFormat, DrmModifier, GstVideoInfo, KeyState, Sender,
     WaylandDisplay, channel, utils::device::PCIVendor,
 };
+
+/// One process-wide `tracing` dispatcher that routes core/smithay events into the gst log.
+///
+/// This used to be built fresh at every use site (`Registry::default().with(GstLayer)` inside
+/// `start()`, `stop()` and — critically — `create()`, i.e. ONCE PER FRAME). Each fresh
+/// subscriber is expensive in two ways that the per-frame site made pathological:
+///
+///  * `Registry::default()` allocates a `sharded_slab::Pool`, whose shard array is a
+///    `Vec<AtomicPtr>` of `MAX_SHARDS = next_pow2(MAX_THREADS - 1) = 4096` entries — a **32 KiB
+///    heap allocation** built and torn down on every buffer. At 60 fps that is ~2 MB/s of
+///    large-bin alloc/free churn on the streaming thread, interleaved with the frame buffers;
+///    classic glibc arena fragmentation (quasar #419: unbounded agent RSS growth per session
+///    with zero fd / thread / GstObject / VRAM correlate).
+///  * `tracing::subscriber::with_default(subscriber, ..)` builds a `Dispatch`, and
+///    `Dispatch::new` calls `tracing_core::callsite::register_dispatch`, which takes a global
+///    write lock and then **rebuilds the interest cache for every tracing callsite registered
+///    anywhere in the process** (this plugin, smithay, and the whole host application — the
+///    node-agent registers hundreds). Per frame. It also re-derives the global
+///    `LevelFilter::set_max` from this Registry, clobbering the host app's max-level hint.
+///
+/// `GstLayer` is a stateless unit struct and the Registry holds no per-element state, so one
+/// shared dispatcher is equivalent in behaviour. Built once, on first `start()`; after that
+/// `dispatcher::with_default(&GST_DISPATCH, ..)` is just a thread-local swap — no allocation,
+/// no global lock, no callsite rebuild.
+static GST_DISPATCH: LazyLock<Dispatch> =
+    LazyLock::new(|| Dispatch::new(Registry::default().with(GstLayer)));
 
 pub struct WaylandDisplaySrc {
     state: Mutex<Option<State>>,
@@ -1302,9 +1329,8 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         };
 
         let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
-        let subscriber = Registry::default().with(GstLayer);
 
-        let Ok(mut display) = tracing::subscriber::with_default(subscriber, || {
+        let Ok(mut display) = tracing::dispatcher::with_default(&GST_DISPATCH, || {
             let mut command_rx = self.command_rx.lock().unwrap();
             WaylandDisplay::new_with_channel(
                 render_node.clone(),
@@ -1392,8 +1418,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
     fn stop(&self) -> Result<(), gst::ErrorMessage> {
         let mut state = self.state.lock().unwrap();
         if let Some(state) = state.take() {
-            let subscriber = Registry::default().with(GstLayer);
-            tracing::subscriber::with_default(subscriber, || drop(state.display));
+            tracing::dispatcher::with_default(&GST_DISPATCH, || drop(state.display));
         }
         // Destroy this session's owned Vulkan device+instance alongside the compositor teardown
         // (8th gwd patch). The old process-global slots leaked by design; per-element ownership
@@ -1473,8 +1498,7 @@ impl PushSrcImpl for WaylandDisplaySrc {
             }
         }
 
-        let subscriber = Registry::default().with(GstLayer);
-        tracing::subscriber::with_default(subscriber, || {
+        tracing::dispatcher::with_default(&GST_DISPATCH, || {
             state.display.frame().map(CreateSuccess::NewBuffer)
         })
     }
