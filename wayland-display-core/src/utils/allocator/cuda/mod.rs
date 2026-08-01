@@ -409,20 +409,27 @@ impl CUDAContext {
     /// destroys a reference it never owned.
     ///
     /// That is exactly what happens on the compositor's OWN context (quasar #426).
-    /// `new_from_gstreamer()` creates the context (rc=1, held by the slot), and
-    /// `gst_cuda_ensure_element_context()` publishes it with a `have-context` message; the
-    /// parent `GstBin` stores that `GstContext` (rc=2) and -- as bins do -- propagates it
-    /// back down to every child, so `waylanddisplaysrc::set_context()` is re-entered with
-    /// the very context it just created. `new_from_set_context()` then hits the
-    /// short-circuit, builds a second owning wrapper, and `imp.rs` drops it on the spot
-    /// (`settings.cuda_context` is already `Some`) => rc 2->1.
+    /// `new_from_gstreamer()` calls `gst_cuda_ensure_element_context()`, which creates the
+    /// context (rc=1, into the slot) and publishes it -- and that publish re-enters
+    /// `waylanddisplaysrc::set_context()` SYNCHRONOUSLY, from inside the very call, with the
+    /// context it is still in the middle of creating. Confirmed live by a leaks-tracer
+    /// creation stack showing `gst_cuda_ensure_element_context` sandwiched BETWEEN two
+    /// waylanddisplaysrc frames (quasar #418 probe-c).
     ///
-    /// At teardown `settings.cuda_context` drops => rc 1->0 => the `GstCudaContext` is
-    /// finalized while the pipeline's stored `GstContext` still points at it. Disposing the
-    /// pipeline then walks `element->contexts`, and `_gst_context_free` ->
-    /// `gst_structure_free` -> `g_value_unset` -> `g_object_unref` lands on freed memory:
-    /// **SIGSEGV in `g_type_check_instance_is_fundamentally_a`, at the end of every session
-    /// teardown**.
+    /// The re-entrancy is what makes the bug stick, because it inverts which wrapper is
+    /// kept: at re-entry `settings.cuda_context` is still `None` (the outer call has not
+    /// returned yet), so it is the INNER, non-owning wrapper -- the one built off the
+    /// short-circuit -- that gets STORED, and the OUTER wrapper, holding the one legitimate
+    /// `(transfer full)` reference, that `imp.rs` drops when the outer call finally returns
+    /// and finds `settings.cuda_context` already `Some`.
+    ///
+    /// So the session runs with the context held only by the published `GstContext` (plus
+    /// any `GstCudaStream`), while `settings.cuda_context` owns nothing but believes it
+    /// does. At teardown it drops => rc hits 0 => the `GstCudaContext` is finalized while
+    /// the pipeline's stored `GstContext` still points at it. Disposing the pipeline then
+    /// walks `element->contexts`, and `_gst_context_free` -> `gst_structure_free` ->
+    /// `g_value_unset` -> `g_object_unref` lands on freed memory: **SIGSEGV in
+    /// `g_type_check_instance_is_fundamentally_a`, at the end of every session teardown**.
     ///
     /// It only bites when nothing else outlives the pipeline: with an application-injected
     /// context (a host that pins one `GstCudaContext` for the process lifetime, e.g.
