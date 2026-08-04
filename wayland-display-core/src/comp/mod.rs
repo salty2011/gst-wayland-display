@@ -88,13 +88,13 @@ pub use self::input::*;
 pub use self::rendering::*;
 #[cfg(feature = "cuda")]
 use crate::utils::allocator::GsCUDABuf;
-use crate::utils::vulkan_share::VulkanShare;
 use crate::utils::allocator::{
     GsBuffer, GsBufferType, GsDmaBuf, GsGlesbuffer, GsNv12Buf, GsVulkanBuf, VideoInfoTypes,
     gst_video_format_to_drm_fourcc, gst_video_format_to_drm_modifier, new_gbm_device,
 };
 use crate::utils::device::gpu::GPUDevice;
 use crate::utils::renderer::setup_renderer;
+use crate::utils::vulkan_share::VulkanShare;
 use crate::{
     utils::RenderTarget,
     wayland::protocols::{
@@ -597,9 +597,7 @@ impl State {
         if now.duration_since(last_emit) >= Duration::from_secs(5) {
             self.renderer_degraded_active = Some(now);
             self.renderer_degraded.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!(
-                "quasar-renderer-degraded: condition still active (periodic re-emit)"
-            );
+            tracing::warn!("quasar-renderer-degraded: condition still active (periodic re-emit)");
         }
     }
 
@@ -1308,5 +1306,4 @@ pub(crate) fn init(
     // makes the keyboard's Arc self-referential, so dropping `state` alone can leak one
     // `memfd:smithay-keymap` per session -- see [`State::release_seat`]. (#400)
     state.release_seat();
-
 }

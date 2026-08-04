@@ -169,9 +169,7 @@ impl CompositorHandler for State {
         let (attached_new_buffer, attached_is_dmabuf) = with_states(surface, |states| {
             let mut attrs = states.cached_state.get::<SurfaceAttributes>();
             match &attrs.current().buffer {
-                Some(BufferAssignment::NewBuffer(buffer)) => {
-                    (true, get_dmabuf(buffer).is_ok())
-                }
+                Some(BufferAssignment::NewBuffer(buffer)) => (true, get_dmabuf(buffer).is_ok()),
                 _ => (false, false),
             }
         });

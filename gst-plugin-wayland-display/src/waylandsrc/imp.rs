@@ -765,11 +765,8 @@ impl WaylandDisplaySrc {
         }
         let node = render_node.unwrap_or_else(|| "/dev/dri/renderD128".into());
         let minor = waylanddisplaycore::utils::vulkan_nv12::render_node_minor(&node);
-        self.vulkan_share.provide_context(
-            self.obj().upcast_ref::<gst::Element>(),
-            query,
-            minor,
-        )
+        self.vulkan_share
+            .provide_context(self.obj().upcast_ref::<gst::Element>(), query, minor)
     }
 }
 
@@ -1450,13 +1447,19 @@ impl PushSrcImpl for WaylandDisplaySrc {
         // marker -- the node-agent matches this to fail a session that requires hardware
         // rendering. Unconditional (independent of WOLF_HDR_CM).
         let degraded = state.display.renderer_degraded_count();
-        if degraded > self.renderer_degraded_seen.swap(degraded, Ordering::Relaxed) {
+        if degraded
+            > self
+                .renderer_degraded_seen
+                .swap(degraded, Ordering::Relaxed)
+        {
             let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
             gst::element_warning!(
                 elem,
                 gst::LibraryError::Failed,
                 ("quasar-renderer-degraded"),
-                ["quasar-renderer-degraded: a client buffer import failed on the GPU renderer; see compositor log"]
+                [
+                    "quasar-renderer-degraded: a client buffer import failed on the GPU renderer; see compositor log"
+                ]
             );
         }
 
