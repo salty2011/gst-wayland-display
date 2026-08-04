@@ -1,3 +1,4 @@
+use crate::ButtonState;
 use crate::tests::client::MouseEvents;
 use crate::tests::fixture::Fixture;
 use smithay::utils::Point;
@@ -15,6 +16,31 @@ fn move_mouse() {
     f.round_trip();
     f.create_window(320, 240);
 
+    {
+        // Mapping a toplevel now resolves pointer focus immediately: the map handler emits a
+        // synthetic zero-delta motion, so the client receives its wl_pointer.enter at the
+        // pointer's *current* location without waiting for a physical motion event.
+        let map_location = f.server.pointer_location;
+
+        let client_events = f.client.get_client_events();
+        assert!(!client_events.is_empty());
+        let MouseEvents::Pointer(client_event) = client_events.remove(0) else {
+            panic!("Unexpected event: {:?}", client_events);
+        };
+        let wl_pointer::Event::Enter {
+            surface_x,
+            surface_y,
+            ..
+        } = client_event
+        else {
+            panic!("Unexpected event: {:?}", client_event);
+        };
+        assert_eq!(surface_x, map_location.x);
+        assert_eq!(surface_y, map_location.y);
+
+        clean_events(client_events);
+    }
+
     let expected_location = Point::from((0.0, 0.0));
     f.server.pointer_motion_absolute(0, expected_location);
     f.round_trip();
@@ -26,6 +52,23 @@ fn move_mouse() {
         // Client logic test
         let client_events = f.client.get_client_events();
         assert!(client_events.len() >= 1);
+        // This first real motion after the map consumes the pending refocus edge trigger,
+        // which cycles focus exactly once: one forced leave (plus its frame), then the
+        // enter asserted below, so that a wl_pointer created after the map still learns it
+        // has focus. Assert that shape precisely -- more than one leave would mean the
+        // trigger is not edge-triggered.
+        let leave = client_events.remove(0);
+        assert!(
+            matches!(leave, MouseEvents::Pointer(wl_pointer::Event::Leave { .. })),
+            "expected the forced leave first, got: {:?}",
+            leave
+        );
+        if matches!(
+            client_events.first(),
+            Some(MouseEvents::Pointer(wl_pointer::Event::Frame))
+        ) {
+            client_events.remove(0);
+        }
         let MouseEvents::Pointer(client_event) = client_events.remove(0) else {
             panic!("Unexpected event: {:?}", client_events);
         };
@@ -290,10 +333,10 @@ fn confine_mouse_absolute_movement() {
     }
 }
 
-/// quasar issue #432: a client whose wl_pointer did not exist when pointer focus was first
-/// resolved must still receive a wl_pointer.enter. The armed `pending_pointer_refocus` flag
-/// forces the next motion to cycle smithay's focus (leave -> enter) instead of taking its
-/// same-target motion-only arm.
+/// A client whose wl_pointer did not exist when pointer focus was first resolved must still
+/// receive a wl_pointer.enter. The armed `pending_pointer_refocus` flag forces the next
+/// motion to cycle smithay's focus (leave -> enter) instead of taking its same-target
+/// motion-only arm.
 #[test]
 fn pending_refocus_re_emits_enter() {
     let mut f = Fixture::new();
@@ -344,5 +387,63 @@ fn pending_refocus_retained_without_surface() {
     assert!(
         f.server.pending_pointer_refocus,
         "flag must survive a motion with no surface under the pointer"
+    );
+}
+
+/// The flag is RETAINED while the pointer is grabbed. smithay's default click grab is live
+/// for as long as a button is held, and forcing a leave mid-click-drag would break the drag,
+/// so the refocus must wait for the button to be released.
+#[test]
+fn pending_refocus_retained_while_grabbed() {
+    const BTN_LEFT: u32 = 0x110;
+
+    let mut f = Fixture::new();
+    f.round_trip();
+    f.create_window(320, 240);
+
+    // Establish focus the normal way, then drop the events it produced.
+    f.server
+        .pointer_motion_absolute(0, Point::from((10.0, 10.0)));
+    f.round_trip();
+    clean_events(f.client.get_client_events());
+
+    // Press: smithay's DefaultGrab installs the click grab, so `pointer.is_grabbed()` is
+    // true from here until the release below.
+    f.server.pointer_button(0, BTN_LEFT, ButtonState::Pressed);
+    f.round_trip();
+    clean_events(f.client.get_client_events());
+
+    f.server.pending_pointer_refocus = true;
+    let delta = Point::from((5.0, 5.0));
+    f.server.pointer_motion(0, 0, delta, delta);
+    f.round_trip();
+
+    // The retained flag is the observable proof that the grab guard fired: with no grab this
+    // motion would have consumed it (see `pending_refocus_re_emits_enter`, same setup).
+    assert!(
+        f.server.pending_pointer_refocus,
+        "flag must survive a motion while the pointer is grabbed"
+    );
+
+    let client_events = f.client.get_client_events();
+    assert!(
+        !client_events
+            .iter()
+            .any(|e| matches!(e, MouseEvents::Pointer(wl_pointer::Event::Leave { .. }))),
+        "no forced leave may be sent mid-click-drag, got: {:?}",
+        client_events
+    );
+    clean_events(client_events);
+
+    // Release, and the very next motion may consume the flag as usual.
+    f.server.pointer_button(0, BTN_LEFT, ButtonState::Released);
+    f.round_trip();
+    clean_events(f.client.get_client_events());
+
+    f.server.pointer_motion(0, 0, delta, delta);
+    f.round_trip();
+    assert!(
+        !f.server.pending_pointer_refocus,
+        "flag must be consumed once the grab is released"
     );
 }
