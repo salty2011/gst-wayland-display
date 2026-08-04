@@ -123,10 +123,6 @@ pub struct State {
     pub(crate) output_buffer: Option<GsBufferType>,
     render_node: Option<DrmNode>,
     pub renderer: GlesRenderer,
-    /// True iff `renderer.bind_wl_display()` succeeded in `State::new`. Gates the explicit
-    /// `unbind_wl_display()` at teardown so we only unbind what we bound -- and so a
-    /// back-to-back session does not inherit a deferred unbind (#378).
-    egl_bound: bool,
     /// Shared lifetime count of renderer-degradation *emission events* (not raw failures --
     /// see `renderer_degraded_active`), incremented by `note_renderer_degraded` (first
     /// failure) and `tick_renderer_degraded` (periodic re-emit while the condition stays
@@ -358,10 +354,6 @@ impl State {
         let mut renderer = setup_renderer(render_node);
 
         let shm_state = ShmState::new::<State>(&dh, vec![]);
-        // Whether `renderer.bind_wl_display()` below succeeds (only attempted on a hardware
-        // render target). Threaded into `State.egl_bound` so teardown can `unbind_wl_display`
-        // exactly what it bound (#378).
-        let mut egl_bound = false;
         let dmabuf_global = if let RenderTarget::Hardware(node) = render_target {
             let mut formats = Bind::<Dmabuf>::supported_formats(&renderer)
                 .expect("Failed to query formats")
@@ -395,10 +387,7 @@ impl State {
             // bind ALWAYS fails here -- logging that as loss of "hardware-acceleration" cost a
             // full diagnostic detour, hence `debug!` (#378).
             match renderer.bind_wl_display(&dh) {
-                Ok(_) => {
-                    egl_bound = true;
-                    tracing::info!("EGL hardware-acceleration enabled");
-                }
+                Ok(_) => tracing::info!("EGL hardware-acceleration enabled"),
                 Err(err) => tracing::debug!(
                     ?err,
                     "EGL wl_display bind unavailable (legacy wl_drm/EGL-image import disabled; dmabuf import unaffected)"
@@ -475,7 +464,6 @@ impl State {
             clock,
 
             renderer,
-            egl_bound,
             renderer_degraded: Arc::new(AtomicU64::new(0)),
             renderer_degraded_active: None,
             dtr: None,
@@ -1321,14 +1309,4 @@ pub(crate) fn init(
     // `memfd:smithay-keymap` per session -- see [`State::release_seat`]. (#400)
     state.release_seat();
 
-    // Explicitly release the EGL wl_display bind (if we ever took it) before `state` -- and
-    // with it the GlesRenderer -- drops at the end of this function. smithay otherwise unbinds
-    // only when the last EGLBufferReader Arc drops, which drains asynchronously with renderer
-    // teardown, so the per-device EGLDisplay can stay transiently bound and race the NEXT
-    // session's bind (OtherEGLDisplayAlreadyBound on a back-to-back launch). unbind_wl_display()
-    // runs eglUnbindWaylandDisplayWL promptly. Gated on egl_bound so we only unbind what we
-    // bound. `ImportEgl` is already in scope (imported at the top of this module). (#378)
-    if state.egl_bound {
-        state.renderer.unbind_wl_display();
-    }
 }
