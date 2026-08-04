@@ -289,3 +289,60 @@ fn confine_mouse_absolute_movement() {
         }
     }
 }
+
+/// quasar issue #432: a client whose wl_pointer did not exist when pointer focus was first
+/// resolved must still receive a wl_pointer.enter. The armed `pending_pointer_refocus` flag
+/// forces the next motion to cycle smithay's focus (leave -> enter) instead of taking its
+/// same-target motion-only arm.
+#[test]
+fn pending_refocus_re_emits_enter() {
+    let mut f = Fixture::new();
+    f.round_trip();
+    f.create_window(320, 240);
+
+    // Establish focus the normal way, then drop the events it produced.
+    f.server
+        .pointer_motion_absolute(0, Point::from((10.0, 10.0)));
+    f.round_trip();
+    clean_events(f.client.get_client_events());
+
+    // Without the flag, a second motion is motion-only (see `move_mouse`). With it armed,
+    // the client must see a fresh Enter.
+    f.server.pending_pointer_refocus = true;
+    let delta = Point::from((5.0, 5.0));
+    f.server.pointer_motion(0, 0, delta, delta);
+    f.round_trip();
+
+    assert!(
+        !f.server.pending_pointer_refocus,
+        "flag must be consumed when a surface is under the pointer"
+    );
+
+    let client_events = f.client.get_client_events();
+    assert!(
+        client_events
+            .iter()
+            .any(|e| matches!(e, MouseEvents::Pointer(wl_pointer::Event::Enter { .. }))),
+        "expected a re-emitted wl_pointer.enter, got: {:?}",
+        client_events
+    );
+}
+
+/// The flag is RETAINED when nothing is under the pointer, so a later motion can still
+/// deliver the enter once a surface is mappable there.
+#[test]
+fn pending_refocus_retained_without_surface() {
+    let mut f = Fixture::new();
+    f.round_trip();
+    // No window created: `Space::element_under` resolves to None.
+
+    f.server.pending_pointer_refocus = true;
+    let delta = Point::from((5.0, 5.0));
+    f.server.pointer_motion(0, 0, delta, delta);
+    f.round_trip();
+
+    assert!(
+        f.server.pending_pointer_refocus,
+        "flag must survive a motion with no surface under the pointer"
+    );
+}
