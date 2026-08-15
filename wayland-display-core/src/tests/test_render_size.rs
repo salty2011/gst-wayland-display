@@ -232,6 +232,90 @@ fn ui_scale_shrinks_logical_mode_and_keeps_scene_full_frame() {
     assert_lit(&px, stride, 1900, 1000);
 }
 
+/// Production cold start: `State::new` leaves no Output, no mode and no video_info, so the
+/// first `apply_video_info` creates the Output and sets its very first mode. That call has
+/// **no previous logical extent** to remap the pointer from, and `clamp_coords` runs against
+/// an Output whose mode was set moments earlier. The seeded [`Fixture::new`] hides both cases
+/// behind its 320x240 seed, so nothing covered this ordering until now.
+#[test]
+fn cold_start_first_mode_set_is_safe_without_a_previous_mode() {
+    let mut f = Fixture::new_cold();
+    assert!(f.server.output.is_none(), "precondition: no Output yet");
+    assert!(f.server.video_info.is_none());
+
+    // The one call that creates the Output and sets the first mode.
+    apply_encode(&mut f, 1920, 1080, 60);
+
+    let p = f.server.pointer_location;
+    assert!(
+        p.x.is_finite() && p.y.is_finite(),
+        "an empty/absent previous extent must not divide by zero into a NaN pointer, got {p:?}",
+    );
+    assert_eq!(
+        (p.x, p.y),
+        (960.0, 540.0),
+        "with no previous extent the pointer centres, as it always did",
+    );
+    assert_eq!(mode_dimensions(&mut f), Some((1920, 1080)));
+
+    // Input and a real frame (cursor included -- it is built with the output scale) must both
+    // survive the freshly-created Output.
+    f.server
+        .pointer_motion_absolute(0, Point::from((10.0, 10.0)));
+    let (px, _stride) = frame_pixels(&mut f);
+    assert!(!px.is_empty());
+
+    // A second mode set now *does* have a previous extent: 1920x1080 -> 1280x720.
+    apply_render(&mut f, 1280, 720);
+    let p = f.server.pointer_location;
+    assert!(p.x.is_finite() && p.y.is_finite(), "got {p:?}");
+}
+
+/// Same cold ordering, but the UI scale is requested *before* any caps arrive (the session
+/// start Task 4 forwards): `apply_ui_scale` must not touch the mode path with no Output, and
+/// the scale must still be in force once the first `apply_video_info` creates one.
+#[test]
+fn cold_start_ui_scale_before_any_video_info() {
+    let mut f = Fixture::new_cold();
+
+    apply_ui_scale(&mut f.server, 2.0);
+    assert!(f.server.output.is_none(), "still no Output to configure");
+
+    apply_encode(&mut f, 1920, 1080, 60);
+
+    assert_eq!(output_scale_event(&mut f), Some(2));
+    let p = f.server.pointer_location;
+    assert!(p.x.is_finite() && p.y.is_finite(), "got {p:?}");
+    assert_eq!(
+        (p.x, p.y),
+        (480.0, 270.0),
+        "centre of the 960x540 LOGICAL extent",
+    );
+}
+
+/// The element re-sends the UI scale after every render-size change, so a redundant apply is
+/// the common case, not an edge case. Under design 2 it would otherwise re-run the whole mode
+/// path (new damage tracker + a configure to every toplevel) for no reason.
+#[test]
+fn a_redundant_ui_scale_apply_is_a_no_op() {
+    let mut f = Fixture::new();
+    f.create_window(320, 240);
+    apply_encode(&mut f, 1920, 1080, 60);
+    apply_scale(&mut f, 2.0);
+
+    let before = f.client.configure_count();
+    apply_scale(&mut f, 2.0);
+    assert_eq!(
+        f.client.configure_count(),
+        before,
+        "re-applying the SAME scale must not reconfigure the toplevel",
+    );
+
+    // ... but a real change still does.
+    apply_scale(&mut f, 1.5);
+    assert!(f.client.configure_count() > before);
+}
+
 #[test]
 fn mode_change_remaps_the_pointer_instead_of_recentring_it() {
     let mut f = Fixture::new();

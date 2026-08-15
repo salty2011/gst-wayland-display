@@ -1008,12 +1008,21 @@ fn remap_pointer(state: &mut State, old: Option<Size<i32, Logical>>, new: Size<i
     state.pointer_absolute_location = pos;
 }
 
-/// Push the current UI scale to `surface` through `wp_fractional_scale_v1::preferred_scale`.
-/// A no-op for a surface that never created a `wp_fractional_scale_v1`.
-pub(crate) fn set_preferred_ui_scale(surface: &WlSurface, scale: f64) {
+/// Push the current UI scale to `surface` through `wp_fractional_scale_v1::preferred_scale`,
+/// returning the value the surface held *before* the call.
+///
+/// That return value is the one diagnostic that matters when a nested compositor ignores a
+/// scale change: smithay's `set_preferred_scale` is **debounced** — it only puts bytes on the
+/// wire when the value differs from the stored one (`wayland/fractional_scale/mod.rs:238-245`)
+/// — so `previous == Some(scale)` means nothing was sent, however many times we called it.
+pub(crate) fn set_preferred_ui_scale(surface: &WlSurface, scale: f64) -> Option<f64> {
     with_states(surface, |states| {
-        with_fractional_scale(states, |fs| fs.set_preferred_scale(scale));
-    });
+        with_fractional_scale(states, |fs| {
+            let previous = fs.preferred_scale();
+            fs.set_preferred_scale(scale);
+            previous
+        })
+    })
 }
 
 /// Re-announce the current UI scale to every toplevel we know about — both the mapped ones
@@ -1026,10 +1035,30 @@ pub(crate) fn set_preferred_ui_scale(surface: &WlSurface, scale: f64) {
 /// surfaces that commit *after* the scale was set.
 pub(crate) fn announce_ui_scale(state: &State) {
     let scale = state.ui_scale;
-    for window in state.space.elements().chain(state.pending_windows.iter()) {
+    let mapped = state.space.elements().count();
+    for (i, window) in state
+        .space
+        .elements()
+        .chain(state.pending_windows.iter())
+        .enumerate()
+    {
         if let Some(surface) = window.wl_surface() {
-            set_preferred_ui_scale(&surface, scale);
+            let previous = set_preferred_ui_scale(&surface, scale);
+            // Deliberately info!, not debug!: when a nested compositor ignores a scale change
+            // this line is the difference between "we never sent it" and "we sent it and the
+            // client did nothing with it", which are opposite bugs. `sent == false` means the
+            // debounce swallowed it.
+            tracing::info!(
+                scale,
+                ?previous,
+                sent = previous != Some(scale),
+                mapped = i < mapped,
+                "Announcing preferred_scale to toplevel",
+            );
         }
+    }
+    if mapped == 0 && state.pending_windows.is_empty() {
+        tracing::info!(scale, "UI scale stored, but no toplevel exists to tell yet");
     }
 }
 
@@ -1041,6 +1070,23 @@ pub(crate) fn announce_ui_scale(state: &State) {
 /// The scale announce itself lives in [`announce_ui_scale`], which both callers run first —
 /// keeping it out of here is what lets pending (unmapped) toplevels be reached too.
 pub(crate) fn configure_toplevels(state: &State, new_size: Size<i32, Logical>) {
+    let output_scale = state
+        .output
+        .as_ref()
+        .map(|o| o.current_scale().fractional_scale())
+        .unwrap_or(1.0);
+    let mode_size = state
+        .output
+        .as_ref()
+        .and_then(|o| o.current_mode())
+        .map(|m| m.size);
+    if state.space.elements().next().is_none() {
+        tracing::info!(
+            ?new_size,
+            output_scale,
+            "No mapped toplevel to configure (nothing will change client-side)",
+        );
+    }
     for window in state.space.elements() {
         let toplevel = window.toplevel().unwrap();
         let max_size = with_states(toplevel.wl_surface(), |states| {
@@ -1068,6 +1114,16 @@ pub(crate) fn configure_toplevels(state: &State, new_size: Size<i32, Logical>) {
                 .intersection(Rectangle::from_size(new_size))
                 .map(|rect| rect.size)
         };
+        // The whole design rests on this triple: a nested compositor computes its buffer as
+        // `configured_size x preferred_scale`, so the pair below is exactly what it acts on.
+        tracing::info!(
+            ?configured_size,
+            ?new_size,
+            ?max_size,
+            ?mode_size,
+            output_scale,
+            "Configuring toplevel (logical = mode / output_scale)",
+        );
         toplevel.with_pending_state(|state| {
             state.size = configured_size;
             state.states.set(XdgState::Fullscreen);
@@ -1125,6 +1181,16 @@ pub(crate) fn apply_ui_scale(state: &mut State, scale: f64) {
         return;
     }
     let scale = scale.clamp(UI_SCALE_MIN, UI_SCALE_MAX);
+
+    // The element re-sends the UI scale after every render-size change (its 3-property apply),
+    // so an unchanged value arrives routinely. Under design 2 that is a full mode-path call --
+    // change_current_state + a fresh damage tracker + a configure to every toplevel -- so let
+    // it out early instead of driving a reconfigure storm. Only safe once an Output exists:
+    // before that the stored value still has to be picked up by the first `apply_video_info`.
+    if scale == state.ui_scale && state.output.is_some() {
+        tracing::debug!(scale, "UI scale unchanged; nothing to re-apply");
+        return;
+    }
     state.ui_scale = scale;
 
     if state.output.is_none() {

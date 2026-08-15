@@ -25,6 +25,19 @@ pub struct Fixture {
 
 impl Fixture {
     pub fn new() -> Self {
+        Self::build(true)
+    }
+
+    /// A fixture with **no** pre-seeded Output, `video_info` or damage tracker — the state
+    /// `State::new` actually leaves behind in production. The first `apply_video_info` then
+    /// has to create the Output and set its very first mode, which is the ordering the
+    /// seeded [`Fixture::new`] can never exercise (it hides "no previous mode" and "empty
+    /// previous extent" behind its 320x240 seed).
+    pub fn new_cold() -> Self {
+        Self::build(false)
+    }
+
+    fn build(seed_output: bool) -> Self {
         INIT.call_once(|| {
             gst::init().expect("Failed to initialize GStreamer");
         });
@@ -82,7 +95,9 @@ impl Fixture {
             server_event_loop: event_loop,
         };
 
-        f.create_server_output();
+        if seed_output {
+            f.create_server_output();
+        }
         f.round_trip();
 
         f
