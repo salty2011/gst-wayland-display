@@ -369,3 +369,51 @@ impl State {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::scene_transform;
+    use smithay::utils::{Physical, Point, Size};
+
+    #[track_caller]
+    fn check(enc: (i32, i32), ren: (i32, i32), scale: f64, offset: (i32, i32)) {
+        let enc: Size<i32, Physical> = enc.into();
+        let ren: Size<i32, Physical> = ren.into();
+        let (got_scale, got_offset) = scene_transform(enc, ren);
+        assert!(
+            (got_scale - scale).abs() < 1e-9,
+            "{enc:?} <- {ren:?}: expected scale {scale}, got {got_scale}",
+        );
+        assert_eq!(
+            got_offset,
+            Point::<i32, Physical>::from(offset),
+            "{enc:?} <- {ren:?}: wrong centring offset",
+        );
+    }
+
+    #[test]
+    fn scene_transform_table() {
+        // Render == encode: the exact identity the default (no render size) path relies on.
+        check((1920, 1080), (1920, 1080), 1.0, (0, 0));
+        // A degenerate render size ("not known yet") is also the identity.
+        check((1920, 1080), (0, 0), 1.0, (0, 0));
+
+        // Matching aspect ratio: fills the framebuffer, no bars.
+        check((1920, 1080), (960, 540), 2.0, (0, 0));
+        check((1920, 1080), (1280, 720), 1.5, (0, 0));
+
+        // Narrower than the encode aspect -> width-limited scale, PILLARbox (bars left/right).
+        check((1920, 1080), (1280, 1080), 1.0, (320, 0));
+        // Wider than the encode aspect -> height-limited scale, LETTERbox (bars top/bottom).
+        check((1920, 1080), (1920, 800), 1.0, (0, 140));
+
+        // Non-integer scale, with a rounded offset: 1920/1000 = 1.92 is width-limited, leaving
+        // 1080 - 540*1.92 = 43.2px of vertical slack -> 21.6 rounds to a 22px top bar (and a
+        // 21px bottom one). Asymmetry of at most 1px is inherent to centring on an integer grid.
+        check((1920, 1080), (1000, 540), 1.92, (0, 22));
+
+        // Odd leftover on the limiting axis: 1920 - 1281 = 639 -> a 320px left bar and a 319px
+        // right one. Pinned deliberately; `round()` on `.5` goes away from zero.
+        check((1920, 1080), (1281, 1080), 1.0, (320, 0));
+    }
+}

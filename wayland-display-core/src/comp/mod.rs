@@ -934,6 +934,13 @@ pub(crate) fn apply_output_mode(state: &mut State, size: Size<i32, Physical>, re
     // Use a Static tracker at the encode size instead. Both routes that can change either size
     // (`apply_video_info` for encode, `apply_render_size` for render) come through here, and a
     // freshly-built tracker has no previous state, so the next frame is full-damage either way.
+    //
+    // Only the SIZE is overridden: the scale and transform are still read off the Output, because
+    // `create_frame`'s `space_render_elements` builds its elements against
+    // `output.current_scale()` / `output.current_transform()`. The old Auto tracker kept the two
+    // in lockstep by construction; taking them from the Output here preserves that. (Both are
+    // effectively constant today -- every `change_current_state` call passes `None` for scale and
+    // transform -- but hardcoding `1.0`/`Normal` would silently desync the day one does not.)
     let encode_size: Size<i32, Physical> = state
         .video_info
         .as_ref()
@@ -941,8 +948,8 @@ pub(crate) fn apply_output_mode(state: &mut State, size: Size<i32, Physical>, re
         .unwrap_or(size);
     state.dtr = Some(OutputDamageTracker::new(
         encode_size,
-        1.0,
-        Transform::Normal,
+        output.current_scale().fractional_scale(),
+        output.current_transform(),
     ));
 
     let position = (size.w as f64 / 2.0, size.h as f64 / 2.0).into();

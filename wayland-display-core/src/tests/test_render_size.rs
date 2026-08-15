@@ -332,15 +332,22 @@ fn no_render_size_composites_one_to_one() {
 }
 
 #[test]
-fn pointer_absolute_maps_into_render_space() {
+fn pointer_motion_absolute_clamps_to_the_render_extent() {
     let mut f = Fixture::new();
     f.create_window(320, 240);
 
     apply_encode(&mut f, 1920, 1080, 60);
     apply_render(&mut f, 960, 540);
 
-    // `Command::PointerMotionAbsolute` carries output-space coordinates and `clamp_coords`
-    // clamps them to the *output mode* -- which is the render size, not the encode size.
+    // `Command::PointerMotionAbsolute` (the FFI entry point) carries output-space coordinates
+    // and `clamp_coords` clamps them to the *output mode* -- which is the render size, not the
+    // encode size. This is the clamp half of the contract.
+    //
+    // The other producer of absolute motion, libinput's `InputEvent::PointerMotionAbsolute`
+    // (`comp/input.rs:507-521`), is correct by construction and not re-asserted here: it
+    // renormalises the device's 0..1 position against `output.current_mode()` via
+    // `x_transformed`/`y_transformed` before calling into the same function, so it lands in
+    // render space for the same reason the clamp does -- both read the current output mode.
     f.server
         .pointer_motion_absolute(0, Point::from((1920.0, 1080.0)));
     f.round_trip();

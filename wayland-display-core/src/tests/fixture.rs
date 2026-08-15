@@ -11,7 +11,6 @@ use smithay::output;
 use smithay::output::{Output, PhysicalProperties, Subpixel};
 use smithay::reexports::input::Libinput;
 use smithay::reexports::wayland_server::Display;
-use smithay::utils::Transform;
 use smithay::wayland::socket::ListeningSocketSource;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -109,10 +108,15 @@ impl Fixture {
         };
         output.change_current_state(Some(mode), None, None, None);
         output.set_preferred(mode);
-        // Static, framebuffer(=encode)-sized -- matching `apply_output_mode`. Identical to the
-        // old `from_output` here (encode size == mode size == 320x240) until a test moves them
-        // apart, at which point the first `apply_output_mode` replaces this tracker anyway.
-        let dtr = OutputDamageTracker::new(mode.size, 1.0, Transform::Normal);
+        // Static, framebuffer(=encode)-sized, scale/transform off the Output -- matching
+        // `apply_output_mode`. Identical to the old `from_output` here (encode size == mode
+        // size == 320x240) until a test moves them apart, at which point the first
+        // `apply_output_mode` replaces this tracker anyway.
+        let dtr = OutputDamageTracker::new(
+            mode.size,
+            output.current_scale().fractional_scale(),
+            output.current_transform(),
+        );
 
         self.server.space.map_output(&output, (0, 0));
         self.server.dtr = Some(dtr);
