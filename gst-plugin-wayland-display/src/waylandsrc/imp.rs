@@ -381,16 +381,30 @@ impl ObjectImpl for WaylandDisplaySrc {
                     )
                     .default_value(false)
                     .build(),
+                glib::ParamSpecString::builder("render-size")
+                    .nick("Render size")
+                    .blurb(
+                        "App-facing render size as \"WxH\" (e.g. \"1280x720\"): the wl_output \
+                         mode the Wayland clients see, decoupled from the negotiated encode \
+                         size. \"0x0\" = follow the encode size. THIS IS THE ATOMIC PATH -- \
+                         width and height are applied to the compositor in a single step, so \
+                         no intermediate wrong-aspect mode ever reaches the clients. Prefer it \
+                         over render-width/render-height whenever the size can change at \
+                         runtime. Live-writable (takes effect while PLAYING) and sticky across \
+                         caps re-negotiation. A malformed value is warned about and ignored.",
+                    )
+                    .default_value(Some("0x0"))
+                    .build(),
                 glib::ParamSpecInt::builder("render-width")
                     .nick("Render width")
                     .blurb(
-                        "App-facing render width: the wl_output mode width the Wayland \
-                         clients see, decoupled from the negotiated encode width. 0 = follow \
-                         the encode width. Live-writable (takes effect while PLAYING) and \
-                         sticky across caps re-negotiation. Set BOTH render-width and \
-                         render-height: the pair is only applied once both are non-zero (or \
-                         both zero), so setting them one at a time never produces an \
-                         intermediate mode. 0/0 = follow encode.",
+                        "App-facing render width; 0 = follow the encode width. CONVENIENCE \
+                         ONLY (gst-launch): it stores the value but applies the pair to the \
+                         compositor only when it COMPLETES a previously incomplete pair (the \
+                         other dimension was already non-zero and this one was 0). Re-sizing \
+                         an already-applied pair through render-width/render-height does NOT \
+                         re-apply it -- that would push a half-updated WxH' mode at every \
+                         client. Use render-size (\"WxH\") for any runtime change.",
                     )
                     .minimum(0)
                     .maximum(16384)
@@ -399,13 +413,13 @@ impl ObjectImpl for WaylandDisplaySrc {
                 glib::ParamSpecInt::builder("render-height")
                     .nick("Render height")
                     .blurb(
-                        "App-facing render height: the wl_output mode height the Wayland \
-                         clients see, decoupled from the negotiated encode height. 0 = follow \
-                         the encode height. Live-writable (takes effect while PLAYING) and \
-                         sticky across caps re-negotiation. Set BOTH render-width and \
-                         render-height: the pair is only applied once both are non-zero (or \
-                         both zero), so setting them one at a time never produces an \
-                         intermediate mode. 0/0 = follow encode.",
+                        "App-facing render height; 0 = follow the encode height. CONVENIENCE \
+                         ONLY (gst-launch): it stores the value but applies the pair to the \
+                         compositor only when it COMPLETES a previously incomplete pair (the \
+                         other dimension was already non-zero and this one was 0). Re-sizing \
+                         an already-applied pair through render-width/render-height does NOT \
+                         re-apply it -- that would push a half-updated W'xH mode at every \
+                         client. Use render-size (\"WxH\") for any runtime change.",
                     )
                     .minimum(0)
                     .maximum(16384)
@@ -507,26 +521,69 @@ impl ObjectImpl for WaylandDisplaySrc {
                 let mut settings = self.settings.lock().unwrap();
                 settings.hdr = value.get::<bool>().expect("Type checked upstream");
             }
+            "render-size" => {
+                let raw = value
+                    .get::<Option<String>>()
+                    .expect("Type checked upstream");
+                let raw = raw.unwrap_or_default();
+                match parse_render_size(&raw) {
+                    Some((width, height)) => {
+                        {
+                            let mut settings = self.settings.lock().unwrap();
+                            settings.render_width = width;
+                            settings.render_height = height;
+                        }
+                        // ATOMIC: both halves are stored, then handed over in ONE command, so
+                        // the compositor never sees a half-updated pair.
+                        if let Some(state) = self.state.lock().unwrap().as_ref() {
+                            state.display.set_render_size(width, height);
+                        }
+                    }
+                    None => {
+                        gst::warning!(
+                            CAT,
+                            imp = self,
+                            "Ignoring malformed render-size {:?}; expected \"WxH\" \
+                             (e.g. \"1280x720\"), each dimension 0..={}",
+                            raw,
+                            MAX_RENDER_DIMENSION
+                        );
+                    }
+                }
+            }
             "render-width" | "render-height" => {
                 let v = value.get::<i32>().expect("Type checked upstream");
-                let (width, height) = {
+                let (was_complete, width, height) = {
                     let mut settings = self.settings.lock().unwrap();
+                    let was_complete = settings.render_width > 0 && settings.render_height > 0;
                     if pspec.name() == "render-width" {
                         settings.render_width = v;
                     } else {
                         settings.render_height = v;
                     }
-                    (settings.render_width, settings.render_height)
+                    (was_complete, settings.render_width, settings.render_height)
                 };
-                // Only forward a COMPLETE pair. A caller that sets width then height (the
-                // node-agent does exactly that) would otherwise drive the compositor
-                // through a `w_new x h_old` intermediate mode, which reconfigures every
-                // toplevel for nothing. Both-zero is the "follow encode" reset and is
-                // forwarded as-is.
-                if (width == 0) == (height == 0) {
+                // Forward ONLY a first-time completion: the pair was incomplete (at least one
+                // dimension still 0) and this set makes both non-zero. Anything else is a
+                // HALF-UPDATED pair -- e.g. re-sizing a stored 1280x720 by setting width=1920
+                // first would push an intermediate 1920x720 mode at every client (observed
+                // live on the devbox: a wrong-aspect reconfigure flash, kwin re-laying out
+                // twice). `render-size` is the atomic path for those.
+                if !was_complete && width > 0 && height > 0 {
                     if let Some(state) = self.state.lock().unwrap().as_ref() {
                         state.display.set_render_size(width, height);
                     }
+                } else {
+                    gst::debug!(
+                        CAT,
+                        imp = self,
+                        "{} stored as {} but not applied (pair {}x{} would be half-updated); \
+                         set the render-size property (\"WxH\") to apply a size atomically",
+                        pspec.name(),
+                        v,
+                        width,
+                        height
+                    );
                 }
             }
             "ui-scale" => {
@@ -581,6 +638,10 @@ impl ObjectImpl for WaylandDisplaySrc {
             "hdr" => {
                 let settings = self.settings.lock().unwrap();
                 settings.hdr.to_value()
+            }
+            "render-size" => {
+                let settings = self.settings.lock().unwrap();
+                format!("{}x{}", settings.render_width, settings.render_height).to_value()
             }
             "render-width" => {
                 let settings = self.settings.lock().unwrap();
@@ -1624,6 +1685,30 @@ impl PushSrcImpl for WaylandDisplaySrc {
             state.display.frame().map(CreateSuccess::NewBuffer)
         })
     }
+}
+
+/// Upper bound for either render dimension, matching the `render-width`/`render-height`
+/// ParamSpec maxima (the string form has no GObject-level range check of its own).
+const MAX_RENDER_DIMENSION: i32 = 16384;
+
+/// Parse the `render-size` property's `"WxH"` form (e.g. `"1280x720"`; `"0x0"` = follow the
+/// encode size). Returns `None` for anything malformed — a missing/extra `x`, a non-digit,
+/// a sign, whitespace, or a dimension above [`MAX_RENDER_DIMENSION`] — so the caller can warn
+/// and keep the previous value instead of applying a garbage mode. Only one dimension being
+/// zero is rejected too: a `"1920x0"` pair has no meaning (use `"0x0"` to follow the encode).
+fn parse_render_size(raw: &str) -> Option<(i32, i32)> {
+    let (w, h) = raw.split_once('x')?;
+    let dim = |s: &str| -> Option<i32> {
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        s.parse::<i32>().ok().filter(|v| *v <= MAX_RENDER_DIMENSION)
+    };
+    let (w, h) = (dim(w)?, dim(h)?);
+    if (w == 0) != (h == 0) {
+        return None;
+    }
+    Some((w, h))
 }
 
 /// A `/dev/dri/*` render node backs a real `GstVaDisplay`; the `software` (llvmpipe)

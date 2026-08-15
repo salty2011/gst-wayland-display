@@ -30,7 +30,84 @@ fn render_size_and_ui_scale_defaults() {
     let src = make_src();
     assert_eq!(src.property::<i32>("render-width"), 0);
     assert_eq!(src.property::<i32>("render-height"), 0);
+    assert_eq!(src.property::<String>("render-size"), "0x0");
     assert_eq!(src.property::<f64>("ui-scale"), 1.0);
+}
+
+#[test]
+fn render_size_string_sets_both_dimensions() {
+    let src = make_src();
+    src.set_property("render-size", "1280x720");
+    assert_eq!(src.property::<i32>("render-width"), 1280);
+    assert_eq!(src.property::<i32>("render-height"), 720);
+    assert_eq!(src.property::<String>("render-size"), "1280x720");
+}
+
+#[test]
+fn render_size_string_resets_to_follow_encode() {
+    let src = make_src();
+    src.set_property("render-size", "1280x720");
+    src.set_property("render-size", "0x0");
+    assert_eq!(src.property::<i32>("render-width"), 0);
+    assert_eq!(src.property::<i32>("render-height"), 0);
+    assert_eq!(src.property::<String>("render-size"), "0x0");
+}
+
+#[test]
+fn render_size_string_rejects_malformed_values() {
+    let src = make_src();
+    src.set_property("render-size", "1280x720");
+    for bad in [
+        "",
+        "bogus",
+        "1280",
+        "1280x",
+        "x720",
+        "1280x720x60",
+        "-1x720",
+        "1280 x 720",
+        "1280X720",
+        "1280x720 ",
+        "20000x720", // above the 16384 ParamSpec maximum
+        "1920x0",    // half-zero has no meaning; "0x0" is the reset
+    ] {
+        src.set_property("render-size", bad);
+        assert_eq!(
+            src.property::<String>("render-size"),
+            "1280x720",
+            "malformed render-size {bad:?} must be ignored, not applied"
+        );
+    }
+}
+
+/// The live defect this property exists for: with a pair already stored, setting
+/// `render-width` alone must NOT hand the compositor a half-updated `1920x720`.
+///
+/// The element test cannot observe `Command` sends (the compositor thread only exists
+/// after `start()`, which needs a GPU + wayland socket), so this pins the *stored* state
+/// and the reachable half of the contract; the forwarding rule itself is asserted by the
+/// comment-documented guard in `set_property` and by the core's sticky-size unit tests.
+#[test]
+fn int_props_store_a_resize_without_committing_it() {
+    let src = make_src();
+    src.set_property("render-size", "1280x720");
+    src.set_property("render-width", 1920i32);
+    // Stored (so a later `render-size` or caps re-negotiation is consistent) ...
+    assert_eq!(src.property::<i32>("render-width"), 1920);
+    assert_eq!(src.property::<i32>("render-height"), 720);
+    // ... and the atomic property is the way to actually apply the new pair.
+    src.set_property("render-size", "1920x1080");
+    assert_eq!(src.property::<String>("render-size"), "1920x1080");
+}
+
+/// First-time completion through the int props stays supported (the `gst-launch
+/// render-width=1280 render-height=720` path).
+#[test]
+fn int_props_complete_an_initial_pair() {
+    let src = make_src();
+    src.set_property("render-width", 1280i32);
+    src.set_property("render-height", 720i32);
+    assert_eq!(src.property::<String>("render-size"), "1280x720");
 }
 
 #[test]
@@ -63,7 +140,7 @@ fn ui_scale_round_trips() {
 #[test]
 fn properties_are_readwrite_and_not_construct_only() {
     let src = make_src();
-    for name in ["render-width", "render-height", "ui-scale"] {
+    for name in ["render-size", "render-width", "render-height", "ui-scale"] {
         let pspec = src.find_property(name).expect("property exists");
         let flags = pspec.flags();
         assert!(
