@@ -120,6 +120,15 @@ pub struct Settings {
     /// content-light-level caps fields, so a downstream `vulkanh265enc` emits the matching
     /// VUI + mastering/CLL SEI. Only affects the P010 path; NV12/SDR is unchanged. Default off.
     hdr: bool,
+    /// App-facing render width (the `wl_output` mode clients see), decoupled from the
+    /// negotiated encode width. `0` = follow the encode size. Live-writable; see
+    /// `forward_render_size` for the "apply the pair" rule.
+    render_width: i32,
+    /// App-facing render height. `0` = follow the encode size.
+    render_height: i32,
+    /// UI scale advertised through `wp_fractional_scale_v1`. `None` = never set by the
+    /// application, so nothing is forwarded and the getter reports the 1.0 default.
+    ui_scale: Option<f64>,
     #[cfg(feature = "cuda")]
     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
     #[cfg(feature = "cuda")]
@@ -372,6 +381,48 @@ impl ObjectImpl for WaylandDisplaySrc {
                     )
                     .default_value(false)
                     .build(),
+                glib::ParamSpecInt::builder("render-width")
+                    .nick("Render width")
+                    .blurb(
+                        "App-facing render width: the wl_output mode width the Wayland \
+                         clients see, decoupled from the negotiated encode width. 0 = follow \
+                         the encode width. Live-writable (takes effect while PLAYING) and \
+                         sticky across caps re-negotiation. Set BOTH render-width and \
+                         render-height: the pair is only applied once both are non-zero (or \
+                         both zero), so setting them one at a time never produces an \
+                         intermediate mode. 0/0 = follow encode.",
+                    )
+                    .minimum(0)
+                    .maximum(16384)
+                    .default_value(0)
+                    .build(),
+                glib::ParamSpecInt::builder("render-height")
+                    .nick("Render height")
+                    .blurb(
+                        "App-facing render height: the wl_output mode height the Wayland \
+                         clients see, decoupled from the negotiated encode height. 0 = follow \
+                         the encode height. Live-writable (takes effect while PLAYING) and \
+                         sticky across caps re-negotiation. Set BOTH render-width and \
+                         render-height: the pair is only applied once both are non-zero (or \
+                         both zero), so setting them one at a time never produces an \
+                         intermediate mode. 0/0 = follow encode.",
+                    )
+                    .minimum(0)
+                    .maximum(16384)
+                    .default_value(0)
+                    .build(),
+                glib::ParamSpecDouble::builder("ui-scale")
+                    .nick("UI scale")
+                    .blurb(
+                        "UI scale advertised to clients through wp_fractional_scale_v1 \
+                         (preferred_scale). A hint only: it changes neither the wl_output mode \
+                         nor the wl_output scale, so the render size and the encode size are \
+                         unaffected. Live-writable and applied immediately.",
+                    )
+                    .minimum(1.0)
+                    .maximum(3.0)
+                    .default_value(1.0)
+                    .build(),
                 glib::ParamSpecUInt64::builder("app-surface-commits")
                     .nick("Application surface buffer commits")
                     .blurb(
@@ -456,6 +507,35 @@ impl ObjectImpl for WaylandDisplaySrc {
                 let mut settings = self.settings.lock().unwrap();
                 settings.hdr = value.get::<bool>().expect("Type checked upstream");
             }
+            "render-width" | "render-height" => {
+                let v = value.get::<i32>().expect("Type checked upstream");
+                let (width, height) = {
+                    let mut settings = self.settings.lock().unwrap();
+                    if pspec.name() == "render-width" {
+                        settings.render_width = v;
+                    } else {
+                        settings.render_height = v;
+                    }
+                    (settings.render_width, settings.render_height)
+                };
+                // Only forward a COMPLETE pair. A caller that sets width then height (the
+                // node-agent does exactly that) would otherwise drive the compositor
+                // through a `w_new x h_old` intermediate mode, which reconfigures every
+                // toplevel for nothing. Both-zero is the "follow encode" reset and is
+                // forwarded as-is.
+                if (width == 0) == (height == 0) {
+                    if let Some(state) = self.state.lock().unwrap().as_ref() {
+                        state.display.set_render_size(width, height);
+                    }
+                }
+            }
+            "ui-scale" => {
+                let scale = value.get::<f64>().expect("Type checked upstream");
+                self.settings.lock().unwrap().ui_scale = Some(scale);
+                if let Some(state) = self.state.lock().unwrap().as_ref() {
+                    state.display.set_ui_scale(scale);
+                }
+            }
             _ => unreachable!(),
         }
     }
@@ -501,6 +581,18 @@ impl ObjectImpl for WaylandDisplaySrc {
             "hdr" => {
                 let settings = self.settings.lock().unwrap();
                 settings.hdr.to_value()
+            }
+            "render-width" => {
+                let settings = self.settings.lock().unwrap();
+                settings.render_width.to_value()
+            }
+            "render-height" => {
+                let settings = self.settings.lock().unwrap();
+                settings.render_height.to_value()
+            }
+            "ui-scale" => {
+                let settings = self.settings.lock().unwrap();
+                settings.ui_scale.unwrap_or(1.0).to_value()
             }
             "app-surface-commits" => self
                 .state
@@ -767,6 +859,31 @@ impl WaylandDisplaySrc {
         let minor = waylanddisplaycore::utils::vulkan_nv12::render_node_minor(&node);
         self.vulkan_share
             .provide_context(self.obj().upcast_ref::<gst::Element>(), query, minor)
+    }
+
+    /// Re-send the stored render size / UI scale to the compositor right after a
+    /// `Command::VideoInfo`.
+    ///
+    /// Both values are sticky in the core, but a value set *before* the compositor thread
+    /// existed (i.e. before `start()`) has to be replayed once there is one — and the
+    /// render size must land after the encode size it is decoupled from, so the compositor
+    /// applies the mode exactly once per negotiation. A partial pair (only one dimension
+    /// set) is deliberately not forwarded; see `set_property`.
+    fn forward_display_geometry(&self) {
+        let (width, height, ui_scale) = {
+            let settings = self.settings.lock().unwrap();
+            (
+                settings.render_width,
+                settings.render_height,
+                settings.ui_scale,
+            )
+        };
+        if width > 0 && height > 0 {
+            let _ = self.command_tx.send(Command::RenderSize { width, height });
+        }
+        if let Some(scale) = ui_scale {
+            let _ = self.command_tx.send(Command::UiScale(scale));
+        }
     }
 }
 
@@ -1248,6 +1365,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                     profile,
                 });
             let _ = self.command_tx.send(Command::VideoInfo(video_info));
+            self.forward_display_geometry();
             return self.parent_set_caps(caps);
         }
 
@@ -1299,6 +1417,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         };
 
         let _ = self.command_tx.send(Command::VideoInfo(video_info));
+        self.forward_display_geometry();
 
         self.parent_set_caps(caps)
     }
