@@ -38,10 +38,12 @@ pub enum Command {
         width: i32,
         height: i32,
     },
-    /// Element -> compositor: set the UI scale advertised to clients through
-    /// `wp_fractional_scale_v1` (`preferred_scale`). Purely a hint: it does NOT change the
-    /// `wl_output` mode or the `wl_output` scale, so the render size and the encode size
-    /// are unaffected. Clamped to `[1.0, 3.0]`.
+    /// Element -> compositor: set the UI scale, which **is** the `wl_output` fractional
+    /// scale. The physical mode stays at the render size; the LOGICAL size clients lay out
+    /// against becomes `render_size / scale`, which is what makes the UI bigger. The value is
+    /// also announced through `wp_fractional_scale_v1` (`preferred_scale`) so scale-aware
+    /// clients render at the full render density rather than being upscaled. The encode size
+    /// is unaffected. Clamped to `[1.0, 3.0]`; non-finite values are ignored.
     UiScale(f64),
     Buffer(
         SyncSender<Result<gst::Buffer, SwapBuffersError>>,
@@ -296,9 +298,10 @@ impl WaylandDisplay {
         let _ = self.command_tx.send(Command::RenderSize { width, height });
     }
 
-    /// Set the UI scale advertised to clients via `wp_fractional_scale_v1`. This is a hint
-    /// only: neither the `wl_output` mode nor the `wl_output` scale change, so the render
-    /// size and the encode size are untouched. Values are clamped to `[1.0, 3.0]`.
+    /// Set the UI scale — the `wl_output` fractional scale. The physical mode stays at the
+    /// render size and the logical desktop becomes `render_size / scale`, so the UI grows;
+    /// the value is also announced via `wp_fractional_scale_v1` so scale-aware clients render
+    /// at full density. The encode size is untouched. Clamped to `[1.0, 3.0]`.
     pub fn set_ui_scale(&self, scale: f64) {
         let _ = self.command_tx.send(Command::UiScale(scale));
     }

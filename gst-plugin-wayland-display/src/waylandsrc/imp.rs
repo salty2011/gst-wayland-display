@@ -428,10 +428,14 @@ impl ObjectImpl for WaylandDisplaySrc {
                 glib::ParamSpecDouble::builder("ui-scale")
                     .nick("UI scale")
                     .blurb(
-                        "UI scale advertised to clients through wp_fractional_scale_v1 \
-                         (preferred_scale). A hint only: it changes neither the wl_output mode \
-                         nor the wl_output scale, so the render size and the encode size are \
-                         unaffected. Live-writable and applied immediately.",
+                        "UI scale for the virtual display. This is the wl_output fractional \
+                         scale: the physical mode stays at the render size, so the logical \
+                         desktop clients lay out against becomes render-size / ui-scale (2.0 \
+                         on a 1280x720 render = a 640x360 logical desktop, i.e. a 2x bigger \
+                         UI). It is also advertised through wp_fractional_scale_v1 \
+                         (preferred_scale), so scale-aware clients render at the full render \
+                         density instead of being upscaled. The encode size is unaffected. \
+                         Live-writable and applied immediately.",
                     )
                     .minimum(1.0)
                     .maximum(3.0)

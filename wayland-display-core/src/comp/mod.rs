@@ -158,10 +158,12 @@ pub struct State {
     /// User-requested app-facing output mode. `None` = follow the encode size
     /// (today's behaviour). Sticky across caps re-negotiation.
     pub(crate) render_size: Option<Size<i32, Physical>>,
-    /// UI scale advertised to clients through `wp_fractional_scale_v1::preferred_scale`.
-    /// A hint only: the `wl_output` mode and the `wl_output` scale are never derived from
-    /// it, so neither the render size nor the encode size move. Clamped to
-    /// [`UI_SCALE_MIN`]..=[`UI_SCALE_MAX`]. Sticky, like `render_size`.
+    /// UI scale — the `wl_output` fractional scale. The physical mode stays at the render
+    /// size, so the LOGICAL size (`mode / ui_scale`) is what shrinks, which is what makes the
+    /// UI bigger; it is also announced through `wp_fractional_scale_v1::preferred_scale` so
+    /// scale-aware clients render at the full render density. The encode size is never
+    /// derived from it. Clamped to [`UI_SCALE_MIN`]..=[`UI_SCALE_MAX`]. Sticky, like
+    /// `render_size`.
     pub(crate) ui_scale: f64,
     pub seat: Seat<Self>,
     pub space: Space<Window>,
@@ -942,10 +944,16 @@ pub(crate) fn apply_output_mode(state: &mut State, size: Size<i32, Physical>, re
     // the mode -- and therefore the density everything is composited at -- stays the render
     // size. Legacy clients see `wl_output.scale = ceil(ui_scale)`; scale-aware ones get the
     // exact value through `wp_fractional_scale_v1` (see `announce_ui_scale`).
+    // Pass the scale only when it actually differs from what the Output already carries:
+    // `change_current_state` emits a `wl_output.scale` event for whatever it is handed, and
+    // the default path (ui_scale 1.0, Output built at `Integer(1)`) would otherwise re-send a
+    // redundant scale of 1 on every mode change. A real change -- in either direction,
+    // including back down to 1.0 -- still goes through.
+    let scale_changed = output.current_scale().fractional_scale() != state.ui_scale;
     output.change_current_state(
         Some(mode),
         None,
-        Some(Scale::Fractional(state.ui_scale)),
+        scale_changed.then_some(Scale::Fractional(state.ui_scale)),
         None,
     );
     output.set_preferred(mode);
@@ -1137,11 +1145,31 @@ pub(crate) fn configure_toplevels(state: &State, new_size: Size<i32, Logical>) {
 /// "follow the encode size" (`render_size = None`). The value is sticky: it is re-applied
 /// by [`apply_video_info`] on every caps re-negotiation.
 pub(crate) fn apply_render_size(state: &mut State, size: Size<i32, Physical>) {
-    state.render_size = if size.w > 0 && size.h > 0 {
+    let requested = if size.w > 0 && size.h > 0 {
         Some(size)
     } else {
         None
     };
+
+    // The element re-forwards the display geometry after every `Command::VideoInfo` (both
+    // set_caps arms), so an unchanged render size arrives on every caps renegotiation --
+    // including every ABR resolution step. Without this guard each one runs the mode path a
+    // SECOND time: another `change_current_state`, another damage-tracker rebuild (= a
+    // full-damage frame) and another `send_configure` to every toplevel. The mode-matches half
+    // keeps it honest: if the output has drifted from the effective size for any other reason,
+    // the re-apply still happens.
+    let mode_matches = state
+        .output
+        .as_ref()
+        .and_then(|o| o.current_mode())
+        .map(|m| m.size)
+        == Some(effective_render_size(state));
+    if requested == state.render_size && state.output.is_some() && mode_matches {
+        tracing::debug!(?size, "Render size unchanged; nothing to re-apply");
+        return;
+    }
+
+    state.render_size = requested;
     if state.output.is_none() {
         // No output yet: `apply_video_info` will pick the stored value up.
         return;

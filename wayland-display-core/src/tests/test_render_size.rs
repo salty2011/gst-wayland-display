@@ -293,6 +293,39 @@ fn cold_start_ui_scale_before_any_video_info() {
     );
 }
 
+/// `forward_display_geometry` re-sends the render size after every `Command::VideoInfo`, on
+/// both set_caps arms — so an unchanged render size arrives on every caps renegotiation,
+/// i.e. on every ABR resolution step. Each redundant apply would otherwise re-run the whole
+/// mode path: a second `change_current_state`, a second damage-tracker rebuild (a full-damage
+/// frame) and a second configure to every toplevel.
+#[test]
+fn a_redundant_render_size_apply_is_a_no_op() {
+    let mut f = Fixture::new();
+    f.create_window(320, 240);
+    apply_encode(&mut f, 1920, 1080, 60);
+    apply_render(&mut f, 1280, 720);
+
+    let before = f.client.configure_count();
+    f.client.get_output_events().clear();
+    apply_render(&mut f, 1280, 720);
+
+    assert_eq!(
+        f.client.configure_count(),
+        before,
+        "re-applying the SAME render size must not reconfigure the toplevel",
+    );
+    assert!(
+        f.client.get_output_events().is_empty(),
+        "... nor re-send any wl_output state: {:?}",
+        f.client.get_output_events(),
+    );
+
+    // ... but a real change still does.
+    apply_render(&mut f, 960, 540);
+    assert!(f.client.configure_count() > before);
+    assert_eq!(mode_dimensions(&mut f), Some((960, 540)));
+}
+
 /// The element re-sends the UI scale after every render-size change, so a redundant apply is
 /// the common case, not an edge case. Under design 2 it would otherwise re-run the whole mode
 /// path (new damage tracker + a configure to every toplevel) for no reason.
