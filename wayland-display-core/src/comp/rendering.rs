@@ -220,9 +220,23 @@ impl State {
         assert!(self.video_info.is_some());
         assert!(self.output_buffer.is_some());
 
+        // The scene is composited at the output's scale (the UI scale): the output's LOGICAL
+        // size is `mode / ui_scale`, so drawing at that scale puts the scene back at the
+        // physical render size -- which is what the rescale below maps into the encode
+        // framebuffer -- and a scale-aware client's high-density buffer is sampled 1:1 rather
+        // than being squeezed into the logical size first. `space_render_elements` picks this
+        // up from the Output on its own; the cursor is built by hand, so it needs it passed
+        // in. 1.0 unless a UI scale was requested, i.e. the default path is unchanged.
+        let output_scale = self
+            .output
+            .as_ref()
+            .expect("output not set")
+            .current_scale()
+            .fractional_scale();
+
         // The cursor lives in RENDER space (its location is `pointer_location`, which input
-        // clamps to the output mode), so it is built at scale 1.0 here and scaled below
-        // together with the client surfaces.
+        // clamps to the output's logical extent), so it is built at the same scale here and
+        // scaled below together with the client surfaces.
         let cursor_elements: Vec<CursorElement<GlesRenderer>> =
             if Instant::now().duration_since(self.last_pointer_movement) < Duration::from_secs(5) {
                 match &self.cursor_state {
@@ -230,7 +244,7 @@ impl State {
                     // TODO: icon?
                     MemoryRenderBufferRenderElement::from_buffer(
                         &mut self.renderer,
-                        self.pointer_location.to_physical_precise_round(1),
+                        self.pointer_location.to_physical_precise_round(output_scale),
                         &self.cursor_element,
                         None,
                         None,
@@ -243,8 +257,8 @@ impl State {
                     smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
                         &mut self.renderer,
                         wl_surface,
-                        self.pointer_location.to_physical_precise_round(1),
-                        1.,
+                        self.pointer_location.to_physical_precise_round(output_scale),
+                        output_scale,
                         1.,
                         Kind::Cursor,
                     )
@@ -269,6 +283,9 @@ impl State {
             &mut self.renderer,
             [&self.space],
             self.output.as_ref().unwrap(),
+            // alpha, not scale: `space_render_elements` reads the scale off the Output itself
+            // (`output.current_scale().fractional_scale()`), so the client surfaces follow the
+            // UI scale with no argument from us.
             1.0,
         )?;
 

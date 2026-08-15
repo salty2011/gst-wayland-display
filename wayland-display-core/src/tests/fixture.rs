@@ -178,6 +178,27 @@ impl Fixture {
         self.client.create_window();
         self.round_trip();
         self.client.setup_window_solid(width, height, rgb);
+        self.finish_solid_window();
+    }
+
+    /// [`Fixture::create_solid_window`] for a HiDPI-aware client: a `buf_w`x`buf_h` buffer
+    /// presented at a `dst_w`x`dst_h` logical size (buffer = logical x UI scale).
+    pub fn create_solid_window_hidpi(
+        &mut self,
+        buf_w: u16,
+        buf_h: u16,
+        dst_w: u16,
+        dst_h: u16,
+        rgb: u32,
+    ) {
+        self.client.create_window();
+        self.round_trip();
+        self.client
+            .setup_window_solid_dst(buf_w, buf_h, dst_w, dst_h, rgb);
+        self.finish_solid_window();
+    }
+
+    fn finish_solid_window(&mut self) {
         self.round_trip();
         self.round_trip();
         for window in self.server.space.elements() {

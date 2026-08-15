@@ -29,8 +29,27 @@ fn apply_render(f: &mut Fixture, width: i32, height: i32) {
     f.round_trip();
 }
 
+fn apply_scale(f: &mut Fixture, scale: f64) {
+    apply_ui_scale(&mut f.server, scale);
+    f.round_trip();
+    f.round_trip();
+}
+
 fn mode_dimensions(f: &mut Fixture) -> Option<(i32, i32)> {
     latest_mode_dimensions(f.client.get_output_events()).map(|(w, h, _)| (w, h))
+}
+
+/// The most recent `wl_output::Event::Scale`. Integer, per the protocol: smithay sends
+/// `ceil(fractional)` here and the exact value via `wp_fractional_scale_v1`.
+fn output_scale_event(f: &mut Fixture) -> Option<i32> {
+    f.client
+        .get_output_events()
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            wl_output::Event::Scale { factor } => Some(*factor),
+            _ => None,
+        })
 }
 
 #[test]
@@ -158,26 +177,83 @@ fn ui_scale_is_sent_as_preferred_scale_to_mapped_toplevel() {
         "the toplevel should have been configured at least at map and at the scale change",
     );
 
-    // A pure hint: the wl_output must not move at all -- no new scale, no new mode.
-    let output_events = f.client.get_output_events();
-    assert!(
-        !output_events
-            .iter()
-            .any(|e| matches!(e, wl_output::Event::Scale { .. })),
-        "a UI-scale change must NOT change the wl_output scale: {:?}",
-        output_events,
+    // The PHYSICAL mode does not move -- the scale is what shrinks the logical size, so the
+    // composite density (and therefore the encode framebuffer) is untouched.
+    assert_eq!(
+        mode_dimensions(&mut f),
+        Some((1920, 1080)),
+        "a UI-scale change must not move the physical wl_output mode",
     );
-    assert!(
-        !output_events
-            .iter()
-            .any(|e| matches!(e, wl_output::Event::Mode { .. })),
-        "a UI-scale change must NOT change the wl_output mode: {:?}",
-        output_events,
+    assert_eq!(
+        output_scale_event(&mut f),
+        Some(2),
+        "legacy clients must see the UI scale as the (integer) wl_output scale",
+    );
+    assert_eq!(
+        f.client.last_configure_size(),
+        Some((960, 540)),
+        "the logical size the toplevel is configured at is mode / ui_scale",
     );
 
     // ... and the encode size is untouched.
     let vi = f.server.video_info.as_ref().unwrap();
     assert_eq!((vi.width(), vi.height()), (1920, 1080));
+}
+
+#[test]
+fn ui_scale_shrinks_logical_mode_and_keeps_scene_full_frame() {
+    let mut f = Fixture::new();
+    hide_cursor(&mut f);
+
+    // Encode 1920x1080, render 1280x720, UI scale 2.
+    apply_encode(&mut f, 1920, 1080, 60);
+    apply_render(&mut f, 1280, 720);
+    f.client.get_output_events().clear();
+    apply_scale(&mut f, 2.0);
+
+    // The PHYSICAL mode stays the render size; the scale is what makes the desktop logically
+    // half as big, so the UI grows without the framebuffer or the encode size changing.
+    assert_eq!(mode_dimensions(&mut f), Some((1280, 720)));
+    assert_eq!(output_scale_event(&mut f), Some(2));
+
+    // A HiDPI-aware client: 640x360 logical, backed by a 1280x720 buffer.
+    f.create_solid_window_hidpi(1280, 720, 640, 360, WHITE);
+    assert_eq!(
+        f.client.last_configure_size(),
+        Some((640, 360)),
+        "the toplevel must be configured at the LOGICAL size (render / ui_scale)",
+    );
+
+    // That 1280x720 buffer is composited at the render density (1:1, not downsampled to the
+    // 640x360 logical size) and then upscaled 1.5x into the encode framebuffer, which it
+    // fills edge to edge.
+    let (px, stride) = frame_pixels(&mut f);
+    assert_lit(&px, stride, 10, 10);
+    assert_lit(&px, stride, 1900, 1000);
+}
+
+#[test]
+fn mode_change_remaps_the_pointer_instead_of_recentring_it() {
+    let mut f = Fixture::new();
+    apply_encode(&mut f, 1920, 1080, 60);
+
+    // Put the cursor somewhere distinctly off-centre: 1/4 across, 3/4 down.
+    f.server.set_pointer_location(Point::from((480.0, 810.0)));
+
+    // Halve the logical extent via the UI scale: 1920x1080 -> 960x540.
+    apply_scale(&mut f, 2.0);
+
+    let p = f.server.pointer_location;
+    assert!(
+        (p.x - 240.0).abs() < 1.0 && (p.y - 405.0).abs() < 1.0,
+        "the pointer must keep its RELATIVE position across a scale change \
+         (expected ~(240, 405), got {p:?})",
+    );
+    assert_ne!(
+        (p.x, p.y),
+        (480.0, 270.0),
+        "and must not be teleported to the centre of the new extent",
+    );
 }
 
 #[test]

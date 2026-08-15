@@ -31,7 +31,7 @@ use smithay::{
         },
     },
     input::{Seat, SeatState, keyboard::XkbConfig, pointer::CursorImageStatus},
-    output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel},
+    output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::{
         calloop::{
             EventLoop, Interest, LoopHandle, Mode, PostAction,
@@ -909,8 +909,13 @@ pub(crate) fn effective_render_size(state: &State) -> Size<i32, Physical> {
 }
 
 /// The mode/configure half of [`apply_video_info`]: point the (already created) Output at
-/// `size` @ `refresh_mhz`, rebuild the damage tracker, recentre the pointer and re-send a
-/// configure to every mapped toplevel.
+/// `size` @ `refresh_mhz` with the current UI scale, rebuild the damage tracker, remap the
+/// pointer and re-send a configure to every mapped toplevel.
+///
+/// `size` is the PHYSICAL mode (the render size); the app-facing LOGICAL size is
+/// `size / ui_scale`, which is what toplevels are configured at. Compositing stays at the
+/// physical render density, so a scale-aware client's high-density buffer lands in our
+/// framebuffer 1:1 instead of being downsampled to the logical size and blown back up.
 ///
 /// Kept separate from the encode-side (allocator / output-buffer) half so the app-facing
 /// mode can change without touching the encode size, and so the damage-tracker
@@ -920,11 +925,29 @@ pub(crate) fn apply_output_mode(state: &mut State, size: Size<i32, Physical>, re
         return;
     };
 
+    // The LOGICAL extent before the change, for the proportional pointer remap below. Read
+    // before `change_current_state`, which updates both halves of it in place.
+    let old_logical = output.current_mode().map(|m| {
+        m.size
+            .to_f64()
+            .to_logical(output.current_scale().fractional_scale())
+            .to_i32_round()
+    });
+
     let mode = OutputMode {
         size,
         refresh: refresh_mhz,
     };
-    output.change_current_state(Some(mode), None, None, None);
+    // The UI scale IS the output scale: it shrinks the logical size (`size / ui_scale`) while
+    // the mode -- and therefore the density everything is composited at -- stays the render
+    // size. Legacy clients see `wl_output.scale = ceil(ui_scale)`; scale-aware ones get the
+    // exact value through `wp_fractional_scale_v1` (see `announce_ui_scale`).
+    output.change_current_state(
+        Some(mode),
+        None,
+        Some(Scale::Fractional(state.ui_scale)),
+        None,
+    );
     output.set_preferred(mode);
 
     // The damage tracker describes the FRAMEBUFFER, not the app-facing output mode. The
@@ -952,16 +975,37 @@ pub(crate) fn apply_output_mode(state: &mut State, size: Size<i32, Physical>, re
         output.current_transform(),
     ));
 
-    let position = (size.w as f64 / 2.0, size.h as f64 / 2.0).into();
-    state.pointer_location = position;
-    state.pointer_absolute_location = position;
-
     let new_size = size
         .to_f64()
         .to_logical(output.current_scale().fractional_scale())
         .to_i32_round();
+
+    remap_pointer(state, old_logical, new_size);
     announce_ui_scale(state);
     configure_toplevels(state, new_size);
+}
+
+/// Move the pointer from a `old`-sized logical extent into a `new`-sized one, keeping it at
+/// the same *relative* position instead of teleporting it to the centre.
+///
+/// A mode or UI-scale change must not move the cursor out from under the user's hand; the
+/// only case that has no previous position to preserve is the very first mode (no previous
+/// extent, or a degenerate one), which centres as it always did.
+fn remap_pointer(state: &mut State, old: Option<Size<i32, Logical>>, new: Size<i32, Logical>) {
+    let pos: Point<f64, Logical> = match old {
+        Some(old) if old.w > 0 && old.h > 0 => {
+            let p = state.pointer_location;
+            (
+                p.x * new.w as f64 / old.w as f64,
+                p.y * new.h as f64 / old.h as f64,
+            )
+                .into()
+        }
+        _ => (new.w as f64 / 2.0, new.h as f64 / 2.0).into(),
+    };
+    let pos = state.clamp_coords(pos);
+    state.pointer_location = pos;
+    state.pointer_absolute_location = pos;
 }
 
 /// Push the current UI scale to `surface` through `wp_fractional_scale_v1::preferred_scale`.
@@ -1082,18 +1126,25 @@ pub(crate) fn apply_ui_scale(state: &mut State, scale: f64) {
     }
     let scale = scale.clamp(UI_SCALE_MIN, UI_SCALE_MAX);
     state.ui_scale = scale;
-    announce_ui_scale(state);
 
-    let Some(output) = state.output.clone() else {
-        // No output yet, so nothing to configure. Surfaces that appear later still learn
-        // the stored value through `FractionalScaleHandler::new_fractional_scale`.
+    if state.output.is_none() {
+        // No output yet: `apply_video_info` will pick the stored value up. Announce anyway,
+        // so a toplevel that already exists is not left on a stale scale; surfaces created
+        // later learn it through `FractionalScaleHandler::new_fractional_scale`.
+        announce_ui_scale(state);
         return;
-    };
-    let logical = effective_render_size(state)
-        .to_f64()
-        .to_logical(output.current_scale().fractional_scale())
-        .to_i32_round();
-    configure_toplevels(state, logical);
+    }
+    // The scale changes the output's LOGICAL size, so this goes through the mode path (which
+    // re-announces the fractional-scale hint and re-configures at the new logical size). The
+    // physical mode is unchanged, so the encode side and the composite density stay put.
+    let refresh = state
+        .output
+        .as_ref()
+        .and_then(|o| o.current_mode())
+        .map(|m| m.refresh)
+        .unwrap_or(60_000);
+    let eff = effective_render_size(state);
+    apply_output_mode(state, eff, refresh);
 }
 
 pub(crate) fn init(

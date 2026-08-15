@@ -276,8 +276,23 @@ impl WaylandClient {
     /// destination. Used by the render-size compositing tests, which assert on pixels read
     /// back out of the compositor's framebuffer.
     pub fn setup_window_solid(&mut self, width: u16, height: u16, rgb: u32) {
+        self.setup_window_solid_dst(width, height, width, height, rgb);
+    }
+
+    /// [`WaylandClient::setup_window_solid`] with the buffer size and the viewport destination
+    /// decoupled: a `buf_w`x`buf_h` buffer presented at a `dst_w`x`dst_h` LOGICAL size. That is
+    /// what a HiDPI-aware client does — buffer = logical x scale — so it exercises the UI-scale
+    /// path where the compositor must sample the dense buffer 1:1 rather than downsampling it.
+    pub fn setup_window_solid_dst(
+        &mut self,
+        buf_w: u16,
+        buf_h: u16,
+        dst_w: u16,
+        dst_h: u16,
+        rgb: u32,
+    ) {
         let qh = self.qh.clone();
-        let (w, h) = (u32::from(width), u32::from(height));
+        let (w, h) = (u32::from(buf_w), u32::from(buf_h));
 
         let mut file = tempfile::tempfile().unwrap();
         {
@@ -309,7 +324,7 @@ impl WaylandClient {
         let window = self.state.windows.last_mut().unwrap();
         window.set_title("Solid");
         window.attach_new_buffer(&buffer);
-        window.set_size(width, height);
+        window.set_size(dst_w, dst_h);
         window.ack_last_and_commit();
     }
 
@@ -330,6 +345,16 @@ impl WaylandClient {
             .first()
             .map(|w| w.configures_received.len())
             .unwrap_or(0)
+    }
+
+    /// Size carried by the most recent toplevel `configure` on the first window — the LOGICAL
+    /// size the compositor wants the client to be. `(0, 0)` means "you decide".
+    pub fn last_configure_size(&self) -> Option<(i32, i32)> {
+        self.state
+            .windows
+            .first()
+            .and_then(|w| w.configures_received.last())
+            .map(|(_, c)| c.size)
     }
 
     /// Call this to start receiving Relative events in `get_client_events()`
