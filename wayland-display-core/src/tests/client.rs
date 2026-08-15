@@ -16,6 +16,9 @@ use wayland_client::{
 };
 use wayland_protocols::{
     wp::{
+        fractional_scale::v1::client::wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
+        fractional_scale::v1::client::wp_fractional_scale_v1,
+        fractional_scale::v1::client::wp_fractional_scale_v1::WpFractionalScaleV1,
         pointer_constraints::zv1::{
             client::zwp_confined_pointer_v1, client::zwp_locked_pointer_v1::ZwpLockedPointerV1,
             client::zwp_pointer_constraints_v1,
@@ -51,6 +54,7 @@ struct State {
     buffer: Option<wl_buffer::WlBuffer>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
     viewporter: Option<WpViewporter>,
+    fractional_scale_manager: Option<WpFractionalScaleManagerV1>,
     seat: Option<wl_seat::WlSeat>,
     pointer_constraints: Option<ZwpPointerConstraintsV1>,
     relative_pointer_manager: Option<ZwpRelativePointerManagerV1>,
@@ -130,6 +134,11 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     state.viewporter =
                         Some(registry.bind::<WpViewporter, _, _>(name, version, qh, ()));
                 }
+                "wp_fractional_scale_manager_v1" => {
+                    state.fractional_scale_manager = Some(
+                        registry.bind::<WpFractionalScaleManagerV1, _, _>(name, version, qh, ()),
+                    );
+                }
                 "zwp_pointer_constraints_v1" => {
                     state.pointer_constraints =
                         Some(registry.bind::<ZwpPointerConstraintsV1, _, _>(name, version, qh, ()))
@@ -163,6 +172,7 @@ delegate_noop!(State: ignore WpViewport);
 delegate_noop!(State: ignore ZwpPointerConstraintsV1);
 delegate_noop!(State: ignore ZwpLockedPointerV1);
 delegate_noop!(State: ignore ZwpRelativePointerManagerV1);
+delegate_noop!(State: ignore WpFractionalScaleManagerV1);
 
 impl WaylandClient {
     pub fn new(w_socket: UnixStream) -> Self {
@@ -181,6 +191,7 @@ impl WaylandClient {
             buffer: None,
             wm_base: None,
             viewporter: None,
+            fractional_scale_manager: None,
             seat: None,
             pointer_constraints: None,
             relative_pointer_manager: None,
@@ -222,7 +233,27 @@ impl WaylandClient {
     }
 
     pub fn create_window(&mut self) {
-        self.state.create_window();
+        self.state.create_window(false);
+    }
+
+    /// Like [`WaylandClient::create_window`], but also creates a `wp_fractional_scale_v1`
+    /// for the new surface (before the first commit), so `preferred_scale` events for it
+    /// are recorded. Returns the surface, for use with
+    /// [`WaylandClient::last_preferred_scale`].
+    pub fn map_toplevel_with_fractional_scale(&mut self) -> wl_surface::WlSurface {
+        self.state.create_window(true);
+        self.state.windows.last().unwrap().surface.clone()
+    }
+
+    /// The most recent `wp_fractional_scale_v1::preferred_scale` for `surface`, in the
+    /// protocol's 1/120ths (so `2.0` arrives as `240`). `None` when the surface has no
+    /// fractional-scale object or has not been told a scale yet.
+    pub fn last_preferred_scale(&self, surface: &wl_surface::WlSurface) -> Option<u32> {
+        self.state
+            .windows
+            .iter()
+            .find(|w| w.surface == *surface)
+            .and_then(|w| w.preferred_scales.last().copied())
     }
 
     pub fn setup_window(&mut self, width: u16, height: u16) {
@@ -326,7 +357,7 @@ impl WaylandClient {
 }
 
 impl State {
-    pub fn create_window(&mut self) {
+    pub fn create_window(&mut self, with_fractional_scale: bool) {
         let compositor = self.compositor.as_ref().unwrap();
         let xdg_wm_base = self.wm_base.as_ref().unwrap();
         let viewporter = self.viewporter.as_ref().unwrap();
@@ -335,12 +366,20 @@ impl State {
         let xdg_surface = xdg_wm_base.get_xdg_surface(&surface, &self.qh, ());
         let xdg_toplevel = xdg_surface.get_toplevel(&self.qh, ());
         let viewport = viewporter.get_viewport(&surface, &self.qh, ());
+        let fractional_scale = with_fractional_scale.then(|| {
+            self.fractional_scale_manager
+                .as_ref()
+                .expect("compositor does not advertise wp_fractional_scale_manager_v1")
+                .get_fractional_scale(&surface, &self.qh, ())
+        });
 
         let window = Window {
             surface,
             xdg_surface,
             xdg_toplevel,
             viewport,
+            fractional_scale,
+            preferred_scales: Vec::new(),
             pending_configure: Configure::default(),
             configures_received: Vec::new(),
             close_requested: false,
@@ -375,6 +414,11 @@ pub struct Window {
     pub xdg_surface: xdg_surface::XdgSurface,
     pub xdg_toplevel: xdg_toplevel::XdgToplevel,
     pub viewport: WpViewport,
+    /// `wp_fractional_scale_v1` for this surface, when the window was created with one.
+    /// Held alive for the lifetime of the window: destroying it stops `preferred_scale`.
+    pub fractional_scale: Option<WpFractionalScaleV1>,
+    /// Every `preferred_scale` received for this surface, in 1/120ths.
+    pub preferred_scales: Vec<u32>,
     pub pending_configure: Configure,
     pub configures_received: Vec<(u32, Configure)>,
     pub close_requested: bool,
@@ -566,6 +610,27 @@ impl Dispatch<wl_output::WlOutput, ()> for State {
     ) {
         tracing::debug!("{:?}", event);
         state.output_events.push(event);
+    }
+}
+
+impl Dispatch<WpFractionalScaleV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        proxy: &WpFractionalScaleV1,
+        event: wp_fractional_scale_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        tracing::debug!("{:?}", event);
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event
+            && let Some(window) = state
+                .windows
+                .iter_mut()
+                .find(|w| w.fractional_scale.as_ref() == Some(proxy))
+        {
+            window.preferred_scales.push(scale);
+        }
     }
 }
 

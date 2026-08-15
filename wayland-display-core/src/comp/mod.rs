@@ -56,6 +56,7 @@ use smithay::{
         compositor::{CompositorClientState, CompositorState, with_states},
         dmabuf::{DmabufGlobal, DmabufState},
         drm_syncobj::{DrmSyncobjState, supports_syncobj_eventfd},
+        fractional_scale::{FractionalScaleManagerState, with_fractional_scale},
         output::OutputManagerState,
         pointer_constraints::PointerConstraintsState,
         presentation::PresentationState,
@@ -156,6 +157,11 @@ pub struct State {
     /// User-requested app-facing output mode. `None` = follow the encode size
     /// (today's behaviour). Sticky across caps re-negotiation.
     pub(crate) render_size: Option<Size<i32, Physical>>,
+    /// UI scale advertised to clients through `wp_fractional_scale_v1::preferred_scale`.
+    /// A hint only: the `wl_output` mode and the `wl_output` scale are never derived from
+    /// it, so neither the render size nor the encode size move. Clamped to
+    /// [`UI_SCALE_MIN`]..=[`UI_SCALE_MAX`]. Sticky, like `render_size`.
+    pub(crate) ui_scale: f64,
     pub seat: Seat<Self>,
     pub space: Space<Window>,
     pub popups: PopupManager,
@@ -186,6 +192,11 @@ pub struct State {
     pub shell_state: XdgShellState,
     pub shm_state: ShmState,
     viewporter_state: ViewporterState,
+    /// `wp_fractional_scale_manager_v1` global. Held so the global stays alive; the
+    /// preferred scale itself is pushed from `configure_toplevels` / the
+    /// `FractionalScaleHandler`.
+    #[allow(dead_code)]
+    fractional_scale_state: FractionalScaleManagerState,
     cursor_event_count: i32,
     pub single_pixel_buffer_state: SinglePixelBufferState,
     /// `wp_color_manager_v1` global id, present only when `WOLF_HDR_CM` is set. Gated so
@@ -325,6 +336,9 @@ impl State {
         let mut seat_state = SeatState::new();
         let shell_state = XdgShellState::new::<State>(&dh);
         let viewporter_state = ViewporterState::new::<State>(&dh);
+        // NOTE: `dh`, not `&dh` -- the neighbouring `new::<State>(&dh)` calls all trip
+        // clippy::needless_borrow (a pre-existing tree-wide pattern); no need to add one more.
+        let fractional_scale_state = FractionalScaleManagerState::new::<State>(dh);
         let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&dh);
 
         // Color management (staging wp_color_manager_v1). Gated behind WOLF_HDR_CM:
@@ -475,6 +489,7 @@ impl State {
             dmabuf_global,
             video_info: None,
             render_size: None,
+            ui_scale: 1.0,
             last_render: None,
             current_input_is_pq: false,
 
@@ -506,6 +521,7 @@ impl State {
             shell_state,
             shm_state,
             viewporter_state,
+            fractional_scale_state,
             single_pixel_buffer_state,
             color_mgmt_global,
             frog_color_mgmt_global,
@@ -919,9 +935,22 @@ pub(crate) fn apply_output_mode(state: &mut State, size: Size<i32, Physical>, re
         .to_f64()
         .to_logical(output.current_scale().fractional_scale())
         .to_i32_round();
+    configure_toplevels(state, new_size);
+}
+
+/// Re-announce the current UI scale and send a configure at `new_size` to every mapped
+/// toplevel.
+///
+/// Shared by [`apply_output_mode`] (so a render-size change also re-sends the scale) and
+/// [`apply_ui_scale`] (so a scale change re-sends a *non-empty* configure, which kwin needs
+/// in order to latch the new scale). Deliberately does NOT touch the pointer location:
+/// a UI-scale change must not teleport the cursor.
+pub(crate) fn configure_toplevels(state: &State, new_size: Size<i32, Logical>) {
+    let ui_scale = state.ui_scale;
     for window in state.space.elements() {
         let toplevel = window.toplevel().unwrap();
         let max_size = with_states(toplevel.wl_surface(), |states| {
+            with_fractional_scale(states, |fs| fs.set_preferred_scale(ui_scale));
             states
                 .data_map
                 .get::<XdgToplevelSurfaceData>()
@@ -978,6 +1007,39 @@ pub(crate) fn apply_render_size(state: &mut State, size: Size<i32, Physical>) {
     apply_output_mode(state, eff, refresh);
 }
 
+/// Lower bound for the UI scale hint (1.0 = no scaling).
+pub(crate) const UI_SCALE_MIN: f64 = 1.0;
+/// Upper bound for the UI scale hint.
+pub(crate) const UI_SCALE_MAX: f64 = 3.0;
+
+/// Apply a requested UI scale: clamp it to `[1.0, 3.0]`, store it, and re-announce it to
+/// every mapped toplevel through `wp_fractional_scale_v1::preferred_scale`, followed by a
+/// configure carrying the *current* size (kwin only latches a new scale on a non-empty
+/// configure -- `wayland_output.cpp:460-474`).
+///
+/// Intentionally does not go through [`apply_output_mode`]: the `wl_output` mode, the
+/// `wl_output` scale, the damage tracker and the pointer location must all stay put -- a
+/// scale change is a pure hint and must not teleport the cursor.
+pub(crate) fn apply_ui_scale(state: &mut State, scale: f64) {
+    if !scale.is_finite() {
+        tracing::warn!(scale, "Ignoring non-finite UI scale");
+        return;
+    }
+    let scale = scale.clamp(UI_SCALE_MIN, UI_SCALE_MAX);
+    state.ui_scale = scale;
+
+    let Some(output) = state.output.clone() else {
+        // No output yet: newly created `wp_fractional_scale_v1` objects still learn the
+        // stored value through `FractionalScaleHandler::new_fractional_scale`.
+        return;
+    };
+    let logical = effective_render_size(state)
+        .to_f64()
+        .to_logical(output.current_scale().fractional_scale())
+        .to_i32_round();
+    configure_toplevels(state, logical);
+}
+
 pub(crate) fn init(
     command_src: Channel<Command>,
     render: impl Into<RenderTarget>,
@@ -1031,6 +1093,10 @@ pub(crate) fn init(
                 Event::Msg(Command::RenderSize { width, height }) => {
                     tracing::info!(width, height, "Applying requested render size");
                     apply_render_size(state, (width, height).into());
+                }
+                Event::Msg(Command::UiScale(scale)) => {
+                    tracing::info!(scale, "Applying requested UI scale");
+                    apply_ui_scale(state, scale);
                 }
                 Event::Msg(Command::InputDevice(path)) => {
                     tracing::info!(path, "Adding input device.");

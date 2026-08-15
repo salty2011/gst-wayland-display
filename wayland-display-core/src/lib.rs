@@ -38,6 +38,11 @@ pub enum Command {
         width: i32,
         height: i32,
     },
+    /// Element -> compositor: set the UI scale advertised to clients through
+    /// `wp_fractional_scale_v1` (`preferred_scale`). Purely a hint: it does NOT change the
+    /// `wl_output` mode or the `wl_output` scale, so the render size and the encode size
+    /// are unaffected. Clamped to `[1.0, 3.0]`.
+    UiScale(f64),
     Buffer(
         SyncSender<Result<gst::Buffer, SwapBuffersError>>,
         Option<Tracer>,
@@ -289,6 +294,13 @@ impl WaylandDisplay {
     /// encode size". The value is sticky: it survives encode-caps re-negotiation.
     pub fn set_render_size(&self, width: i32, height: i32) {
         let _ = self.command_tx.send(Command::RenderSize { width, height });
+    }
+
+    /// Set the UI scale advertised to clients via `wp_fractional_scale_v1`. This is a hint
+    /// only: neither the `wl_output` mode nor the `wl_output` scale change, so the render
+    /// size and the encode size are untouched. Values are clamped to `[1.0, 3.0]`.
+    pub fn set_ui_scale(&self, scale: f64) {
+        let _ = self.command_tx.send(Command::UiScale(scale));
     }
 
     pub fn keyboard_input(&self, key: u32, pressed: bool) {

@@ -1,7 +1,7 @@
 //! Render size (the app-facing `wl_output` mode) is decoupled from the encode size
 //! carried by the negotiated caps, and is sticky across caps re-negotiation.
 
-use crate::comp::{apply_render_size, apply_video_info};
+use crate::comp::{apply_render_size, apply_ui_scale, apply_video_info};
 use crate::tests::fixture::Fixture;
 use crate::tests::test_resolution::{latest_mode_dimensions, make_video_info};
 use crate::utils::RenderTarget;
@@ -119,6 +119,53 @@ fn render_size_before_video_info_is_applied_on_negotiation() {
         Some((1280, 720)),
         "a render size requested before caps negotiation must survive it",
     );
+}
+
+#[test]
+fn ui_scale_is_sent_as_preferred_scale_to_mapped_toplevel() {
+    let mut f = Fixture::new();
+    let surface = f.create_window_with_fractional_scale(320, 240);
+    apply_encode(&mut f, 1920, 1080, 60);
+
+    // The scale is announced at wp_fractional_scale_v1 creation time, at the default 1.0.
+    assert_eq!(f.client.last_preferred_scale(&surface), Some(120));
+
+    let before = f.client.configure_count();
+    apply_ui_scale(&mut f.server, 2.0);
+    f.round_trip();
+    f.round_trip();
+
+    assert_eq!(
+        f.client.last_preferred_scale(&surface),
+        Some(240),
+        "the UI scale must reach the client as preferred_scale in 1/120ths",
+    );
+    assert!(
+        f.client.configure_count() > before,
+        "a UI-scale change must be followed by a (non-empty) configure (was {}, now {})",
+        before,
+        f.client.configure_count(),
+    );
+    assert!(
+        f.client.configure_count() >= 2,
+        "the toplevel should have been configured at least at map and at the scale change",
+    );
+
+    // A pure hint: neither the output mode nor the encode size move.
+    assert_eq!(mode_dimensions(&mut f), Some((1920, 1080)));
+    let vi = f.server.video_info.as_ref().unwrap();
+    assert_eq!((vi.width(), vi.height()), (1920, 1080));
+}
+
+#[test]
+fn ui_scale_out_of_range_is_clamped() {
+    let mut f = Fixture::new();
+
+    apply_ui_scale(&mut f.server, 7.5);
+    assert_eq!(f.server.ui_scale, 3.0);
+
+    apply_ui_scale(&mut f.server, 0.2);
+    assert_eq!(f.server.ui_scale, 1.0);
 }
 
 #[test]

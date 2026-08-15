@@ -160,6 +160,23 @@ impl Fixture {
 
     pub fn create_window(&mut self, width: u16, height: u16) {
         self.client.create_window();
+        self.finish_window(width, height);
+    }
+
+    /// Like [`Fixture::create_window`], but the surface also carries a
+    /// `wp_fractional_scale_v1`. Returns the surface, for
+    /// [`WaylandClient::last_preferred_scale`].
+    pub fn create_window_with_fractional_scale(
+        &mut self,
+        width: u16,
+        height: u16,
+    ) -> wayland_client::protocol::wl_surface::WlSurface {
+        let surface = self.client.map_toplevel_with_fractional_scale();
+        self.finish_window(width, height);
+        surface
+    }
+
+    fn finish_window(&mut self, width: u16, height: u16) {
         self.round_trip();
 
         self.client.setup_window(width, height);
