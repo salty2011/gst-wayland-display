@@ -3,4 +3,5 @@ mod device;
 mod fixture;
 mod test_keymap_fd;
 mod test_pointer;
+mod test_render_size;
 mod test_resolution;

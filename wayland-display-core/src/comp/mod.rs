@@ -153,6 +153,9 @@ pub struct State {
     // management
     pub output: Option<Output>,
     pub video_info: Option<VideoInfo>,
+    /// User-requested app-facing output mode. `None` = follow the encode size
+    /// (today's behaviour). Sticky across caps re-negotiation.
+    pub(crate) render_size: Option<Size<i32, Physical>>,
     pub seat: Seat<Self>,
     pub space: Space<Window>,
     pub popups: PopupManager,
@@ -471,6 +474,7 @@ impl State {
             render_node,
             dmabuf_global,
             video_info: None,
+            render_size: None,
             last_render: None,
             current_input_is_pq: false,
 
@@ -730,9 +734,9 @@ pub(crate) fn apply_video_info(
         base_info.format(),
         base_info.format().to_fourcc()
     );
-    let size: Size<i32, Physical> = (base_info.width() as i32, base_info.height() as i32).into();
     let framerate = base_info.fps();
     let duration = Duration::from_secs_f64(framerate.numer() as f64 / framerate.denom() as f64);
+    let refresh = (duration.as_secs_f64() * 1000.0).round() as i32;
 
     // init wayland objects
     let output = state.output.get_or_insert_with(|| {
@@ -748,21 +752,10 @@ pub(crate) fn apply_video_info(
         output.create_global::<State>(&state.dh);
         output
     });
-    let mode = OutputMode {
-        size: size.into(),
-        refresh: (duration.as_secs_f64() * 1000.0).round() as i32,
-    };
-    output.change_current_state(Some(mode), None, None, None);
-    output.set_preferred(mode);
-    let dtr = OutputDamageTracker::from_output(&output);
-
     if !output_already_running {
+        let output = output.clone();
         state.space.map_output(&output, (0, 0));
     }
-    state.dtr = Some(dtr);
-    let position = (size.w as f64 / 2.0, size.h as f64 / 2.0).into();
-    state.pointer_location = position;
-    state.pointer_absolute_location = position;
     let prev_video_info = state.video_info.clone();
     state.video_info = Some(video_info.clone().into());
 
@@ -877,38 +870,112 @@ pub(crate) fn apply_video_info(
         }
     }
 
+    // The app-facing output mode is the *render* size, which is the encode size unless a
+    // render size was requested (sticky across caps re-negotiation).
+    apply_output_mode(state, effective_render_size(state), refresh);
+}
+
+/// The size the app-facing `wl_output` mode should have: the requested render size when
+/// one is set, otherwise the encode size. A requested render size is never allowed to
+/// exceed the encode size (there is nothing to scale it into).
+pub(crate) fn effective_render_size(state: &State) -> Size<i32, Physical> {
+    let enc: Option<Size<i32, Physical>> = state
+        .video_info
+        .as_ref()
+        .map(|vi| (vi.width() as i32, vi.height() as i32).into());
+    match (state.render_size, enc) {
+        (Some(r), Some(e)) => (r.w.min(e.w), r.h.min(e.h)).into(),
+        (Some(r), None) => r,
+        (None, Some(e)) => e,
+        (None, None) => (0, 0).into(),
+    }
+}
+
+/// The mode/configure half of [`apply_video_info`]: point the (already created) Output at
+/// `size` @ `refresh_mhz`, rebuild the damage tracker, recentre the pointer and re-send a
+/// configure to every mapped toplevel.
+///
+/// Kept separate from the encode-side (allocator / output-buffer) half so the app-facing
+/// mode can change without touching the encode size, and so the damage-tracker
+/// construction lives in exactly one place.
+pub(crate) fn apply_output_mode(state: &mut State, size: Size<i32, Physical>, refresh_mhz: i32) {
+    let Some(output) = state.output.clone() else {
+        return;
+    };
+
+    let mode = OutputMode {
+        size,
+        refresh: refresh_mhz,
+    };
+    output.change_current_state(Some(mode), None, None, None);
+    output.set_preferred(mode);
+    state.dtr = Some(OutputDamageTracker::from_output(&output));
+
+    let position = (size.w as f64 / 2.0, size.h as f64 / 2.0).into();
+    state.pointer_location = position;
+    state.pointer_absolute_location = position;
+
     let new_size = size
         .to_f64()
         .to_logical(output.current_scale().fractional_scale())
         .to_i32_round();
     for window in state.space.elements() {
         let toplevel = window.toplevel().unwrap();
-        let max_size = Rectangle::from_size(
-            with_states(toplevel.wl_surface(), |states| {
-                states
-                    .data_map
-                    .get::<XdgToplevelSurfaceData>()
-                    .map(|_attrs| {
-                        states
-                            .cached_state
-                            .get::<SurfaceCachedState>()
-                            .current()
-                            .max_size
-                    })
-            })
-            .unwrap_or(new_size),
-        );
+        let max_size = with_states(toplevel.wl_surface(), |states| {
+            states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .map(|_attrs| {
+                    states
+                        .cached_state
+                        .get::<SurfaceCachedState>()
+                        .current()
+                        .max_size
+                })
+        })
+        .unwrap_or(new_size);
 
-        let new_size = max_size
-            .intersection(Rectangle::from_size(new_size))
-            .map(|rect| rect.size);
+        // A toplevel that declares no max size (the common case) must be configured at the
+        // full output size -- intersecting with a (0,0) rectangle yields an EMPTY configure,
+        // which leaves the client sizing itself. Mirrors the initial-configure path in
+        // `wayland/handlers/compositor.rs`.
+        let configured_size = if max_size.w == 0 && max_size.h == 0 {
+            Some(new_size)
+        } else {
+            Rectangle::from_size(max_size)
+                .intersection(Rectangle::from_size(new_size))
+                .map(|rect| rect.size)
+        };
         toplevel.with_pending_state(|state| {
-            state.size = new_size;
+            state.size = configured_size;
             state.states.set(XdgState::Fullscreen);
             state.states.set(XdgState::Activated);
         });
         toplevel.send_configure();
     }
+}
+
+/// Apply a requested app-facing render size. A non-positive width or height means
+/// "follow the encode size" (`render_size = None`). The value is sticky: it is re-applied
+/// by [`apply_video_info`] on every caps re-negotiation.
+pub(crate) fn apply_render_size(state: &mut State, size: Size<i32, Physical>) {
+    state.render_size = if size.w > 0 && size.h > 0 {
+        Some(size)
+    } else {
+        None
+    };
+    if state.output.is_none() {
+        // No output yet: `apply_video_info` will pick the stored value up.
+        return;
+    }
+    let refresh = state
+        .output
+        .as_ref()
+        .and_then(|o| o.current_mode())
+        .map(|m| m.refresh)
+        .unwrap_or(60_000);
+    let eff = effective_render_size(state);
+    apply_output_mode(state, eff, refresh);
 }
 
 pub(crate) fn init(
@@ -960,6 +1027,10 @@ pub(crate) fn init(
             match event {
                 Event::Msg(Command::VideoInfo(video_info)) => {
                     apply_video_info(state, video_info, &render_target, render_node.clone());
+                }
+                Event::Msg(Command::RenderSize { width, height }) => {
+                    tracing::info!(width, height, "Applying requested render size");
+                    apply_render_size(state, (width, height).into());
                 }
                 Event::Msg(Command::InputDevice(path)) => {
                     tracing::info!(path, "Adding input device.");

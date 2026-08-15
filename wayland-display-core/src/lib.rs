@@ -30,6 +30,14 @@ pub use crate::utils::video_info::GstVideoInfo;
 pub enum Command {
     InputDevice(String),
     VideoInfo(GstVideoInfo),
+    /// Element -> compositor: set the app-facing render size (the `wl_output` mode the
+    /// Wayland clients see), decoupled from the encode size carried by
+    /// [`Command::VideoInfo`]. Sticky across caps re-negotiation. A `(0, 0)` (or any
+    /// non-positive) size means "follow the encode size" (the historical behaviour).
+    RenderSize {
+        width: i32,
+        height: i32,
+    },
     Buffer(
         SyncSender<Result<gst::Buffer, SwapBuffersError>>,
         Option<Tracer>,
@@ -274,6 +282,13 @@ impl WaylandDisplay {
 
     pub fn set_video_info(&self, info: GstVideoInfo) {
         let _ = self.command_tx.send(Command::VideoInfo(info));
+    }
+
+    /// Set the app-facing render size (the `wl_output` mode clients see), independent of
+    /// the encode size. `(0, 0)` -- or any non-positive size -- resets to "follow the
+    /// encode size". The value is sticky: it survives encode-caps re-negotiation.
+    pub fn set_render_size(&self, width: i32, height: i32) {
+        let _ = self.command_tx.send(Command::RenderSize { width, height });
     }
 
     pub fn keyboard_input(&self, key: u32, pressed: bool) {

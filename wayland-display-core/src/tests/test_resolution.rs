@@ -30,7 +30,7 @@ use gst_video::{VideoFormat, VideoInfo};
 use test_log::test;
 use wayland_client::protocol::wl_output;
 
-fn make_video_info(width: u32, height: u32, fps: i32) -> GstVideoInfo {
+pub(super) fn make_video_info(width: u32, height: u32, fps: i32) -> GstVideoInfo {
     GstVideoInfo::RAW(
         VideoInfo::builder(VideoFormat::Rgba, width, height)
             .fps(Fraction::new(fps, 1))
@@ -54,7 +54,9 @@ fn apply(f: &mut Fixture, width: u32, height: u32, fps: i32) {
     f.round_trip();
 }
 
-fn latest_mode_dimensions(client_events: &[wl_output::Event]) -> Option<(i32, i32, i32)> {
+pub(super) fn latest_mode_dimensions(
+    client_events: &[wl_output::Event],
+) -> Option<(i32, i32, i32)> {
     client_events.iter().rev().find_map(|e| match e {
         wl_output::Event::Mode {
             width,
