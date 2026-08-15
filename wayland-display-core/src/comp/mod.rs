@@ -926,7 +926,24 @@ pub(crate) fn apply_output_mode(state: &mut State, size: Size<i32, Physical>, re
     };
     output.change_current_state(Some(mode), None, None, None);
     output.set_preferred(mode);
-    state.dtr = Some(OutputDamageTracker::from_output(&output));
+
+    // The damage tracker describes the FRAMEBUFFER, not the app-facing output mode. The
+    // framebuffer is always encode-sized (`create_frame` upscales the render-sized scene into
+    // it), while `mode.size` above is the *render* size -- so a `from_output` (Auto) tracker
+    // would size the GL viewport/projection to the render size and clip the upscaled scene.
+    // Use a Static tracker at the encode size instead. Both routes that can change either size
+    // (`apply_video_info` for encode, `apply_render_size` for render) come through here, and a
+    // freshly-built tracker has no previous state, so the next frame is full-damage either way.
+    let encode_size: Size<i32, Physical> = state
+        .video_info
+        .as_ref()
+        .map(|vi| (vi.width() as i32, vi.height() as i32).into())
+        .unwrap_or(size);
+    state.dtr = Some(OutputDamageTracker::new(
+        encode_size,
+        1.0,
+        Transform::Normal,
+    ));
 
     let position = (size.w as f64 / 2.0, size.h as f64 / 2.0).into();
     state.pointer_location = position;

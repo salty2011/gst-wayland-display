@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use super::State;
+use super::{State, effective_render_size};
 use crate::utils::allocator::GsBuffer;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{GlesError, GlesRenderer, GlesTarget};
@@ -9,12 +9,15 @@ use smithay::{
         Color32F, ExportMem, ImportAll, ImportMem, Renderer,
         damage::{Error as OutputDamageTrackerError, RenderOutputResult},
         element::{
-            Id, Kind, memory::MemoryRenderBufferRenderElement, solid::SolidColorRenderElement,
+            Id, Kind,
+            memory::MemoryRenderBufferRenderElement,
+            solid::SolidColorRenderElement,
             surface::WaylandSurfaceRenderElement,
+            utils::{Relocate, RelocateRenderElement, RescaleRenderElement},
         },
         utils::CommitCounter,
     },
-    desktop::space::render_output,
+    desktop::space::{SpaceRenderElements, space_render_elements},
     input::pointer::CursorImageStatus,
     render_elements,
     utils::{Physical, Point, Rectangle, Size},
@@ -29,6 +32,68 @@ render_elements! {
     Memory=MemoryRenderBufferRenderElement<R>,
     // HDR render-path spike (WOLF_HDR_SPIKE): synthetic >1.0 brightness bars.
     Solid=SolidColorRenderElement
+}
+
+// NOTE: the space half is carried as a *generic* parameter rather than spelled out as
+// `SpaceRenderElements<R, WaylandSurfaceRenderElement<R>>`. `render_elements!` emits the enum
+// definition WITHOUT the `where` clause (only the impls get it), and `SpaceRenderElements`'
+// own definition requires `E: RenderElement<R>` -- which is unprovable in a definition with no
+// bounds. A `$custom` generic gets exactly that bound generated for it, so the concrete types are
+// supplied at the use site instead (see [`SceneElements`]). Both variants are generic because the
+// macro only skips its blanket `From` impls -- which would collide -- at two or more customs.
+render_elements! {
+    /// Everything that lives in *render* space: the cursor and the space (client surfaces).
+    /// Grouped so a single rescale/relocate pair maps the whole scene into the encode-sized
+    /// framebuffer -- which keeps the cursor *inside* the scaled scene, so what the user
+    /// points at is what hit-testing (which runs in render space) resolves.
+    SceneElement<R, C, S> where R: Renderer + ImportAll + ImportMem;
+    Cursor=C,
+    Space=S
+}
+
+render_elements! {
+    /// The final element list handed to the damage tracker: the scaled scene plus any
+    /// encode-space overlay (the HDR spike bars), which must NOT be scaled.
+    FrameElement<R, T, O> where R: Renderer + ImportAll + ImportMem;
+    Scene=T,
+    Overlay=O
+}
+
+/// The render-space scene, concrete for the compositor's GLES renderer.
+type SceneElements = SceneElement<
+    GlesRenderer,
+    CursorElement<GlesRenderer>,
+    SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
+>;
+/// [`SceneElements`] mapped from render space into the encode-sized framebuffer.
+type ScaledSceneElements = RelocateRenderElement<RescaleRenderElement<SceneElements>>;
+/// One entry of the element list `create_frame` hands to the damage tracker.
+type FrameElements = FrameElement<GlesRenderer, ScaledSceneElements, CursorElement<GlesRenderer>>;
+
+/// How to map a `render`-sized scene into an `encode`-sized framebuffer: an aspect-preserving
+/// upscale plus the centring offset that turns the leftover into symmetric letterbox/pillarbox
+/// bars (painted by the clear colour).
+///
+/// Returns `(1.0, (0,0))` -- an exact identity -- whenever the two sizes match, which is the
+/// default configuration (no render size requested). `RescaleRenderElement` at scale 1.0 with
+/// origin `(0,0)` and `RelocateRenderElement` at offset `(0,0)` are both pass-throughs on
+/// integer geometry, so the default path composites exactly as it did before.
+fn scene_transform(
+    encode: Size<i32, Physical>,
+    render: Size<i32, Physical>,
+) -> (f64, Point<i32, Physical>) {
+    if render.w <= 0 || render.h <= 0 || render == encode {
+        return (1.0, Point::from((0, 0)));
+    }
+    let scale = f64::min(
+        encode.w as f64 / render.w as f64,
+        encode.h as f64 / render.h as f64,
+    );
+    let offset = Point::from((
+        ((encode.w as f64 - render.w as f64 * scale) / 2.0).round() as i32,
+        ((encode.h as f64 - render.h as f64 * scale) / 2.0).round() as i32,
+    ));
+    (scale, offset)
 }
 
 /// HDR render-path spike: linear brightness levels (multiples of SDR reference white) for the
@@ -155,7 +220,10 @@ impl State {
         assert!(self.video_info.is_some());
         assert!(self.output_buffer.is_some());
 
-        let mut elements =
+        // The cursor lives in RENDER space (its location is `pointer_location`, which input
+        // clamps to the output mode), so it is built at scale 1.0 here and scaled below
+        // together with the client surfaces.
+        let cursor_elements: Vec<CursorElement<GlesRenderer>> =
             if Instant::now().duration_since(self.last_pointer_movement) < Duration::from_secs(5) {
                 match &self.cursor_state {
                 CursorImageStatus::Named(_cursor_icon) => vec![CursorElement::Memory(
@@ -187,16 +255,54 @@ impl State {
                 vec![]
             };
 
+        // The framebuffer is always ENCODE-sized; the scene is composited at the RENDER size and
+        // upscaled into it (aspect-preserving, centred). Both are the same size unless a render
+        // size was requested, in which case `scene_transform` is an exact identity.
+        let vi = self.video_info.as_ref().expect("video_info not set");
+        let encode_size: Size<i32, Physical> = (vi.width() as i32, vi.height() as i32).into();
+        let render_size = effective_render_size(self);
+        let (scale, offset) = scene_transform(encode_size, render_size);
+
+        // Client surfaces, in render space. Built explicitly (rather than via
+        // `desktop::space::render_output`) so they can be wrapped alongside the cursor.
+        let space_elements = space_render_elements(
+            &mut self.renderer,
+            [&self.space],
+            self.output.as_ref().unwrap(),
+            1.0,
+        )?;
+
+        let mut elements: Vec<FrameElements> = Vec::with_capacity(
+            cursor_elements.len() + space_elements.len() + HDR_SPIKE_LEVELS.len(),
+        );
+
         // HDR render-path spike: prepend synthetic >1.0 brightness bars across the top of the
         // output as the topmost elements (so client surfaces never occlude them). Gated behind
-        // WOLF_HDR_SPIKE -- unset = exactly the elements built above (no bars, no behavior change).
+        // WOLF_HDR_SPIKE -- unset = exactly the elements built above (no bars, no behavior
+        // change). They are authored in ENCODE space, so they are the one thing NOT scaled.
         if std::env::var("WOLF_HDR_SPIKE").is_ok() {
-            if let Some(vi) = self.video_info.as_ref() {
-                let mut bars = hdr_spike_bars(vi.width() as i32, vi.height() as i32);
-                bars.append(&mut elements);
-                elements = bars;
-            }
+            elements.extend(
+                hdr_spike_bars(encode_size.w, encode_size.h)
+                    .into_iter()
+                    .map(FrameElements::Overlay),
+            );
         }
+
+        // Cursor first (topmost within the scene), then the space -- the same z-order
+        // `render_output` produced for custom elements vs. space elements.
+        elements.extend(
+            cursor_elements
+                .into_iter()
+                .map(SceneElements::Cursor)
+                .chain(space_elements.into_iter().map(SceneElements::Space))
+                .map(|e| {
+                    FrameElements::Scene(RelocateRenderElement::from_element(
+                        RescaleRenderElement::from_element(e, Point::from((0, 0)), scale),
+                        offset,
+                        Relocate::Relative,
+                    ))
+                }),
+        );
 
         let mut output_buffer = self.output_buffer.clone().expect("Output buffer not set");
 
@@ -209,15 +315,14 @@ impl State {
             .bind(&mut self.renderer)
             .map_err(OutputDamageTrackerError::Rendering)?;
 
-        let render_output_result = render_output(
-            self.output.as_ref().unwrap(),
+        // The damage tracker is Static at the encode size (see `apply_output_mode`), which is
+        // what sizes the GL viewport/projection here -- the letterbox bars are this clear
+        // colour showing through where the scaled scene does not reach.
+        let render_output_result = self.dtr.as_mut().unwrap().render_output(
             &mut self.renderer,
             &mut target,
-            1.0,
             0,
-            [&self.space],
-            &*elements,
-            self.dtr.as_mut().unwrap(),
+            &elements,
             [0.0, 0.0, 0.0, 1.0],
         )?;
 

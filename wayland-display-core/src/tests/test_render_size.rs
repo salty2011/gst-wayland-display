@@ -5,8 +5,12 @@ use crate::comp::{apply_render_size, apply_ui_scale, apply_video_info};
 use crate::tests::fixture::Fixture;
 use crate::tests::test_resolution::{latest_mode_dimensions, make_video_info};
 use crate::utils::RenderTarget;
+use smithay::input::pointer::CursorImageStatus;
+use smithay::utils::Point;
 use test_log::test;
 use wayland_client::protocol::wl_output;
+
+const WHITE: u32 = 0x00FF_FFFF;
 
 fn apply_encode(f: &mut Fixture, width: u32, height: u32, fps: i32) {
     apply_video_info(
@@ -229,5 +233,121 @@ fn render_size_change_triggers_a_configure() {
         "a render-size change should re-configure mapped toplevels (was {}, now {})",
         before,
         f.client.configure_count(),
+    );
+}
+
+// ---------------------------------------------------------------------------------------
+// Compositing: the scene is built at the render size and upscaled into the encode-sized
+// framebuffer (aspect-preserving, centred). These render a real frame through the
+// `RenderTarget::Software` path and read the RAW gst::Buffer back.
+// ---------------------------------------------------------------------------------------
+
+/// Render one frame and return `(rgba_bytes, stride)` of the encode-sized framebuffer.
+fn frame_pixels(f: &mut Fixture) -> (Vec<u8>, usize) {
+    let stride = f.server.video_info.as_ref().unwrap().stride()[0] as usize;
+    let (buffer, _result) = f.server.create_frame().expect("create_frame failed");
+    let map = buffer.map_readable().expect("failed to map frame buffer");
+    (map.as_slice().to_vec(), stride)
+}
+
+fn pixel(px: &[u8], stride: usize, x: usize, y: usize) -> [u8; 3] {
+    let i = y * stride + x * 4;
+    [px[i], px[i + 1], px[i + 2]]
+}
+
+#[track_caller]
+fn assert_lit(px: &[u8], stride: usize, x: usize, y: usize) {
+    let p = pixel(px, stride, x, y);
+    assert!(
+        p.iter().all(|&c| c > 200),
+        "expected the scaled scene (white) at ({x},{y}), got {p:?}",
+    );
+}
+
+#[track_caller]
+fn assert_dark(px: &[u8], stride: usize, x: usize, y: usize) {
+    let p = pixel(px, stride, x, y);
+    assert!(
+        p.iter().all(|&c| c < 50),
+        "expected letterbox/clear (black) at ({x},{y}), got {p:?}",
+    );
+}
+
+/// The cursor is composited *inside* the scaled scene, so it would land on the sample
+/// points below. These tests are about the scene transform, so take it out of the frame.
+fn hide_cursor(f: &mut Fixture) {
+    f.server.cursor_state = CursorImageStatus::Hidden;
+}
+
+#[test]
+fn render_size_scene_is_upscaled_into_the_encode_framebuffer() {
+    let mut f = Fixture::new();
+    hide_cursor(&mut f);
+
+    // Exact 2x: 960x540 render into a 1920x1080 encode framebuffer, no bars.
+    apply_encode(&mut f, 1920, 1080, 60);
+    apply_render(&mut f, 960, 540);
+    f.create_solid_window(960, 540, WHITE);
+
+    let (px, stride) = frame_pixels(&mut f);
+    // Before the upscale existed the scene was drawn 1:1 into the top-left, so (1900,1000)
+    // was the black clear colour.
+    assert_lit(&px, stride, 1900, 1000);
+    assert_lit(&px, stride, 10, 10);
+}
+
+#[test]
+fn render_size_with_a_mismatched_aspect_is_pillarboxed() {
+    let mut f = Fixture::new();
+    hide_cursor(&mut f);
+
+    // 1280x1080 into 1920x1080: min(1.5, 1.0) = 1.0, so 320px black bars left and right.
+    apply_encode(&mut f, 1920, 1080, 60);
+    apply_render(&mut f, 1280, 1080);
+    f.create_solid_window(1280, 1080, WHITE);
+
+    let (px, stride) = frame_pixels(&mut f);
+    assert_dark(&px, stride, 10, 540);
+    assert_lit(&px, stride, 960, 540);
+    assert_dark(&px, stride, 1910, 540);
+}
+
+#[test]
+fn no_render_size_composites_one_to_one() {
+    let mut f = Fixture::new();
+    hide_cursor(&mut f);
+
+    // No render size => scale 1.0, origin (0,0). The rescale/relocate wrappers must be an
+    // exact identity: a 960x540 window still occupies only the top-left of a 1920x1080
+    // framebuffer, exactly as before this change.
+    apply_encode(&mut f, 1920, 1080, 60);
+    f.create_solid_window(960, 540, WHITE);
+
+    let (px, stride) = frame_pixels(&mut f);
+    assert_lit(&px, stride, 10, 10);
+    assert_lit(&px, stride, 950, 530);
+    assert_dark(&px, stride, 970, 530);
+    assert_dark(&px, stride, 950, 550);
+    assert_dark(&px, stride, 1900, 1000);
+}
+
+#[test]
+fn pointer_absolute_maps_into_render_space() {
+    let mut f = Fixture::new();
+    f.create_window(320, 240);
+
+    apply_encode(&mut f, 1920, 1080, 60);
+    apply_render(&mut f, 960, 540);
+
+    // `Command::PointerMotionAbsolute` carries output-space coordinates and `clamp_coords`
+    // clamps them to the *output mode* -- which is the render size, not the encode size.
+    f.server
+        .pointer_motion_absolute(0, Point::from((1920.0, 1080.0)));
+    f.round_trip();
+
+    assert_eq!(
+        f.server.pointer_location,
+        Point::from((958.0, 538.0)),
+        "absolute pointer input must clamp into the render extent, not the encode extent",
     );
 }

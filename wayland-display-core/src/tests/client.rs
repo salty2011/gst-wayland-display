@@ -51,7 +51,11 @@ struct State {
     qh: QueueHandle<State>,
 
     compositor: Option<wl_compositor::WlCompositor>,
+    shm: Option<wl_shm::WlShm>,
     buffer: Option<wl_buffer::WlBuffer>,
+    /// Backing files for buffers created by [`WaylandClient::setup_window_solid`]. The
+    /// compositor mmaps these for the lifetime of the pool, so they must outlive the test.
+    solid_files: Vec<File>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
     viewporter: Option<WpViewporter>,
     fractional_scale_manager: Option<WpFractionalScaleManagerV1>,
@@ -120,6 +124,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                         (),
                     );
                     state.buffer = Some(buffer.clone());
+                    state.shm = Some(shm);
                 }
                 "wl_seat" => {
                     state.seat =
@@ -188,7 +193,9 @@ impl WaylandClient {
             qh: qh.clone(),
 
             compositor: None,
+            shm: None,
             buffer: None,
+            solid_files: Vec::new(),
             wm_base: None,
             viewporter: None,
             fractional_scale_manager: None,
@@ -260,6 +267,48 @@ impl WaylandClient {
         let window = self.state.windows.last_mut().unwrap();
         window.set_title("Hello World!");
         window.attach_new_buffer(self.state.buffer.as_ref().unwrap());
+        window.set_size(width, height);
+        window.ack_last_and_commit();
+    }
+
+    /// Like [`WaylandClient::setup_window`], but attaches a freshly allocated `width`x`height`
+    /// shm buffer filled with a single opaque colour (`0xRRGGBB`), 1:1 with the viewport
+    /// destination. Used by the render-size compositing tests, which assert on pixels read
+    /// back out of the compositor's framebuffer.
+    pub fn setup_window_solid(&mut self, width: u16, height: u16, rgb: u32) {
+        let qh = self.qh.clone();
+        let (w, h) = (u32::from(width), u32::from(height));
+
+        let mut file = tempfile::tempfile().unwrap();
+        {
+            use std::io::Write;
+            let px = (0xFF00_0000u32 | (rgb & 0x00FF_FFFF)).to_ne_bytes();
+            let mut buf = std::io::BufWriter::new(&mut file);
+            for _ in 0..(w * h) {
+                buf.write_all(&px).unwrap();
+            }
+            buf.flush().unwrap();
+        }
+        let pool = self
+            .state
+            .shm
+            .as_ref()
+            .expect("wl_shm not bound")
+            .create_pool(file.as_fd(), (w * h * 4) as i32, &qh, ());
+        let buffer = pool.create_buffer(
+            0,
+            w as i32,
+            h as i32,
+            (w * 4) as i32,
+            wl_shm::Format::Argb8888,
+            &qh,
+            (),
+        );
+        self.state.solid_files.push(file);
+
+        let window = self.state.windows.last_mut().unwrap();
+        window.set_title("Solid");
+        window.attach_new_buffer(&buffer);
         window.set_size(width, height);
         window.ack_last_and_commit();
     }

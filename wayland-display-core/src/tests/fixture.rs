@@ -11,6 +11,7 @@ use smithay::output;
 use smithay::output::{Output, PhysicalProperties, Subpixel};
 use smithay::reexports::input::Libinput;
 use smithay::reexports::wayland_server::Display;
+use smithay::utils::Transform;
 use smithay::wayland::socket::ListeningSocketSource;
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
@@ -108,7 +109,10 @@ impl Fixture {
         };
         output.change_current_state(Some(mode), None, None, None);
         output.set_preferred(mode);
-        let dtr = OutputDamageTracker::from_output(&output);
+        // Static, framebuffer(=encode)-sized -- matching `apply_output_mode`. Identical to the
+        // old `from_output` here (encode size == mode size == 320x240) until a test moves them
+        // apart, at which point the first `apply_output_mode` replaces this tracker anyway.
+        let dtr = OutputDamageTracker::new(mode.size, 1.0, Transform::Normal);
 
         self.server.space.map_output(&output, (0, 0));
         self.server.dtr = Some(dtr);
@@ -161,6 +165,20 @@ impl Fixture {
     pub fn create_window(&mut self, width: u16, height: u16) {
         self.client.create_window();
         self.finish_window(width, height);
+    }
+
+    /// Like [`Fixture::create_window`], but the toplevel commits a `width`x`height` buffer
+    /// filled with a single opaque colour (`0xRRGGBB`) instead of the shared 320x240 gradient,
+    /// so a test can assert on the pixels the compositor produced.
+    pub fn create_solid_window(&mut self, width: u16, height: u16, rgb: u32) {
+        self.client.create_window();
+        self.round_trip();
+        self.client.setup_window_solid(width, height, rgb);
+        self.round_trip();
+        self.round_trip();
+        for window in self.server.space.elements() {
+            window.on_commit();
+        }
     }
 
     /// Like [`Fixture::create_window`], but the surface also carries a
