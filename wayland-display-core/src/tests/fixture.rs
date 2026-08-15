@@ -176,7 +176,10 @@ impl Fixture {
         surface
     }
 
-    fn finish_window(&mut self, width: u16, height: u16) {
+    /// Drive an already-created surface through map: round-trip, attach a buffer + ack the
+    /// initial configure, round-trip again. Exposed so a test can interpose server-side work
+    /// (e.g. `apply_ui_scale`) while the toplevel is still in `pending_windows`.
+    pub fn finish_window(&mut self, width: u16, height: u16) {
         self.round_trip();
 
         self.client.setup_window(width, height);

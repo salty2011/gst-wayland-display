@@ -46,6 +46,7 @@ use smithay::{
         wayland_server::{
             Display, DisplayHandle,
             backend::{ClientData, ClientId, DisconnectReason, GlobalId},
+            protocol::wl_surface::WlSurface,
         },
     },
     utils::{
@@ -935,22 +936,46 @@ pub(crate) fn apply_output_mode(state: &mut State, size: Size<i32, Physical>, re
         .to_f64()
         .to_logical(output.current_scale().fractional_scale())
         .to_i32_round();
+    announce_ui_scale(state);
     configure_toplevels(state, new_size);
 }
 
-/// Re-announce the current UI scale and send a configure at `new_size` to every mapped
-/// toplevel.
+/// Push the current UI scale to `surface` through `wp_fractional_scale_v1::preferred_scale`.
+/// A no-op for a surface that never created a `wp_fractional_scale_v1`.
+pub(crate) fn set_preferred_ui_scale(surface: &WlSurface, scale: f64) {
+    with_states(surface, |states| {
+        with_fractional_scale(states, |fs| fs.set_preferred_scale(scale));
+    });
+}
+
+/// Re-announce the current UI scale to every toplevel we know about — both the mapped ones
+/// (`space`) and those still waiting to ack their initial configure (`pending_windows`).
 ///
-/// Shared by [`apply_output_mode`] (so a render-size change also re-sends the scale) and
-/// [`apply_ui_scale`] (so a scale change re-sends a *non-empty* configure, which kwin needs
-/// in order to latch the new scale). Deliberately does NOT touch the pointer location:
-/// a UI-scale change must not teleport the cursor.
+/// The `pending_windows` half matters: a toplevel sits there from its first commit until it
+/// acks (`wayland/handlers/compositor.rs`), which is exactly the window in which a
+/// session-start `Command::UiScale` arrives. Missing it would leave that client at 1.0 until
+/// some later render-size change. The initial-configure path announces the scale too, for
+/// surfaces that commit *after* the scale was set.
+pub(crate) fn announce_ui_scale(state: &State) {
+    let scale = state.ui_scale;
+    for window in state.space.elements().chain(state.pending_windows.iter()) {
+        if let Some(surface) = window.wl_surface() {
+            set_preferred_ui_scale(&surface, scale);
+        }
+    }
+}
+
+/// Send a configure at `new_size` to every mapped toplevel.
+///
+/// Shared by [`apply_output_mode`] and [`apply_ui_scale`] (a scale change must be followed by
+/// a *non-empty* configure, which kwin needs in order to latch the new scale). Deliberately
+/// does NOT touch the pointer location: a UI-scale change must not teleport the cursor.
+/// The scale announce itself lives in [`announce_ui_scale`], which both callers run first —
+/// keeping it out of here is what lets pending (unmapped) toplevels be reached too.
 pub(crate) fn configure_toplevels(state: &State, new_size: Size<i32, Logical>) {
-    let ui_scale = state.ui_scale;
     for window in state.space.elements() {
         let toplevel = window.toplevel().unwrap();
         let max_size = with_states(toplevel.wl_surface(), |states| {
-            with_fractional_scale(states, |fs| fs.set_preferred_scale(ui_scale));
             states
                 .data_map
                 .get::<XdgToplevelSurfaceData>()
@@ -1012,25 +1037,32 @@ pub(crate) const UI_SCALE_MIN: f64 = 1.0;
 /// Upper bound for the UI scale hint.
 pub(crate) const UI_SCALE_MAX: f64 = 3.0;
 
-/// Apply a requested UI scale: clamp it to `[1.0, 3.0]`, store it, and re-announce it to
-/// every mapped toplevel through `wp_fractional_scale_v1::preferred_scale`, followed by a
-/// configure carrying the *current* size (kwin only latches a new scale on a non-empty
+/// Apply a requested UI scale and announce it to every toplevel (mapped *and* pending)
+/// through `wp_fractional_scale_v1::preferred_scale`, followed by a configure carrying the
+/// *current* size for the mapped ones (kwin only latches a new scale on a non-empty
 /// configure -- `wayland_output.cpp:460-474`).
+///
+/// A finite out-of-range value is clamped to `[1.0, 3.0]`; a non-finite value (NaN, ±inf)
+/// is ignored entirely.
 ///
 /// Intentionally does not go through [`apply_output_mode`]: the `wl_output` mode, the
 /// `wl_output` scale, the damage tracker and the pointer location must all stay put -- a
 /// scale change is a pure hint and must not teleport the cursor.
 pub(crate) fn apply_ui_scale(state: &mut State, scale: f64) {
+    // `f64::clamp` propagates NaN rather than clamping it, and a NaN scale would reach
+    // clients as `preferred_scale = 0` (the u32 cast saturates), so reject it up front.
+    // ±inf is rejected on the same path for the same "never store a nonsense scale" reason.
     if !scale.is_finite() {
         tracing::warn!(scale, "Ignoring non-finite UI scale");
         return;
     }
     let scale = scale.clamp(UI_SCALE_MIN, UI_SCALE_MAX);
     state.ui_scale = scale;
+    announce_ui_scale(state);
 
     let Some(output) = state.output.clone() else {
-        // No output yet: newly created `wp_fractional_scale_v1` objects still learn the
-        // stored value through `FractionalScaleHandler::new_fractional_scale`.
+        // No output yet, so nothing to configure. Surfaces that appear later still learn
+        // the stored value through `FractionalScaleHandler::new_fractional_scale`.
         return;
     };
     let logical = effective_render_size(state)
