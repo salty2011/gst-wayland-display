@@ -147,8 +147,6 @@ impl State {
     /// surface-local coordinate as `location - target_origin`, and the origin here is the
     /// window's location in its OWN space.
     pub(crate) fn pointer_focus(&self, pos: Point<f64, Logical>) -> PointerFocus {
-        let output_logical = self.output_logical_size();
-
         // Top to bottom, like `Space::element_under`.
         for window in self.space.elements().rev() {
             let (Some(bbox), Some(location)) = (
@@ -158,7 +156,7 @@ impl State {
                 continue;
             };
             let origin = (location - window.geometry().loc).to_f64();
-            let (scale, offset) = super::window_fullscreen_fit(window, output_logical);
+            let (scale, offset) = self.window_fit(window);
             let local = unfit(pos, origin, scale, offset);
             if bbox.to_f64().contains(local) && window.is_in_input_region(&(local - origin)) {
                 return (Some((window.clone(), origin)), local);
@@ -181,7 +179,6 @@ impl State {
     /// path resolves focus before the move and delivers the location after it — both must be
     /// expressed against the same window).
     fn fit_of(&self, target: &FocusTarget) -> (f64, Point<f64, Logical>) {
-        let output_logical = self.output_logical_size();
         target
             .wl_surface()
             .and_then(|surface| {
@@ -189,8 +186,21 @@ impl State {
                     .elements()
                     .find(|w| w.wl_surface().map(|s| *s == *surface).unwrap_or(false))
             })
-            .map(|window| super::window_fullscreen_fit(window, output_logical))
+            .map(|window| self.window_fit(window))
             .unwrap_or((1.0, Point::from((0.0, 0.0))))
+    }
+
+    /// A window's fullscreen fit with its centring offset snapped to the same physical pixel
+    /// grid compositing rounds it to, so the inverse applied here is the exact inverse of
+    /// what was drawn rather than one up to half a pixel away.
+    pub(crate) fn window_fit(&self, window: &Window) -> (f64, Point<f64, Logical>) {
+        let (scale, offset) = super::window_fullscreen_fit(window, self.output_logical_size());
+        let output_scale = self
+            .output
+            .as_ref()
+            .map(|o| o.current_scale().fractional_scale())
+            .unwrap_or(1.0);
+        (scale, super::fit_offset_snapped(offset, output_scale))
     }
 
     pub(crate) fn maybe_activate_pointer_constraint(
@@ -690,7 +700,7 @@ impl State {
     /// `mode.size` is physical, so it must be converted first: with a UI scale of 2 the
     /// logical extent is half the mode, and clamping against the raw mode would let the
     /// cursor run off the desktop by a factor of the scale.
-    pub(super) fn clamp_coords(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
+    pub(crate) fn clamp_coords(&self, pos: Point<f64, Logical>) -> Point<f64, Logical> {
         if let Some(output) = self.output.as_ref() {
             if let Some(mode) = output.current_mode() {
                 let logical: Size<i32, Logical> = mode

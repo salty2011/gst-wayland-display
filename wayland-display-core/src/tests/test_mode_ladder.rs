@@ -2,7 +2,7 @@
 //! menu has something to list, without moving the mode the compositor actually composites
 //! at (that stays the render size).
 
-use crate::comp::{apply_mode_ladder, apply_video_info};
+use crate::comp::{apply_mode_ladder, apply_render_size, apply_video_info};
 use crate::tests::fixture::Fixture;
 use crate::tests::test_resolution::make_video_info;
 use crate::utils::RenderTarget;
@@ -150,6 +150,58 @@ fn clearing_the_ladder_retires_its_rungs() {
         Some((1920, 1080)),
         "the current mode must survive the retirement pass",
     );
+}
+
+/// `Output::change_current_state` APPENDS every mode it is handed and never removes the one
+/// it replaced, so without an explicit sweep every render size the session has ever used
+/// stays advertised forever. Invisible while nothing listed the modes; with a ladder, an
+/// in-app display menu shows the lot.
+#[test]
+fn superseded_render_sizes_do_not_accumulate_as_modes() {
+    let mut f = Fixture::new_cold();
+    apply_encode(&mut f, 1920, 1080, 60);
+
+    apply_render_size(&mut f.server, (1280, 1080).into());
+    apply_render_size(&mut f.server, (1920, 1080).into());
+
+    let dims: Vec<_> = f
+        .server
+        .output
+        .as_ref()
+        .unwrap()
+        .modes()
+        .iter()
+        .map(|m| (m.size.w, m.size.h))
+        .collect();
+    assert_eq!(
+        dims,
+        vec![(1920, 1080)],
+        "a superseded render size must not linger as an advertised mode",
+    );
+}
+
+/// ... but a superseded render size that IS a ladder rung stays, because the ladder wants it.
+#[test]
+fn a_superseded_render_size_that_is_a_ladder_rung_is_kept() {
+    let mut f = Fixture::new_cold();
+    apply_mode_ladder(&mut f.server, &[(1280, 720)]);
+    apply_encode(&mut f, 1920, 1080, 60);
+
+    apply_render_size(&mut f.server, (1280, 720).into());
+    apply_render_size(&mut f.server, (1920, 1080).into());
+
+    let dims: Vec<_> = f
+        .server
+        .output
+        .as_ref()
+        .unwrap()
+        .modes()
+        .iter()
+        .map(|m| (m.size.w, m.size.h))
+        .collect();
+    assert!(dims.contains(&(1280, 720)), "got {dims:?}");
+    assert!(dims.contains(&(1920, 1080)), "got {dims:?}");
+    assert_eq!(dims.len(), 2, "and nothing else: {dims:?}");
 }
 
 /// A rung that fit the previous encode size but not the new one is retired on the next caps

@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use super::{State, effective_render_size, window_fullscreen_fit};
+use super::{State, effective_render_size, fit_offset_physical, window_fullscreen_fit};
 use crate::utils::allocator::GsBuffer;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{GlesError, GlesRenderer, GlesTarget};
@@ -127,11 +127,7 @@ fn window_fit_physical(
     output_scale: f64,
 ) -> (f64, Point<i32, Physical>) {
     let (scale, offset) = window_fullscreen_fit(window, output_logical);
-    let offset = Point::from((
-        (offset.x * output_scale).round() as i32,
-        (offset.y * output_scale).round() as i32,
-    ));
-    (scale, offset)
+    (scale, fit_offset_physical(offset, output_scale))
 }
 
 /// HDR render-path spike: linear brightness levels (multiples of SDR reference white) for the

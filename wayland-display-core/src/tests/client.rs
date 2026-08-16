@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use wayland_backend::client::Backend;
 use wayland_client::protocol::wl_callback::WlCallback;
 use wayland_client::protocol::wl_display::WlDisplay;
-use wayland_client::protocol::{wl_callback, wl_output, wl_pointer, wl_region};
+use wayland_client::protocol::{
+    wl_callback, wl_output, wl_pointer, wl_region, wl_subcompositor, wl_subsurface,
+};
 use wayland_client::{
     Connection, Dispatch, EventQueue, QueueHandle, WEnum, delegate_noop,
     protocol::{
@@ -56,6 +58,10 @@ struct State {
     /// Backing files for buffers created by [`WaylandClient::setup_window_solid`]. The
     /// compositor mmaps these for the lifetime of the pool, so they must outlive the test.
     solid_files: Vec<File>,
+    subcompositor: Option<wl_subcompositor::WlSubcompositor>,
+    /// Subsurfaces created by [`WaylandClient::add_solid_subsurface`]. Held so they (and
+    /// their surfaces) stay alive for the lifetime of the client.
+    subsurfaces: Vec<(wl_surface::WlSurface, wl_subsurface::WlSubsurface)>,
     wm_base: Option<xdg_wm_base::XdgWmBase>,
     viewporter: Option<WpViewporter>,
     fractional_scale_manager: Option<WpFractionalScaleManagerV1>,
@@ -126,6 +132,15 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     state.buffer = Some(buffer.clone());
                     state.shm = Some(shm);
                 }
+                "wl_subcompositor" => {
+                    state.subcompositor =
+                        Some(registry.bind::<wl_subcompositor::WlSubcompositor, _, _>(
+                            name,
+                            version,
+                            qh,
+                            (),
+                        ));
+                }
                 "wl_seat" => {
                     state.seat =
                         Some(registry.bind::<wl_seat::WlSeat, _, _>(name, version, qh, ()));
@@ -172,6 +187,8 @@ delegate_noop!(State: ignore wl_shm::WlShm);
 delegate_noop!(State: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(State: ignore wl_buffer::WlBuffer);
 delegate_noop!(State: ignore wl_region::WlRegion);
+delegate_noop!(State: ignore wl_subcompositor::WlSubcompositor);
+delegate_noop!(State: ignore wl_subsurface::WlSubsurface);
 delegate_noop!(State: ignore WpViewporter);
 delegate_noop!(State: ignore WpViewport);
 delegate_noop!(State: ignore ZwpPointerConstraintsV1);
@@ -196,6 +213,8 @@ impl WaylandClient {
             shm: None,
             buffer: None,
             solid_files: Vec::new(),
+            subcompositor: None,
+            subsurfaces: Vec::new(),
             wm_base: None,
             viewporter: None,
             fractional_scale_manager: None,
@@ -348,6 +367,33 @@ impl WaylandClient {
         window.set_title("Solid (no viewport)");
         window.attach_new_buffer(&buffer);
         window.ack_last_and_commit();
+    }
+
+    /// Attach a `w`x`h` solid subsurface at `(x, y)` to the current window's toplevel
+    /// surface and commit both. The parent's bbox then covers the subsurface too, which is
+    /// what a launcher that renders through subsurfaces looks like — and what the fullscreen
+    /// fit must refuse to derive a scale from (the root buffer is not the visible content).
+    pub fn add_solid_subsurface(&mut self, x: i32, y: i32, w: u16, h: u16, rgb: u32) {
+        let qh = self.qh.clone();
+        let buffer = self.make_solid_buffer(w, h, rgb);
+        let parent = self.state.windows.last().expect("a window").surface.clone();
+        let surface = self
+            .state
+            .compositor
+            .as_ref()
+            .expect("wl_compositor not bound")
+            .create_surface(&qh, ());
+        let subsurface = self
+            .state
+            .subcompositor
+            .as_ref()
+            .expect("wl_subcompositor not bound")
+            .get_subsurface(&surface, &parent, &qh, ());
+        subsurface.set_position(x, y);
+        surface.attach(Some(&buffer), 0, 0);
+        surface.commit();
+        parent.commit();
+        self.state.subsurfaces.push((surface, subsurface));
     }
 
     pub fn get_client_events(&mut self) -> &mut Vec<MouseEvents> {

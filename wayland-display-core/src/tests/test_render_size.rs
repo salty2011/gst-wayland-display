@@ -644,6 +644,101 @@ fn pointer_input_is_mapped_through_the_fullscreen_fit() {
     );
 }
 
+/// The scale is derived from the ROOT surface, but the whole surface TREE is what gets
+/// scaled and what hit-testing sees. A client whose root buffer is small while its
+/// subsurfaces cover the output — the "launcher rendering via subsurfaces" this compositor
+/// explicitly expects — must NOT be blown up by the ratio between the two.
+#[test]
+fn a_window_whose_subsurfaces_exceed_its_root_surface_is_not_fit() {
+    let mut f = Fixture::new();
+    hide_cursor(&mut f);
+
+    apply_encode(&mut f, 1920, 1080, 60);
+    // Root buffer 320x180 (a 6x fit if taken at face value) ...
+    f.create_solid_window_fullscreen(320, 180, WHITE);
+    let window = f.server.space.elements().next().expect("window").clone();
+    assert_ne!(
+        window_fullscreen_fit(&window, (1920, 1080).into()).0,
+        1.0,
+        "precondition: the bare root surface WOULD be fit-scaled",
+    );
+
+    // ... but the visible content is a full-output subsurface.
+    f.add_solid_subsurface(0, 0, 1920, 1080, WHITE);
+    assert_eq!(
+        window.bbox().size,
+        (1920, 1080).into(),
+        "precondition: the subsurface must have grown the window bbox",
+    );
+
+    assert_eq!(
+        window_fullscreen_fit(&window, (1920, 1080).into()),
+        (1.0, Point::from((0.0, 0.0))),
+        "content extending past the root surface must fall back to the identity, \
+         not be scaled by the root/content ratio",
+    );
+}
+
+/// A locked pointer's `set_cursor_position_hint` is where the cursor is put when the lock is
+/// released. It arrives in the CLIENT's coordinates, so under a fit it must be mapped
+/// forward into render space for the compositor's own pointer — otherwise the unlock lands
+/// at half the intended position (a 2x fit) and every subsequent relative motion accumulates
+/// from the wrong spot. SDL games that lock the pointer are precisely the target clients.
+#[test]
+fn cursor_position_hint_is_mapped_through_the_fullscreen_fit() {
+    use smithay::wayland::pointer_constraints::PointerConstraintsHandler;
+    use smithay::wayland::seat::WaylandFocus;
+
+    let mut f = Fixture::new();
+    apply_encode(&mut f, 1920, 1080, 60);
+    f.create_solid_window_fullscreen(960, 540, WHITE);
+
+    // Park the pointer somewhere that is NOT the answer, so the assertion below cannot pass
+    // by accident: the fixture's remap puts it at the output centre (960,540), which is
+    // exactly where the hint should land it.
+    f.server
+        .pointer_motion_absolute(0, Point::from((100.0, 100.0)));
+    f.round_trip();
+
+    let _lock = f.client.lock_pointer();
+    f.round_trip();
+    // A motion attempt is what activates the constraint; the pointer is locked, so it does
+    // not actually move and stays parked at (100,100).
+    f.server
+        .pointer_motion_absolute(0, Point::from((200.0, 200.0)));
+    f.round_trip();
+    assert_eq!(
+        f.server.pointer_location,
+        Point::from((100.0, 100.0)),
+        "precondition: the lock is active (the pointer did not move) and is parked off-centre",
+    );
+
+    let surface = f
+        .server
+        .space
+        .elements()
+        .next()
+        .and_then(|w| w.wl_surface())
+        .expect("mapped surface")
+        .into_owned();
+    let pointer = f.server.seat.get_pointer().expect("pointer");
+
+    // The client asks for the cursor to end up at its own (480, 270) -- its centre.
+    f.server
+        .cursor_position_hint(&surface, &pointer, Point::from((480.0, 270.0)));
+
+    assert_eq!(
+        f.server.pointer_location,
+        Point::from((960.0, 540.0)),
+        "the client's (480,270) is (960,540) on a 2x-fit 1920x1080 output",
+    );
+    assert_eq!(
+        pointer.current_location(),
+        Point::from((480.0, 270.0)),
+        "smithay's own pointer location stays in the client's space, untransformed",
+    );
+}
+
 /// Relative motion must follow the same transform as the absolute coordinates, or a
 /// pointer-locked client (which sees ONLY relative motion) gets double sensitivity under a
 /// 2x fit while everything else moves at 1x. `dx_unaccel` is the documented exception —

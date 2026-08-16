@@ -226,6 +226,13 @@ impl Fixture {
         self.finish_solid_window();
     }
 
+    /// Attach a solid subsurface to the current window and let the compositor settle, so the
+    /// window's bbox picks it up.
+    pub fn add_solid_subsurface(&mut self, x: i32, y: i32, w: u16, h: u16, rgb: u32) {
+        self.client.add_solid_subsurface(x, y, w, h, rgb);
+        self.finish_solid_window();
+    }
+
     fn finish_solid_window(&mut self) {
         self.round_trip();
         self.round_trip();

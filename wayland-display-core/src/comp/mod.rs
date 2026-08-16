@@ -1023,6 +1023,14 @@ pub(crate) fn apply_output_mode(state: &mut State, size: Size<i32, Physical>, re
 ///
 /// Returns `(1.0, (0.0, 0.0))` — an exact identity — for a degenerate size or when the two
 /// already match, which is every window that fills its configure.
+///
+/// The fit is deliberately **symmetric**: content LARGER than its configure is scaled *down*
+/// by the same rule. The spec's rule is internal ≤ external, so that direction should not
+/// arise in a well-behaved session — but a client that overshoots its configure (a race
+/// around a mode change, a client that ignores the configure outright) would otherwise be
+/// cropped by the framebuffer, losing whatever fell outside. Shrinking it keeps all of it on
+/// screen and keeps the inverse used by input total. Guarding it to smaller-only would buy
+/// nothing and reintroduce that cliff.
 pub(crate) fn fullscreen_fit(
     configured: Size<i32, Logical>,
     surface: Size<i32, Logical>,
@@ -1044,6 +1052,35 @@ pub(crate) fn fullscreen_fit(
         (configured.h as f64 - surface.h as f64 * scale) / 2.0,
     ));
     (scale, offset)
+}
+
+/// Snap a fit's centring offset to the PHYSICAL pixel grid the renderer composites on.
+///
+/// Compositing can only place an element on whole physical pixels, so the offset is rounded
+/// there. Input inverts the same transform in logical f64, and would otherwise invert an
+/// offset up to half a physical pixel away from the one actually drawn. Both sides round
+/// here, once, so the two are the same number by construction.
+pub(crate) fn fit_offset_physical(
+    offset: Point<f64, Logical>,
+    output_scale: f64,
+) -> Point<i32, Physical> {
+    Point::from((
+        (offset.x * output_scale).round() as i32,
+        (offset.y * output_scale).round() as i32,
+    ))
+}
+
+/// [`fit_offset_physical`] converted back to logical, for the input side: the same snapped
+/// offset compositing uses, expressed in the space pointer positions live in.
+pub(crate) fn fit_offset_snapped(
+    offset: Point<f64, Logical>,
+    output_scale: f64,
+) -> Point<f64, Logical> {
+    let physical = fit_offset_physical(offset, output_scale);
+    Point::from((
+        physical.x as f64 / output_scale,
+        physical.y as f64 / output_scale,
+    ))
 }
 
 /// [`fullscreen_fit`] resolved for a mapped `window`: identity unless the window is a
@@ -1094,6 +1131,29 @@ pub(crate) fn window_fullscreen_fit(
     else {
         return identity;
     };
+
+    // The scale is derived from the ROOT surface, but what gets scaled is the whole surface
+    // TREE -- and hit-testing runs against the window bbox, which is the tree too. A client
+    // whose root buffer is small while its subsurfaces cover the output (this compositor
+    // explicitly expects such clients: see "a launcher rendering via subsurfaces" in
+    // `wayland/handlers/compositor.rs`) would otherwise be blown up by the ratio between the
+    // two -- unbounded, and wrong in both compositing and input.
+    //
+    // So: only fit a window whose visible content actually fits inside its root surface.
+    // `Window::bbox()` is subsurface-inclusive and popup-EXCLUSIVE (unlike
+    // `SpaceElement::bbox`, which is `bbox_with_popups` -- using that here would make the
+    // scale jump on every popup open/close). A single-surface game has bbox == root exactly,
+    // and so do gamescope and kwin, so the intended cases are untouched; anything else bails
+    // to the identity, i.e. today's unscaled behaviour rather than a guessed scale.
+    let bbox = window.bbox();
+    if !Rectangle::from_size(surface_size).contains_rect(bbox) {
+        tracing::trace!(
+            ?bbox,
+            ?surface_size,
+            "Not fitting a fullscreen window whose content extends beyond its root surface",
+        );
+        return identity;
+    }
     fullscreen_fit(configured.unwrap_or(output_logical), surface_size)
 }
 
@@ -1133,13 +1193,22 @@ fn advertise_mode_ladder(
         }
     }
 
+    // Reconcile against the FULL advertised set, not just what this function put there.
+    // `Output::change_current_state` APPENDS every mode it is handed and never removes the
+    // one it replaced, so without this every render size (and every encode size) the session
+    // has ever used accumulates on the output forever. That was invisible while gwd
+    // advertised a single mode and nothing listed them; with a ladder, an in-app display menu
+    // shows the lot. Keep exactly: the ladder, the current mode, and the preferred mode
+    // (`delete_mode` clears `current_mode`/`preferred_mode` when they match, which would
+    // leave the output modeless).
     let current = output.current_mode();
     let preferred = output.preferred_mode();
-    for stale in &state.advertised_ladder {
-        if desired.contains(stale) || Some(*stale) == current || Some(*stale) == preferred {
+    for stale in output.modes() {
+        if desired.contains(&stale) || Some(stale) == current || Some(stale) == preferred {
             continue;
         }
-        output.delete_mode(*stale);
+        tracing::debug!(?stale, "Retiring a stale wl_output mode");
+        output.delete_mode(stale);
     }
     for mode in &desired {
         output.add_mode(*mode);
