@@ -1,7 +1,7 @@
 //! Render size (the app-facing `wl_output` mode) is decoupled from the encode size
 //! carried by the negotiated caps, and is sticky across caps re-negotiation.
 
-use crate::comp::{apply_render_size, apply_ui_scale, apply_video_info};
+use crate::comp::{apply_render_size, apply_ui_scale, apply_video_info, window_fullscreen_fit};
 use crate::tests::fixture::Fixture;
 use crate::tests::test_resolution::{latest_mode_dimensions, make_video_info};
 use crate::utils::RenderTarget;
@@ -510,18 +510,23 @@ fn no_render_size_composites_one_to_one() {
     let mut f = Fixture::new();
     hide_cursor(&mut f);
 
-    // No render size => scale 1.0, origin (0,0). The rescale/relocate wrappers must be an
-    // exact identity: a 960x540 window still occupies only the top-left of a 1920x1080
-    // framebuffer, exactly as before this change.
+    // No render size => the scene transform is scale 1.0, origin (0,0); a window that fills
+    // its configure has an identity fullscreen fit too. So the client's 1920x1080 content
+    // lands in the 1920x1080 framebuffer 1:1, edge to edge, with no bars anywhere.
     apply_encode(&mut f, 1920, 1080, 60);
-    f.create_solid_window(960, 540, WHITE);
+    f.create_solid_window(1920, 1080, WHITE);
+
+    let window = f.server.space.elements().next().expect("window mapped");
+    assert_eq!(
+        window_fullscreen_fit(window, (1920, 1080).into()),
+        (1.0, Point::from((0.0, 0.0))),
+        "a window that fills its configure must not be fit-scaled at all",
+    );
 
     let (px, stride) = frame_pixels(&mut f);
-    assert_lit(&px, stride, 10, 10);
-    assert_lit(&px, stride, 950, 530);
-    assert_dark(&px, stride, 970, 530);
-    assert_dark(&px, stride, 950, 550);
-    assert_dark(&px, stride, 1900, 1000);
+    for (x, y) in [(0, 0), (1919, 0), (0, 1079), (1919, 1079), (960, 540)] {
+        assert_lit(&px, stride, x, y);
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -562,6 +567,80 @@ fn fullscreen_buffer_with_other_aspect_is_letterboxed() {
     assert_dark(&px, stride, 10, 540);
     assert_lit(&px, stride, 960, 540);
     assert_dark(&px, stride, 1910, 540);
+}
+
+/// A viewporter-aware client (SDL3/GTK4/Qt6 and friends) that presents at a destination
+/// SMALLER than its configure is fit-scaled just like a plain one: the surface size smithay
+/// reports is already post-viewport, so there is nothing to special-case and no double
+/// scale. The mirror of this — destination == configure, as gamescope and KWin do — is the
+/// identity asserted by `no_render_size_composites_one_to_one`.
+#[test]
+fn fullscreen_viewport_destination_smaller_than_the_output_is_scaled_to_fit() {
+    let mut f = Fixture::new();
+    hide_cursor(&mut f);
+
+    apply_encode(&mut f, 1920, 1080, 60);
+    // A 480x270 buffer presented at a 960x540 destination: the viewport already doubles it,
+    // and the fit doubles it again to fill the 1920x1080 output.
+    f.create_solid_window_hidpi(480, 270, 960, 540, WHITE);
+
+    let (px, stride) = frame_pixels(&mut f);
+    assert_lit(&px, stride, 10, 10);
+    assert_lit(&px, stride, 1900, 1000);
+}
+
+/// The input half of the fit. Compositing scales a 960x540 fullscreen client 2x to fill a
+/// 1920x1080 output, so pointer input must be mapped back through that scale: without the
+/// inverse map the client would take no input at all beyond (960,540) — roughly 75% of the
+/// frame — and would be told twice the coordinate the user is pointing at.
+#[test]
+fn pointer_input_is_mapped_through_the_fullscreen_fit() {
+    use crate::tests::client::MouseEvents;
+    use wayland_client::protocol::wl_pointer;
+
+    let mut f = Fixture::new();
+    apply_encode(&mut f, 1920, 1080, 60);
+    f.create_solid_window_fullscreen(960, 540, WHITE);
+
+    f.client.get_client_events().clear();
+    // Bottom-right of the FRAME: outside the client's own 960x540 geometry entirely.
+    f.server
+        .pointer_motion_absolute(0, Point::from((1900.0, 1000.0)));
+    f.round_trip();
+
+    let surface_pos = f
+        .client
+        .get_client_events()
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            MouseEvents::Pointer(
+                wl_pointer::Event::Motion {
+                    surface_x,
+                    surface_y,
+                    ..
+                }
+                | wl_pointer::Event::Enter {
+                    surface_x,
+                    surface_y,
+                    ..
+                },
+            ) => Some((*surface_x, *surface_y)),
+            _ => None,
+        })
+        .expect("the client must still receive pointer events out here");
+
+    assert_eq!(
+        surface_pos,
+        (950.0, 500.0),
+        "the client must be told the position in ITS OWN 960x540 space (1900/2, 1000/2)",
+    );
+    // ... while the cursor itself stays where it is drawn, in render space.
+    assert_eq!(
+        f.server.pointer_location,
+        Point::from((1900.0, 1000.0)),
+        "the fit must not move the compositor's own (render-space) pointer location",
+    );
 }
 
 #[test]

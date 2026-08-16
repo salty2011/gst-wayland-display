@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use super::{State, effective_render_size};
+use super::{State, effective_render_size, window_fullscreen_fit};
 use crate::utils::allocator::GsBuffer;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{GlesError, GlesRenderer, GlesTarget};
@@ -20,10 +20,8 @@ use smithay::{
     desktop::Window,
     desktop::space::SpaceElement,
     input::pointer::CursorImageStatus,
-    reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State as XdgState,
     render_elements,
     utils::{Logical, Physical, Point, Rectangle, Scale, Size},
-    wayland::{compositor::with_states, viewporter::ViewportCachedState},
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -63,8 +61,9 @@ render_elements! {
 }
 
 /// One mapped window's surface tree (plus its popups), mapped from the size the client
-/// actually committed into the size it was configured at — see [`fullscreen_fit`]. The
-/// wrappers are an exact identity for every window that already fills its configure.
+/// actually committed into the size it was configured at — see
+/// [`super::window_fullscreen_fit`]. The wrappers are an exact identity for every window
+/// that already fills its configure.
 type WindowElements =
     RelocateRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>;
 
@@ -82,7 +81,7 @@ struct FitWindow {
     window: Window,
     /// The window's render location, relative to the output's region (render space).
     loc: Point<i32, Logical>,
-    /// Aspect-preserving fit scale and centring offset — see [`fullscreen_fit`].
+    /// Aspect-preserving fit scale and centring offset — see [`window_fit_physical`].
     scale: f64,
     offset: Point<i32, Physical>,
 }
@@ -113,68 +112,24 @@ fn scene_transform(
     (scale, offset)
 }
 
-/// How to map ONE fullscreen window's committed content into the box it was configured at:
-/// an aspect-preserving scale plus the centring offset (in PHYSICAL pixels) that turns the
-/// leftover into symmetric letterbox/pillarbox bars.
+/// [`super::window_fullscreen_fit`] for one window, with the centring offset converted from
+/// logical into the PHYSICAL pixels the render elements live in.
 ///
-/// The problem this solves: a fullscreen toplevel that commits a buffer SMALLER than its
+/// The problem the fit solves: a fullscreen toplevel that commits a surface SMALLER than its
 /// configured size — a native Wayland game whose in-menu "resolution" setting picked, say,
-/// 1280x720 on a 1920x1080 output — is composited by the space at its buffer size at its map
+/// 1280x720 on a 1920x1080 output — is composited by the space at that size at its map
 /// location, i.e. 1:1 in the top-left corner with black everywhere else. Every other
 /// compositor scales it to fill the output; gwd did not, which is what made an in-app
 /// resolution choice look broken.
-///
-/// Returns `(1.0, (0,0))` — an exact identity, so the wrappers composite exactly as the
-/// unwrapped elements did — for anything that is not that case:
-///
-/// * a window with no toplevel, or a toplevel whose **current** (acked) state is not
-///   `Fullscreen`;
-/// * a client that set a `wp_viewport` **destination**. Such a client has stated the size it
-///   wants to be presented at (gamescope and KWin both do this, sizing the destination to the
-///   size we configured them at), so its choice is honoured rather than second-guessed;
-/// * a degenerate size, or a committed size that already equals the configured one (the
-///   overwhelmingly common case: identity, no arithmetic).
-///
-/// `output_logical` is the fallback "configured size" for a toplevel whose current state
-/// carries none, and `output_scale` converts the logical centring offset into the physical
-/// pixels the render elements live in.
-fn fullscreen_fit(
+fn window_fit_physical(
     window: &Window,
     output_logical: Size<i32, Logical>,
     output_scale: f64,
 ) -> (f64, Point<i32, Physical>) {
-    let identity = (1.0, Point::from((0, 0)));
-
-    let Some(toplevel) = window.toplevel() else {
-        return identity;
-    };
-    let toplevel_state = toplevel.current_state();
-    if !toplevel_state.states.contains(XdgState::Fullscreen) {
-        return identity;
-    }
-    let states_own_size = with_states(toplevel.wl_surface(), |states| {
-        states
-            .cached_state
-            .get::<ViewportCachedState>()
-            .current()
-            .dst
-            .is_some()
-    });
-    if states_own_size {
-        return identity;
-    }
-
-    // `c` = the box the client was told to fill; `b` = what it actually committed.
-    let c = toplevel_state.size.unwrap_or(output_logical);
-    let b = SpaceElement::geometry(window).size;
-    if b.w <= 0 || b.h <= 0 || c.w <= 0 || c.h <= 0 || b == c {
-        return identity;
-    }
-
-    let scale = f64::min(c.w as f64 / b.w as f64, c.h as f64 / b.h as f64);
+    let (scale, offset) = window_fullscreen_fit(window, output_logical);
     let offset = Point::from((
-        (((c.w as f64 - b.w as f64 * scale) / 2.0) * output_scale).round() as i32,
-        (((c.h as f64 - b.h as f64 * scale) / 2.0) * output_scale).round() as i32,
+        (offset.x * output_scale).round() as i32,
+        (offset.y * output_scale).round() as i32,
     ));
     (scale, offset)
 }
@@ -386,7 +341,7 @@ impl State {
                     let loc = self.space.element_location(window)?
                         - SpaceElement::geometry(window).loc
                         - region.loc;
-                    let (scale, offset) = fullscreen_fit(window, region.size, output_scale);
+                    let (scale, offset) = window_fit_physical(window, region.size, output_scale);
                     Some(FitWindow {
                         window: window.clone(),
                         loc,
