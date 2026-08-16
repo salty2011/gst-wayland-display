@@ -13,11 +13,15 @@ impl PointerConstraintsHandler for State {
             .map(|x| &*(x.wl_surface().unwrap()) == surface)
             .unwrap_or(false)
         {
-            let under = self
-                .space
-                .element_under(self.pointer_location)
-                .map(|(w, pos)| (w.clone().into(), pos.to_f64()));
-            self.maybe_activate_pointer_constraint(&under, self.pointer_location);
+            // Resolved through `pointer_focus`, not `Space::element_under`: with a
+            // fullscreen fit active the raw (render-space) pointer position misses the
+            // window entirely outside its unscaled bbox, and the constraint's region would
+            // be evaluated off by the fit scale. This is the lock-before-map path (SDL,
+            // nested gamescope with --force-grab-cursor), so it must agree with the motion
+            // path that activates constraints later.
+            let (focus, position) = self.pointer_focus(self.pointer_location);
+            let under = focus.map(|(window, origin)| (window.into(), origin));
+            self.maybe_activate_pointer_constraint(&under, position);
         }
     }
 

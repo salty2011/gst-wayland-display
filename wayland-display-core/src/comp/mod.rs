@@ -1069,8 +1069,24 @@ pub(crate) fn window_fullscreen_fit(
     let Some(toplevel) = window.toplevel() else {
         return identity;
     };
-    let toplevel_state = toplevel.current_state();
-    if !toplevel_state.states.contains(XdgState::Fullscreen) {
+    // Only the two fields that matter, read in place. `ToplevelSurface::current_state()`
+    // would CLONE the whole `ToplevelState` (including the `Vec` inside its state set), and
+    // this now runs on the input hot path -- once per mapped window per pointer event, not
+    // just once per frame.
+    let Some((fullscreen, configured)) = with_states(toplevel.wl_surface(), |states| {
+        let attributes = states
+            .data_map
+            .get::<XdgToplevelSurfaceData>()?
+            .lock()
+            .ok()?;
+        Some((
+            attributes.current.states.contains(XdgState::Fullscreen),
+            attributes.current.size,
+        ))
+    }) else {
+        return identity;
+    };
+    if !fullscreen {
         return identity;
     }
     let Some(surface_size) =
@@ -1078,7 +1094,7 @@ pub(crate) fn window_fullscreen_fit(
     else {
         return identity;
     };
-    fullscreen_fit(toplevel_state.size.unwrap_or(output_logical), surface_size)
+    fullscreen_fit(configured.unwrap_or(output_logical), surface_size)
 }
 
 /// Push [`State::mode_ladder`] onto the Output as additional advertised `wl_output` modes,

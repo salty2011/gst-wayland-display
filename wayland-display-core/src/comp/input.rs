@@ -363,12 +363,23 @@ impl State {
         // inverse fit of the window `under` refers to, so the origin in `under` and the
         // location below are expressed in the same space (smithay derives the surface-local
         // coordinate as `location - origin`).
-        let event_pos = match &under {
-            Some((target, origin)) => {
-                let (scale, offset) = self.fit_of(target);
+        let fit = under.as_ref().map(|(target, _)| self.fit_of(target));
+        let event_pos = match (&under, fit) {
+            (Some((_, origin)), Some((scale, offset))) => {
                 unfit(possible_pos, *origin, scale, offset)
             }
-            None => possible_pos,
+            _ => possible_pos,
+        };
+
+        // zwp_relative_pointer_v1: `dx`/`dy` are in the SAME coordinate space as
+        // wl_pointer.motion, so once the absolute coordinates above are client-space the
+        // deltas must be too -- otherwise a pointer-locked client under a 2x fit sees double
+        // sensitivity while its absolute position moves at 1x. `dx_unaccel`/`dy_unaccel` are
+        // the documented exception: raw device motion, no compositor transform, so they are
+        // forwarded untouched.
+        let relative_delta = match fit {
+            Some((scale, _)) if scale != 1.0 => delta.downscale(scale),
+            _ => delta,
         };
 
         // Pointer should only move if it's not locked or confined (and going out of bounds)
@@ -393,7 +404,7 @@ impl State {
             self,
             under.map(|(w, pos)| (w, pos.to_f64())),
             &RelativeMotionEvent {
-                delta,
+                delta: relative_delta,
                 delta_unaccel: delta_unaccelerated,
                 utime: event_time_usec,
             },

@@ -530,10 +530,11 @@ fn no_render_size_composites_one_to_one() {
 }
 
 // ---------------------------------------------------------------------------------------
-// Fullscreen fit-to-output: a fullscreen toplevel that commits a buffer SMALLER than the
+// Fullscreen fit-to-output: a fullscreen toplevel that commits a surface SMALLER than the
 // size it was configured at (a native app that picked its own internal resolution) is
 // scaled up to fill the output, aspect-preserved and centred, instead of being drawn 1:1
-// in the top-left corner. See `comp::rendering::fullscreen_fit`.
+// in the top-left corner. See `comp::fullscreen_fit` (the arithmetic, shared with input)
+// and `comp::window_fullscreen_fit` (the per-window lookup).
 // ---------------------------------------------------------------------------------------
 
 #[test]
@@ -640,6 +641,55 @@ fn pointer_input_is_mapped_through_the_fullscreen_fit() {
         f.server.pointer_location,
         Point::from((1900.0, 1000.0)),
         "the fit must not move the compositor's own (render-space) pointer location",
+    );
+}
+
+/// Relative motion must follow the same transform as the absolute coordinates, or a
+/// pointer-locked client (which sees ONLY relative motion) gets double sensitivity under a
+/// 2x fit while everything else moves at 1x. `dx_unaccel` is the documented exception —
+/// raw device motion, no compositor transform — so it stays untouched.
+#[test]
+fn relative_motion_is_scaled_by_the_fullscreen_fit() {
+    use crate::tests::client::MouseEvents;
+    use wayland_protocols::wp::relative_pointer::zv1::client::zwp_relative_pointer_v1;
+
+    let mut f = Fixture::new();
+    apply_encode(&mut f, 1920, 1080, 60);
+    f.create_solid_window_fullscreen(960, 540, WHITE);
+    let _relative_pointer = f.client.get_relative_pointer();
+    f.round_trip();
+
+    f.client.get_client_events().clear();
+    let delta = Point::from((20.0, 20.0));
+    f.server.pointer_motion(0, 0, delta, delta);
+    f.round_trip();
+
+    let relative = f
+        .client
+        .get_client_events()
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            MouseEvents::Relative(zwp_relative_pointer_v1::Event::RelativeMotion {
+                dx,
+                dy,
+                dx_unaccel,
+                dy_unaccel,
+                ..
+            }) => Some((*dx, *dy, *dx_unaccel, *dy_unaccel)),
+            _ => None,
+        })
+        .expect("a relative-motion event");
+
+    assert_eq!(
+        (relative.0, relative.1),
+        (10.0, 10.0),
+        "dx/dy share wl_pointer.motion's space, so a 2x fit halves them",
+    );
+    assert_eq!(
+        (relative.2, relative.3),
+        (20.0, 20.0),
+        "dx_unaccel/dy_unaccel are raw device motion and must NOT be transformed",
     );
 }
 
