@@ -524,6 +524,46 @@ fn no_render_size_composites_one_to_one() {
     assert_dark(&px, stride, 1900, 1000);
 }
 
+// ---------------------------------------------------------------------------------------
+// Fullscreen fit-to-output: a fullscreen toplevel that commits a buffer SMALLER than the
+// size it was configured at (a native app that picked its own internal resolution) is
+// scaled up to fill the output, aspect-preserved and centred, instead of being drawn 1:1
+// in the top-left corner. See `comp::rendering::fullscreen_fit`.
+// ---------------------------------------------------------------------------------------
+
+#[test]
+fn fullscreen_buffer_smaller_than_output_is_scaled_to_fit() {
+    let mut f = Fixture::new();
+    hide_cursor(&mut f);
+
+    // Encode == render == 1920x1080, so the whole-scene transform is the identity and the
+    // only thing under test is the per-window fit.
+    apply_encode(&mut f, 1920, 1080, 60);
+    f.create_solid_window_fullscreen(960, 540, WHITE);
+
+    let (px, stride) = frame_pixels(&mut f);
+    // Exact 2x (same aspect): the window fills the frame edge to edge. Before the fit
+    // existed the buffer was drawn 1:1 top-left, so (1900,1000) was the black clear colour.
+    assert_lit(&px, stride, 10, 10);
+    assert_lit(&px, stride, 1900, 1000);
+}
+
+#[test]
+fn fullscreen_buffer_with_other_aspect_is_letterboxed() {
+    let mut f = Fixture::new();
+    hide_cursor(&mut f);
+
+    // 1440x1080 (4:3) into a 1920x1080 (16:9) output: min(1.333, 1.0) = 1.0, so the buffer
+    // is not scaled at all -- only centred, leaving 240px black bars left and right.
+    apply_encode(&mut f, 1920, 1080, 60);
+    f.create_solid_window_fullscreen(1440, 1080, WHITE);
+
+    let (px, stride) = frame_pixels(&mut f);
+    assert_dark(&px, stride, 10, 540);
+    assert_lit(&px, stride, 960, 540);
+    assert_dark(&px, stride, 1910, 540);
+}
+
 #[test]
 fn pointer_motion_absolute_clamps_to_the_render_extent() {
     let mut f = Fixture::new();

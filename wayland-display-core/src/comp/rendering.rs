@@ -9,7 +9,7 @@ use smithay::{
         Color32F, ExportMem, ImportAll, ImportMem, Renderer,
         damage::{Error as OutputDamageTrackerError, RenderOutputResult},
         element::{
-            Id, Kind,
+            AsRenderElements, Id, Kind,
             memory::MemoryRenderBufferRenderElement,
             solid::SolidColorRenderElement,
             surface::WaylandSurfaceRenderElement,
@@ -17,10 +17,13 @@ use smithay::{
         },
         utils::CommitCounter,
     },
-    desktop::space::{SpaceRenderElements, space_render_elements},
+    desktop::Window,
+    desktop::space::SpaceElement,
     input::pointer::CursorImageStatus,
+    reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State as XdgState,
     render_elements,
-    utils::{Physical, Point, Rectangle, Size},
+    utils::{Logical, Physical, Point, Rectangle, Scale, Size},
+    wayland::{compositor::with_states, viewporter::ViewportCachedState},
 };
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -59,16 +62,30 @@ render_elements! {
     Overlay=O
 }
 
+/// One mapped window's surface tree (plus its popups), mapped from the size the client
+/// actually committed into the size it was configured at — see [`fullscreen_fit`]. The
+/// wrappers are an exact identity for every window that already fills its configure.
+type WindowElements =
+    RelocateRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>;
+
 /// The render-space scene, concrete for the compositor's GLES renderer.
-type SceneElements = SceneElement<
-    GlesRenderer,
-    CursorElement<GlesRenderer>,
-    SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
->;
+type SceneElements = SceneElement<GlesRenderer, CursorElement<GlesRenderer>, WindowElements>;
 /// [`SceneElements`] mapped from render space into the encode-sized framebuffer.
 type ScaledSceneElements = RelocateRenderElement<RescaleRenderElement<SceneElements>>;
 /// One entry of the element list `create_frame` hands to the damage tracker.
 type FrameElements = FrameElement<GlesRenderer, ScaledSceneElements, CursorElement<GlesRenderer>>;
+
+/// One mapped window, resolved for this frame: where its elements are built and how they
+/// are mapped into its configured box. Snapshotted out of the space *before* the renderer
+/// is borrowed mutably to build the elements.
+struct FitWindow {
+    window: Window,
+    /// The window's render location, relative to the output's region (render space).
+    loc: Point<i32, Logical>,
+    /// Aspect-preserving fit scale and centring offset — see [`fullscreen_fit`].
+    scale: f64,
+    offset: Point<i32, Physical>,
+}
 
 /// How to map a `render`-sized scene into an `encode`-sized framebuffer: an aspect-preserving
 /// upscale plus the centring offset that turns the leftover into symmetric letterbox/pillarbox
@@ -92,6 +109,72 @@ fn scene_transform(
     let offset = Point::from((
         ((encode.w as f64 - render.w as f64 * scale) / 2.0).round() as i32,
         ((encode.h as f64 - render.h as f64 * scale) / 2.0).round() as i32,
+    ));
+    (scale, offset)
+}
+
+/// How to map ONE fullscreen window's committed content into the box it was configured at:
+/// an aspect-preserving scale plus the centring offset (in PHYSICAL pixels) that turns the
+/// leftover into symmetric letterbox/pillarbox bars.
+///
+/// The problem this solves: a fullscreen toplevel that commits a buffer SMALLER than its
+/// configured size — a native Wayland game whose in-menu "resolution" setting picked, say,
+/// 1280x720 on a 1920x1080 output — is composited by the space at its buffer size at its map
+/// location, i.e. 1:1 in the top-left corner with black everywhere else. Every other
+/// compositor scales it to fill the output; gwd did not, which is what made an in-app
+/// resolution choice look broken.
+///
+/// Returns `(1.0, (0,0))` — an exact identity, so the wrappers composite exactly as the
+/// unwrapped elements did — for anything that is not that case:
+///
+/// * a window with no toplevel, or a toplevel whose **current** (acked) state is not
+///   `Fullscreen`;
+/// * a client that set a `wp_viewport` **destination**. Such a client has stated the size it
+///   wants to be presented at (gamescope and KWin both do this, sizing the destination to the
+///   size we configured them at), so its choice is honoured rather than second-guessed;
+/// * a degenerate size, or a committed size that already equals the configured one (the
+///   overwhelmingly common case: identity, no arithmetic).
+///
+/// `output_logical` is the fallback "configured size" for a toplevel whose current state
+/// carries none, and `output_scale` converts the logical centring offset into the physical
+/// pixels the render elements live in.
+fn fullscreen_fit(
+    window: &Window,
+    output_logical: Size<i32, Logical>,
+    output_scale: f64,
+) -> (f64, Point<i32, Physical>) {
+    let identity = (1.0, Point::from((0, 0)));
+
+    let Some(toplevel) = window.toplevel() else {
+        return identity;
+    };
+    let toplevel_state = toplevel.current_state();
+    if !toplevel_state.states.contains(XdgState::Fullscreen) {
+        return identity;
+    }
+    let states_own_size = with_states(toplevel.wl_surface(), |states| {
+        states
+            .cached_state
+            .get::<ViewportCachedState>()
+            .current()
+            .dst
+            .is_some()
+    });
+    if states_own_size {
+        return identity;
+    }
+
+    // `c` = the box the client was told to fill; `b` = what it actually committed.
+    let c = toplevel_state.size.unwrap_or(output_logical);
+    let b = SpaceElement::geometry(window).size;
+    if b.w <= 0 || b.h <= 0 || c.w <= 0 || c.h <= 0 || b == c {
+        return identity;
+    }
+
+    let scale = f64::min(c.w as f64 / b.w as f64, c.h as f64 / b.h as f64);
+    let offset = Point::from((
+        (((c.w as f64 - b.w as f64 * scale) / 2.0) * output_scale).round() as i32,
+        (((c.h as f64 - b.h as f64 * scale) / 2.0) * output_scale).round() as i32,
     ));
     (scale, offset)
 }
@@ -277,20 +360,67 @@ impl State {
         let render_size = effective_render_size(self);
         let (scale, offset) = scene_transform(encode_size, render_size);
 
-        // Client surfaces, in render space. Built explicitly (rather than via
-        // `desktop::space::render_output`) so they can be wrapped alongside the cursor.
-        let space_elements = space_render_elements(
-            &mut self.renderer,
-            [&self.space],
-            self.output.as_ref().unwrap(),
-            // alpha, not scale: `space_render_elements` reads the scale off the Output itself
-            // (`output.current_scale().fractional_scale()`), so the client surfaces follow the
-            // UI scale with no argument from us.
-            1.0,
-        )?;
+        // Client surfaces, in render space. Built per window (rather than via
+        // `desktop::space::space_render_elements` / `render_output`) so each window's
+        // elements can be wrapped in its OWN fit transform before the whole scene is wrapped
+        // in the render->encode one, and so they can be grouped with the cursor.
+        //
+        // The traversal mirrors `Space::render_elements_for_region`, which this replaces:
+        // z-order back-to-front from `space.elements()`, reversed so the topmost window's
+        // elements come first (render-element lists are front-to-back), each window's
+        // location taken relative to the output's region. gwd maps exactly one output at
+        // (0,0) and uses no layer-shell surfaces, so nothing else `space_render_elements`
+        // does applies here.
+        let output = self.output.clone().expect("output not set");
+        let region = self.space.output_geometry(&output);
+        let windows: Vec<FitWindow> = match region {
+            Some(region) => self
+                .space
+                .elements()
+                .rev()
+                .filter_map(|window| {
+                    let bbox = self.space.element_bbox(window)?;
+                    if !region.overlaps(bbox) {
+                        return None;
+                    }
+                    let loc = self.space.element_location(window)?
+                        - SpaceElement::geometry(window).loc
+                        - region.loc;
+                    let (scale, offset) = fullscreen_fit(window, region.size, output_scale);
+                    Some(FitWindow {
+                        window: window.clone(),
+                        loc,
+                        scale,
+                        offset,
+                    })
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+
+        let mut window_elements: Vec<WindowElements> = Vec::new();
+        for fit in windows {
+            let origin: Point<i32, Physical> = fit.loc.to_physical_precise_round(output_scale);
+            let elements = fit
+                .window
+                .render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
+                    &mut self.renderer,
+                    origin,
+                    Scale::from(output_scale),
+                    // alpha
+                    1.0,
+                );
+            window_elements.extend(elements.into_iter().map(|e| {
+                RelocateRenderElement::from_element(
+                    RescaleRenderElement::from_element(e, origin, fit.scale),
+                    fit.offset,
+                    Relocate::Relative,
+                )
+            }));
+        }
 
         let mut elements: Vec<FrameElements> = Vec::with_capacity(
-            cursor_elements.len() + space_elements.len() + HDR_SPIKE_LEVELS.len(),
+            cursor_elements.len() + window_elements.len() + HDR_SPIKE_LEVELS.len(),
         );
 
         // HDR render-path spike: prepend synthetic >1.0 brightness bars across the top of the
@@ -311,7 +441,7 @@ impl State {
             cursor_elements
                 .into_iter()
                 .map(SceneElements::Cursor)
-                .chain(space_elements.into_iter().map(SceneElements::Space))
+                .chain(window_elements.into_iter().map(SceneElements::Space))
                 .map(|e| {
                     FrameElements::Scene(RelocateRenderElement::from_element(
                         RescaleRenderElement::from_element(e, Point::from((0, 0)), scale),
