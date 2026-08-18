@@ -403,18 +403,18 @@ impl CUDAContext {
     ///     return TRUE;
     /// ```
     ///
-    /// i.e. they report SUCCESS while transferring NOTHING. Every other exit path is
+    /// i.e. they report SUCCESS while transferring NOTHING. Every other SUCCESS path is
     /// `(transfer full)` into the slot. [`CUDAContext::drop`] unconditionally
     /// `gst_object_unref()`s `self.ptr`, so a wrapper built off that short-circuit
     /// destroys a reference it never owned.
     ///
-    /// That is exactly what happens on the compositor's OWN context (quasar #426).
+    /// That is exactly what happens on the compositor's OWN context.
     /// `new_from_gstreamer()` calls `gst_cuda_ensure_element_context()`, which creates the
     /// context (rc=1, into the slot) and publishes it -- and that publish re-enters
     /// `waylanddisplaysrc::set_context()` SYNCHRONOUSLY, from inside the very call, with the
     /// context it is still in the middle of creating. Confirmed live by a leaks-tracer
     /// creation stack showing `gst_cuda_ensure_element_context` sandwiched BETWEEN two
-    /// waylanddisplaysrc frames (quasar #418 probe-c).
+    /// waylanddisplaysrc frames.
     ///
     /// The re-entrancy is what makes the bug stick, because it inverts which wrapper is
     /// kept: at re-entry `settings.cuda_context` is still `None` (the outer call has not
@@ -442,7 +442,7 @@ impl CUDAContext {
     /// `cuda_raw_ptr` must be a valid, readable slot, and `pre` must be the value read from
     /// that same slot immediately before the call being adopted.
     unsafe fn adopt_slot_ref(pre: *mut GstCudaContext, cuda_raw_ptr: *mut *mut GstCudaContext) {
-        // Edition 2024: `unsafe_op_in_unsafe_fn` is deny-by-default, so an `unsafe fn` body
+        // Edition 2024: `unsafe_op_in_unsafe_fn` warns by default, so an `unsafe fn` body
         // still needs its own block.
         unsafe {
             let post = *cuda_raw_ptr;

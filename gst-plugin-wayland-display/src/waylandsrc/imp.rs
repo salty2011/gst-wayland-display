@@ -41,7 +41,7 @@ use waylanddisplaycore::{
 ///    `Vec<AtomicPtr>` of `MAX_SHARDS = next_pow2(MAX_THREADS - 1) = 4096` entries — a **32 KiB
 ///    heap allocation** built and torn down on every buffer. At 60 fps that is ~2 MB/s of
 ///    large-bin alloc/free churn on the streaming thread, interleaved with the frame buffers;
-///    classic glibc arena fragmentation (quasar #419: unbounded agent RSS growth per session
+///    classic glibc arena fragmentation (observed as unbounded agent RSS growth per session
 ///    with zero fd / thread / GstObject / VRAM correlate).
 ///  * `tracing::subscriber::with_default(subscriber, ..)` builds a `Dispatch`, and
 ///    `Dispatch::new` calls `tracing_core::callsite::register_dispatch`, which takes a global
