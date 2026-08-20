@@ -2166,8 +2166,8 @@ mod tests {
         let pspec = source
             .find_property("app-surface-commits")
             .expect("counter property");
-        assert!(pspec.flags().contains(glib::ParamFlags::READABLE));
-        assert!(!pspec.flags().contains(glib::ParamFlags::WRITABLE));
+        assert!(pspec.flags().contains(gst::glib::ParamFlags::READABLE));
+        assert!(!pspec.flags().contains(gst::glib::ParamFlags::WRITABLE));
         assert_eq!(source.property::<u64>("app-surface-commits"), 0);
     }
 
