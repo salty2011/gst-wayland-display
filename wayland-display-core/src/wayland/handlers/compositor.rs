@@ -174,7 +174,7 @@ impl CompositorHandler for State {
                 _ => (false, false),
             }
         });
-        // #378 T6: a newly-attached buffer that is NOT a dmabuf (SHM, single-pixel, ...)
+        // A newly-attached buffer that is NOT a dmabuf (SHM, single-pixel, ...)
         // clears the renderer-degradation condition -- the client is actively presenting
         // through a path independent of the (possibly-failing) GPU dmabuf import, so any
         // earlier import failure was transient or the client already recovered via an SHM
@@ -330,8 +330,7 @@ impl CompositorHandler for State {
                     (0., 0.).into(),
                     (0., 0.).into(),
                 );
-                // Arm the edge-triggered pointer refocus for the NEXT motion (quasar
-                // issue #432): the enter emitted by the synthetic motion above reaches
+                // Arm the edge-triggered pointer refocus for the NEXT motion: the enter emitted by the synthetic motion above reaches
                 // only the wl_pointer resources that exist at this instant, and a client
                 // that calls wl_seat.get_pointer afterwards (rootful Xwayland always;
                 // gamescope intermittently) would never see one, because smithay records

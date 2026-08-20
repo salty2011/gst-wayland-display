@@ -130,15 +130,15 @@ pub struct State {
     /// see `renderer_degraded_active`), incremented by `note_renderer_degraded` (first
     /// failure) and `tick_renderer_degraded` (periodic re-emit while the condition stays
     /// active). The gst element delta-samples it (via
-    /// `WaylandDisplay::renderer_degraded_count`) to post a `quasar-renderer-degraded` bus
+    /// `WaylandDisplay::renderer_degraded_count`) to post a `wolf-renderer-degraded` bus
     /// WARNING -- tracing does not reach the gst bus, so this counter is the compositor ->
-    /// element bridge (#378).
+    /// element bridge.
     pub(crate) renderer_degraded: Arc<AtomicU64>,
     /// Renderer-degradation CONDITION state, not a one-shot event: `Some(last_emit)` means a
     /// client buffer import has failed and NO client buffer has succeeded since. A client
-    /// that backs off permanently after one rejected import (observed live with gamescope,
-    /// #378 T6) never produces another failure to re-trigger on, so a one-shot marker would
-    /// never satisfy the node-agent's 2-in-30s debounce and the black-screen session would
+    /// that backs off permanently after one rejected import (observed live with gamescope)
+    /// never produces another failure to re-trigger on, so a one-shot marker would
+    /// never satisfy a downstream 2-in-30s debounce and the black-screen session would
     /// stay `running` forever. `tick_renderer_degraded` re-emits every 5s while `Some`;
     /// `clear_renderer_degraded` resets to `None` the moment any client buffer (dmabuf or
     /// SHM/other) is handled successfully, since that proves the client is alive and any
@@ -182,7 +182,7 @@ pub struct State {
     pub(crate) pointer_location: Point<f64, Logical>,
     pub(crate) pointer_absolute_location: Point<f64, Logical>,
     last_pointer_movement: Instant,
-    /// Edge trigger for a forced wl_pointer refocus (quasar issue #432). Set at initial
+    /// Edge trigger for a forced wl_pointer refocus. Set at initial
     /// toplevel map, consumed by the next `pointer_motion()` that has a surface under the
     /// pointer; see `comp::input::pointer_motion`.
     pub(crate) pending_pointer_refocus: bool,
@@ -261,12 +261,11 @@ const HDR_IMPORT_FOURCCS: [Fourcc; 6] = [
     Fourcc::Xrgb2101010,
 ];
 
-/// Test-only fault-injection hook for #378 T6 (see
-/// `docs/design/plans/2026-07-19-378-multisession-fail-closed-spec.md`). When
-/// `QUASAR_DEBUG_FAIL_DMABUF_IMPORT` is `"1"` or `"true"`, every dmabuf import in
+/// Test-only fault-injection hook for the renderer-degradation path. When
+/// `WOLF_DEBUG_FAIL_DMABUF_IMPORT` is `"1"` or `"true"`, every dmabuf import in
 /// `handlers/dmabuf.rs` and `handlers/wl_drm.rs` is treated as failed WITHOUT calling the
 /// real `renderer.import_dmabuf` -- deterministically exercising the
-/// `quasar-renderer-degraded` bus-warning / fail-closed path without needing a client that
+/// `wolf-renderer-degraded` bus-warning / fail-closed path without needing a client that
 /// actually submits an unimportable buffer. Read once (mirrors `wolf_hdr_cm()` in
 /// `utils/vulkan_nv12.rs`). Unset/any-other-value == byte-identical prior behavior.
 /// NEVER set this in production.
@@ -274,7 +273,7 @@ pub(crate) fn debug_fail_dmabuf_import() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| {
         matches!(
-            std::env::var("QUASAR_DEBUG_FAIL_DMABUF_IMPORT").as_deref(),
+            std::env::var("WOLF_DEBUG_FAIL_DMABUF_IMPORT").as_deref(),
             Ok("1") | Ok("true")
         )
     })
@@ -416,7 +415,7 @@ impl State {
             // failed bind loses NO client capability. On NVIDIA the per-device EGLDisplay is
             // process-shared and allows exactly one wl_display, so a 2nd concurrent compositor's
             // bind ALWAYS fails here -- logging that as loss of "hardware-acceleration" cost a
-            // full diagnostic detour, hence `debug!` (#378).
+            // full diagnostic detour, hence `debug!`.
             match renderer.bind_wl_display(&dh) {
                 Ok(_) => tracing::info!("EGL hardware-acceleration enabled"),
                 Err(err) => tracing::debug!(
@@ -563,7 +562,7 @@ impl State {
     /// an `Arc` pointing at itself: no drop of ours can reach it, and the keymap memfd
     /// stays open for the lifetime of the *process*, not the session.
     ///
-    /// That is the shape the node-agent measured (quasar#400): 136 back-to-back sessions
+    /// That is the shape measured in practice: 136 back-to-back sessions
     /// leaked exactly one `smithay-keymap` fd each, while everything else the compositor
     /// owns -- renderer, EGL, wayland sockets, and even the sibling
     /// `smithay-dmabuffeedback-format-table` memfd that lives in the same `Display` --
@@ -590,19 +589,19 @@ impl State {
 
     /// Enter (or refresh) the renderer-degradation CONDITION: a client buffer import failed
     /// on the GPU renderer (`handlers/dmabuf.rs`, `handlers/wl_drm.rs`, or the
-    /// `QUASAR_DEBUG_FAIL_DMABUF_IMPORT` T6 injection hook). The FIRST failure since the
+    /// `WOLF_DEBUG_FAIL_DMABUF_IMPORT` injection hook). The FIRST failure since the
     /// condition was last clear emits immediately (bumps `renderer_degraded` + logs); a
     /// repeat failure while already active does not re-emit here -- `tick_renderer_degraded`
     /// covers "still broken" via periodic re-emission, so a client retrying every frame can't
     /// flood the log/bus, and a client that backs off after exactly one failed import (the
-    /// #378 T6 gamescope case: no retry, ever) still gets covered by the tick path instead of
+    /// gamescope case: no retry, ever) still gets covered by the tick path instead of
     /// going silent forever. See the `renderer_degraded_active` field doc for the condition
     /// model this implements.
     pub(crate) fn note_renderer_degraded(&mut self, detail: &str) {
         let now = Instant::now();
         if self.renderer_degraded_active.is_none() {
             self.renderer_degraded.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!("quasar-renderer-degraded: {detail}");
+            tracing::warn!("wolf-renderer-degraded: {detail}");
         }
         self.renderer_degraded_active = Some(now);
     }
@@ -614,7 +613,7 @@ impl State {
     /// SHM fallback after a rejected dmabuf), so stop re-emitting. A client that backs off
     /// permanently instead (never produces another buffer) never reaches this call, so the
     /// condition -- and `tick_renderer_degraded`'s periodic re-emission -- stays active until
-    /// the node-agent acts on it (#378).
+    /// a downstream consumer acts on it.
     pub(crate) fn clear_renderer_degraded(&mut self) {
         self.renderer_degraded_active = None;
     }
@@ -624,7 +623,7 @@ impl State {
     /// frames, so it runs continuously regardless of whether the offending client ever
     /// submits another buffer -- unlike `note_renderer_degraded`, which only runs when a
     /// client actually attempts an import). This is what turns a single rejected import into
-    /// a periodic, debounce-surviving signal for a client that backs off for good (#378 T6).
+    /// a periodic, debounce-surviving signal for a client that backs off for good.
     pub(crate) fn tick_renderer_degraded(&mut self) {
         let Some(last_emit) = self.renderer_degraded_active else {
             return;
@@ -633,7 +632,7 @@ impl State {
         if now.duration_since(last_emit) >= Duration::from_secs(5) {
             self.renderer_degraded_active = Some(now);
             self.renderer_degraded.fetch_add(1, Ordering::Relaxed);
-            tracing::warn!("quasar-renderer-degraded: condition still active (periodic re-emit)");
+            tracing::warn!("wolf-renderer-degraded: condition still active (periodic re-emit)");
         }
     }
 
@@ -1596,7 +1595,7 @@ pub(crate) fn init(
                         // WOLF_HDR_CM is set). Runs before the buffer check so transitions
                         // are observed even on frames that fail to produce a buffer.
                         state.update_hdr_state();
-                        // #378 T6: periodic re-emission of an active renderer-degradation
+                        // Periodic re-emission of an active renderer-degradation
                         // condition. This runs every frame the encode pipeline pulls
                         // (independent of client behavior), which is the only reliable
                         // periodic tick available to a client that backed off after one
@@ -1909,7 +1908,7 @@ pub(crate) fn init(
 
     // Close the seat's keymap memfd before `state` drops. A grab left active by the client
     // makes the keyboard's Arc self-referential, so dropping `state` alone can leak one
-    // `memfd:smithay-keymap` per session -- see [`State::release_seat`]. (#400)
+    // `memfd:smithay-keymap` per session -- see [`State::release_seat`].
     state.release_seat();
 }
 

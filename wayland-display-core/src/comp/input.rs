@@ -311,7 +311,7 @@ impl State {
         let under: Option<(FocusTarget, Point<f64, Logical>)> =
             focus.map(|(w, pos)| (w.into(), pos));
 
-        // Edge-triggered pointer refocus (quasar issue #432).
+        // Edge-triggered pointer refocus.
         //
         // smithay only emits wl_pointer.enter on a focus TRANSITION, and broadcasts it to
         // the wl_pointer resources that exist at that instant while recording the new focus

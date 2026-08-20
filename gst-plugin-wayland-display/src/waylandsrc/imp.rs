@@ -76,8 +76,8 @@ pub struct WaylandDisplaySrc {
     hdr_meta: Mutex<(Option<String>, Option<String>)>,
     /// Last `WaylandDisplay::renderer_degraded_count()` value observed in `create()`. When the
     /// compositor's shared counter advances past this, the element posts a
-    /// `quasar-renderer-degraded` bus WARNING (tracing does not reach the gst bus, so this
-    /// delta-sample is the bridge to the node-agent's fail-closed hook). Default 0 (#378).
+    /// `wolf-renderer-degraded` bus WARNING (tracing does not reach the gst bus, so this
+    /// delta-sample is the bridge to a downstream fail-closed policy). Default 0.
     renderer_degraded_seen: AtomicU64,
     /// This element's OWN Vulkan-encode device share (8th gwd patch — per-element device
     /// ownership). Replaces the old process-global `vulkan_share` `OnceLock` slots so N
@@ -1687,11 +1687,11 @@ impl PushSrcImpl for WaylandDisplaySrc {
             return Err(gst::FlowError::Eos);
         };
 
-        // Renderer-degradation bridge (#378): the compositor increments a shared counter
+        // Renderer-degradation bridge: the compositor increments a shared counter
         // (rate-limited to <=1 per 5s) whenever a client buffer import fails on the GPU
         // renderer. tracing does not reach the gst bus, so delta-sample the counter here and
-        // surface each new event as a bus WARNING carrying the `quasar-renderer-degraded`
-        // marker -- the node-agent matches this to fail a session that requires hardware
+        // surface each new event as a bus WARNING carrying the `wolf-renderer-degraded`
+        // marker -- a downstream consumer matches this to fail a session that requires hardware
         // rendering. Unconditional (independent of WOLF_HDR_CM).
         let degraded = state.display.renderer_degraded_count();
         if degraded
@@ -1703,9 +1703,9 @@ impl PushSrcImpl for WaylandDisplaySrc {
             gst::element_warning!(
                 elem,
                 gst::LibraryError::Failed,
-                ("quasar-renderer-degraded"),
+                ("wolf-renderer-degraded"),
                 [
-                    "quasar-renderer-degraded: a client buffer import failed on the GPU renderer; see compositor log"
+                    "wolf-renderer-degraded: a client buffer import failed on the GPU renderer; see compositor log"
                 ]
             );
         }

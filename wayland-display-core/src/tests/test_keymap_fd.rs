@@ -1,4 +1,4 @@
-//! Regression guard for the per-session `memfd:smithay-keymap` fd leak (quasar#400).
+//! Regression guard for the per-session `memfd:smithay-keymap` fd leak.
 //!
 //! smithay mints one sealed memfd named `smithay-keymap` per `Seat::add_keyboard`
 //! (`KeymapFile::new`), i.e. one per compositor instance, and keeps it in the
@@ -113,7 +113,7 @@ fn keymap_memfd_is_released_on_compositor_teardown() {
     assert!(
         after <= baseline + TOLERANCE,
         "smithay-keymap memfds grew across {CYCLES} compositor teardowns: \
-         {baseline} -> {after} (issue #400)"
+         {baseline} -> {after}"
     );
 }
 
@@ -142,6 +142,6 @@ fn keymap_memfd_is_released_when_a_grab_is_still_active() {
     assert!(
         after <= baseline + TOLERANCE,
         "smithay-keymap memfds grew across {CYCLES} teardowns with an active grab: \
-         {baseline} -> {after} (issue #400)"
+         {baseline} -> {after}"
     );
 }

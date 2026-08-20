@@ -17,11 +17,11 @@ impl DmabufHandler for State {
         dmabuf: Dmabuf,
         notifier: ImportNotifier,
     ) {
-        // #378 T6 fault-injection hook: see `debug_fail_dmabuf_import` doc comment
+        // Fault-injection hook: see `debug_fail_dmabuf_import` doc comment
         // (comp/mod.rs). Test-only; never set in production.
         if debug_fail_dmabuf_import() {
             self.note_renderer_degraded(
-                "dmabuf import failed: QUASAR_DEBUG_FAIL_DMABUF_IMPORT injected failure",
+                "dmabuf import failed: WOLF_DEBUG_FAIL_DMABUF_IMPORT injected failure",
             );
             notifier.failed();
             return;
@@ -30,14 +30,14 @@ impl DmabufHandler for State {
         match self.renderer.import_dmabuf(&dmabuf, None) {
             Ok(_) => {
                 // A successful import proves the client's GPU path is alive -- clear any
-                // active degradation condition (#378 T6).
+                // active degradation condition.
                 self.clear_renderer_degraded();
                 let _ = notifier.successful::<State>();
             }
             Err(err) => {
                 // A client's dmabuf failed to import on the GPU renderer -- the frame it
                 // backs will not composite. Enters/refreshes the degradation condition so
-                // the node-agent can fail a session that requires hardware rendering (#378).
+                // a downstream consumer can fail a session that requires hardware rendering.
                 self.note_renderer_degraded(&format!("dmabuf import failed: {err:?}"));
                 notifier.failed();
             }

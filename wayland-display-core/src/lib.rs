@@ -135,7 +135,7 @@ pub struct WaylandDisplay {
     app_surface_commits: Arc<AtomicU64>,
     /// Shared with the compositor thread: lifetime count of renderer-degradation events
     /// (rate-limited client-buffer import failures). Delta-sampled by the gst element to post
-    /// a `quasar-renderer-degraded` bus warning (#378).
+    /// a `wolf-renderer-degraded` bus warning.
     renderer_degraded: Arc<AtomicU64>,
 
     pub tracer: Option<Tracer>,
@@ -284,7 +284,7 @@ impl WaylandDisplay {
 
     /// Lifetime count of renderer-degradation events (rate-limited client-buffer import
     /// failures on the GPU renderer). The gst element delta-samples this to post a
-    /// `quasar-renderer-degraded` bus WARNING the node-agent's fail-closed hook reads (#378).
+    /// `wolf-renderer-degraded` bus WARNING a downstream fail-closed hook reads.
     pub fn renderer_degraded_count(&self) -> u64 {
         self.renderer_degraded.load(Ordering::Relaxed)
     }
