@@ -327,15 +327,13 @@ impl BaseTransformImpl for VulkanScale {
         inbuf: gst_base::subclass::base_transform::InputBuffer,
     ) -> Result<gst_base::subclass::base_transform::PrepareOutputBufferSuccess, gst::FlowError>
     {
+        if self.obj().is_passthrough() {
+            return Ok(gst_base::subclass::base_transform::PrepareOutputBufferSuccess::InputBuffer);
+        }
         let inbuf = match inbuf {
             gst_base::subclass::base_transform::InputBuffer::Readable(b) => b.to_owned(),
             gst_base::subclass::base_transform::InputBuffer::Writable(b) => b.to_owned(),
         };
-        if self.obj().is_passthrough() {
-            return Ok(
-                gst_base::subclass::base_transform::PrepareOutputBufferSuccess::Buffer(inbuf),
-            );
-        }
         let out = self.scale(&inbuf).map_err(|e| {
             gst::element_imp_error!(self, gst::ResourceError::Failed, ["{e}"]);
             gst::FlowError::Error

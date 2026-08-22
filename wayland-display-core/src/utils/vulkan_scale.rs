@@ -90,7 +90,15 @@ pub struct VulkanScaler {
     dst_w: u32,
     dst_h: u32,
     fmt: PixFmt,
+    /// Rolling scale cost (dispatch + copy + fence wait), reported every
+    /// [`REPORT_EVERY`] frames so a rung's GPU cost is visible in the log without a probe.
+    frames: u64,
+    total_us: u64,
+    max_us: u64,
 }
+
+/// How often the rolling scale cost is logged.
+const REPORT_EVERY: u64 = 300;
 
 impl std::fmt::Debug for VulkanScaler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -246,12 +254,33 @@ impl VulkanScaler {
             dst_w,
             dst_h,
             fmt,
+            frames: 0,
+            total_us: 0,
+            max_us: 0,
         })
     }
 
     /// Scale one input frame into the next ring slot and return that slot's buffer.
     pub fn scale(&mut self, input: &gst::Buffer) -> Result<gst::Buffer, Err> {
-        unsafe { self.scale_inner(input) }
+        let t0 = std::time::Instant::now();
+        let out = unsafe { self.scale_inner(input) };
+        let us = t0.elapsed().as_micros() as u64;
+        self.frames += 1;
+        self.total_us += us;
+        self.max_us = self.max_us.max(us);
+        if self.frames.is_multiple_of(REPORT_EVERY) {
+            tracing::info!(
+                "vulkanscale: {}x{} mean {:.2} ms/frame, max {:.2} ms over {} frames",
+                self.dst_w,
+                self.dst_h,
+                self.total_us as f64 / REPORT_EVERY as f64 / 1000.0,
+                self.max_us as f64 / 1000.0,
+                REPORT_EVERY
+            );
+            self.total_us = 0;
+            self.max_us = 0;
+        }
+        out
     }
 
     unsafe fn scale_inner(&mut self, input: &gst::Buffer) -> Result<gst::Buffer, Err> {
@@ -509,7 +538,22 @@ impl VulkanScaler {
         self.device.wait_for_fences(&[fence], true, u64::MAX)?;
         self.device.reset_fences(&[fence])?;
 
-        Ok(self.outputs[idx].buffer.clone())
+        // Hand downstream a shallow HEADER copy that shares the slot's memory and carries
+        // a ParentBufferMeta back to the slot buffer. The child header is writable (so
+        // GstBaseTransform can retime it and the encoder can attach its own metas) while
+        // the parent's refcount stays the completion sentinel the reuse gate above reads.
+        let parent = &self.outputs[idx].buffer;
+        let mut child = parent.copy();
+        {
+            let cr = child
+                .get_mut()
+                .ok_or("vulkanscale: fresh output child unexpectedly shared")?;
+            cr.set_pts(gst::ClockTime::NONE);
+            cr.set_dts(gst::ClockTime::NONE);
+            cr.set_duration(gst::ClockTime::NONE);
+            gst::ParentBufferMeta::add(cr, parent);
+        }
+        Ok(child)
     }
 
     /// Y/UV sampled views over `input`, created once per distinct source image set.

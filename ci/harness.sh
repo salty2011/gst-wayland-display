@@ -152,7 +152,7 @@ phase_detect() {
   if command -v gst-inspect-1.0 >/dev/null; then
     echo "  encoders        :"
     local e
-    for e in vah265enc vah265lpenc nvh265enc vulkanh265enc vulkanh264enc dmabuftocuda; do
+    for e in vah265enc vah265lpenc nvh265enc vulkanh265enc vulkanh264enc vulkanav1enc vulkanscale dmabuftocuda; do
       gst-inspect-1.0 "$e" >/dev/null 2>&1 && echo "      $e"
     done
   fi
@@ -187,10 +187,23 @@ phase_unit() {
 phase_gpu() {
   if [[ ${#NODE_FOR_VENDOR[@]} -eq 0 ]]; then warn "no GPU; skipping"; return 0; fi
   local node="${FORCE_NODE:-${NODE_FOR_VENDOR[amd]:-${NODE_FOR_VENDOR[intel]:-${NODE_FOR_VENDOR[nvidia]:-}}}}"
+  local rel; rel="$([[ $PROFILE == release ]] && echo --release)"
   log "  GPU-gated Rust tests on $node"
   NV12_TEST_NODE="$node" VULKAN_ENC_NODE="$node" \
-    sh_run "$CARGO" test --workspace $(feature_args) \
-      $([[ $PROFILE == release ]] && echo --release) -- --ignored
+    sh_run "$CARGO" test --workspace $(feature_args) $rel -- --ignored \
+      --skip _live_resize_reaches_the_bitstream || return 1
+  # The vulkanscale live-resize tests get a process each: a mid-stream size change in a
+  # SECOND Vulkan encode session of the same process makes the encoder fail
+  # ("Failed to encode the frame", gsth264encoder.c) even though the resize itself lands.
+  # Two sequential sessions are fine without a resize, and the first session resizes fine,
+  # so this isolates the tests from that (separately tracked) interaction.
+  local t
+  for t in h264 h265 av1; do
+    log "  vulkanscale ${t} live resize (own process)"
+    NV12_TEST_NODE="$node" VULKAN_ENC_NODE="$node" \
+      sh_run "$CARGO" test -p gst-plugin-wayland-display --test vulkanscale $(feature_args) $rel \
+        -- --ignored --exact "${t}_live_resize_reaches_the_bitstream" || return 1
+  done
 }
 
 # --- per-vendor encode integration smoke tests -------------------------------
