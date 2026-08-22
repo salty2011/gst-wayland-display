@@ -28,7 +28,35 @@ use gst::prelude::*;
 use gstreamer_vulkan::prelude::*;
 use gstreamer_vulkan::{VulkanDevice, VulkanInstance, VulkanPhysicalDevice, VulkanQueue};
 use gstreamer_vulkan_sys as gstvk;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// Devices that have already logged the encode-src readable-flags fallback.
+///
+/// Per **device**, not per process: on a multi-GPU host one GPU may refuse the readable
+/// superset while another accepts it, and a process-global guard would hide whichever came
+/// second. Keyed by the `GstVulkanDevice` pointer, which is stable for the lifetime of the
+/// device that owns the images in question.
+static READABLE_REJECTED: OnceLock<Mutex<Vec<usize>>> = OnceLock::new();
+
+/// The `GstVulkanDevice` pointer as an opaque identity key.
+fn device_key(device: &VulkanDevice) -> usize {
+    let ptr: *mut gstvk::GstVulkanDevice = device.to_glib_none().0;
+    ptr as usize
+}
+
+/// True the first time `device` reports the fallback, false afterwards.
+fn first_readable_rejection(device: &VulkanDevice) -> bool {
+    let key = device_key(device);
+    let mut seen = READABLE_REJECTED
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    if seen.contains(&key) {
+        return false;
+    }
+    seen.push(key);
+    true
+}
 
 // VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR / VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR via raw
 // values (stable, and avoids depending on the named ash constants existing).
@@ -503,6 +531,65 @@ pub fn alloc_encode_src_buffer(
             PixFmt::Nv12 => vk::Format::G8_B8R8_2PLANE_420_UNORM,
             PixFmt::P010 => vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
         };
+        // Scaler-readable encode-src image (`vulkanscale`, quasar #501). An encode-src
+        // image allocated with TRANSFER_DST|VIDEO_ENCODE_SRC alone cannot be READ by
+        // anything: no SAMPLED/TRANSFER_SRC usage, and no MUTABLE_FORMAT, so the
+        // per-plane R8/R8G8 views a compute shader needs cannot even be created. Ask for
+        // the readable superset first and fall back to the historical flags if the driver
+        // rejects it, so a driver that will not combine SAMPLED with VIDEO_ENCODE_SRC
+        // keeps working exactly as before (only `vulkanscale` loses its input).
+        //
+        // **Why unconditional rather than gated on a scaler being present.** These images are
+        // allocated by the compositor thread when it builds its output ring, which happens at
+        // `set_caps` time — before any downstream element has been asked anything, and with no
+        // handle on the encode pipeline at all. On the Quasar path the scaler is not even in
+        // the same `GstPipeline` (the ring crosses an interpipe boundary), so "is there a
+        // vulkanscale downstream" is not a question this call site can answer. The lever would
+        // have to be an explicit property threaded from the node-agent, which only pays for
+        // itself if the superset costs something: measured on an RTX 5090 / 610.57.04 it does
+        // not (see the A/B in the commit that introduced this), so the flags stay unconditional
+        // and the fallback keeps a hostile driver working.
+        let view_formats = [image_format, fmt.y_view_format(), fmt.uv_view_format()];
+        let mut flist = vk::ImageFormatListCreateInfo::default().view_formats(&view_formats);
+        let base_usage = vk::ImageUsageFlags::TRANSFER_DST
+            | vk::ImageUsageFlags::from_raw(VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_KHR);
+        let readable_info = vk::ImageCreateInfo::default()
+            .flags(vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE)
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(image_format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(tiling)
+            .usage(base_usage | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut profile_list)
+            .push_next(&mut flist);
+
+        // `WOLF_VULKAN_ENCSRC_READABLE=0` forces the historical encode-only flags. This is
+        // the lever the steady-state A/B was measured with (RTX 5090 / 610.57.04, 5x600
+        // frames per arm, no scaler, no resize: encode mean 2.076 ms readable vs 2.082 ms
+        // legacy, p50 2.022 vs 2.026, 234.8 vs 234.6 fps, VRAM identical at 779 MiB peak --
+        // the superset is free, within run-to-run noise). It is retained as a diagnostic and
+        // as an escape hatch if a future driver makes the superset expensive, NOT as the
+        // shipping mechanism: the flags are on by default because they cost nothing.
+        let want_readable = std::env::var("WOLF_VULKAN_ENCSRC_READABLE")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        let mut mem_ptr = if want_readable {
+            gstvk::gst_vulkan_image_memory_alloc_with_image_info(
+                device.to_glib_none().0,
+                &readable_info as *const vk::ImageCreateInfo as *mut _,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            )
+        } else {
+            std::ptr::null_mut()
+        };
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(image_format)
@@ -515,18 +602,25 @@ pub fn alloc_encode_src_buffer(
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(tiling)
-            .usage(
-                vk::ImageUsageFlags::TRANSFER_DST
-                    | vk::ImageUsageFlags::from_raw(VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_KHR),
-            )
+            .usage(base_usage)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .push_next(&mut profile_list);
-
-        let mut mem_ptr = gstvk::gst_vulkan_image_memory_alloc_with_image_info(
-            device.to_glib_none().0,
-            &image_info as *const vk::ImageCreateInfo as *mut _,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        );
+        if mem_ptr.is_null() {
+            if first_readable_rejection(device) {
+                tracing::warn!(
+                    "vulkan_share: encode-src image on GstVulkanDevice {:?} rejected \
+                     SAMPLED|TRANSFER_SRC|MUTABLE_FORMAT -- falling back to the encode-only \
+                     flags. Encoding is unaffected; vulkanscale cannot read these images and \
+                     will fail the session closed if it is in the graph.",
+                    device_key(device) as *const ()
+                );
+            }
+            mem_ptr = gstvk::gst_vulkan_image_memory_alloc_with_image_info(
+                device.to_glib_none().0,
+                &image_info as *const vk::ImageCreateInfo as *mut _,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            );
+        }
         let mut effective_tiling = tiling;
         if mem_ptr.is_null() && linear_encsrc {
             // The tiled-fallback promised above: some encoders (NVIDIA Vulkan-Video)
@@ -575,6 +669,24 @@ pub fn alloc_encode_src_buffer(
             );
         }
         Some(buffer)
+    }
+}
+
+/// Recover the `VkImage` of the `idx`-th memory of `buffer`, when that memory is a
+/// `GstVulkanImageMemory`. `vulkanscale` needs this per-memory form because a generic
+/// `GstVulkanImageBufferPool` hands out one single-plane image per plane, while the
+/// encode-src path is a single multiplanar image.
+pub fn recover_vk_image_at(buffer: &gst::Buffer, idx: usize) -> Option<vk::Image> {
+    if idx >= buffer.n_memory() {
+        return None;
+    }
+    let mem_ptr = buffer.peek_memory(idx).as_ptr() as *mut gst::ffi::GstMemory;
+    unsafe {
+        if gstvk::gst_is_vulkan_image_memory(mem_ptr) == gst::glib::ffi::GFALSE {
+            return None;
+        }
+        let image = wayland_display_vk_image(mem_ptr);
+        (image != vk::Image::null()).then_some(image)
     }
 }
 
