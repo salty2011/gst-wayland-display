@@ -195,6 +195,21 @@ const G1_WARN_PERIOD: Duration = Duration::from_secs(5);
 /// unchanged.
 const G1_FIRST_FRAME_GRACE: Duration = Duration::from_secs(1);
 
+/// Clamp bounds for the `WOLF_VULKAN_G1_BUDGET_MS` override.
+const G1_BUDGET_OVERRIDE_MIN_MS: u64 = 1;
+const G1_BUDGET_OVERRIDE_MAX_MS: u64 = 5_000;
+
+/// Parse the `WOLF_VULKAN_G1_BUDGET_MS` value. `None` (unset), `0`, a negative number, or
+/// anything unparseable means "derive from the negotiated framerate"; everything else is
+/// clamped to `1..=5000` ms. Split out of [`g1_budget_override`] so the policy is testable
+/// without touching the process environment or the `OnceLock`.
+fn parse_g1_budget_override(raw: Option<&str>) -> Option<Duration> {
+    let ms = raw?.trim().parse::<u64>().ok().filter(|&ms| ms > 0)?;
+    Some(Duration::from_millis(
+        ms.clamp(G1_BUDGET_OVERRIDE_MIN_MS, G1_BUDGET_OVERRIDE_MAX_MS),
+    ))
+}
+
 /// Operator override for the G1 wait budget, in milliseconds (`WOLF_VULKAN_G1_BUDGET_MS`).
 /// `0`, unset or unparseable means "derive from the negotiated framerate". Clamped to
 /// 1..=5000 ms; set it to `1000` to restore the pre-#504 flat budget. Read once.
@@ -202,13 +217,11 @@ fn g1_budget_override() -> Option<Duration> {
     use std::sync::OnceLock;
     static B: OnceLock<Option<Duration>> = OnceLock::new();
     *B.get_or_init(|| {
-        let ms = std::env::var("WOLF_VULKAN_G1_BUDGET_MS")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .filter(|&ms| ms > 0)?;
-        let d = Duration::from_millis(ms.clamp(1, 5_000));
-        tracing::debug!("VulkanNv12: G1 wait budget overridden to {d:?}");
-        Some(d)
+        let d = parse_g1_budget_override(std::env::var("WOLF_VULKAN_G1_BUDGET_MS").ok().as_deref());
+        if let Some(d) = d {
+            tracing::debug!("VulkanNv12: G1 wait budget overridden to {d:?}");
+        }
+        d
     })
 }
 
@@ -1768,6 +1781,37 @@ mod tests {
         for fps in [24, 30, 50, 60, 90, 120, 144, 240] {
             assert!(g1_budget_from_framerate(fps, 1) <= G1_BUDGET_MAX);
         }
+    }
+
+    /// `WOLF_VULKAN_G1_BUDGET_MS` parsing: only a positive integer overrides, and it is
+    /// clamped. Anything else falls through to the framerate-derived budget.
+    #[test]
+    fn budget_override_parses_and_clamps() {
+        // Unset / empty / junk / negative / zero -> no override.
+        assert_eq!(parse_g1_budget_override(None), None);
+        assert_eq!(parse_g1_budget_override(Some("")), None);
+        assert_eq!(parse_g1_budget_override(Some("abc")), None);
+        assert_eq!(parse_g1_budget_override(Some("-5")), None);
+        assert_eq!(parse_g1_budget_override(Some("0")), None);
+        assert_eq!(parse_g1_budget_override(Some("33.5")), None);
+        // A plain value, and one with the whitespace an env assignment can pick up.
+        assert_eq!(
+            parse_g1_budget_override(Some("50")),
+            Some(Duration::from_millis(50))
+        );
+        assert_eq!(
+            parse_g1_budget_override(Some(" 1000 ")),
+            Some(Duration::from_millis(1000))
+        );
+        // Clamped at both ends.
+        assert_eq!(
+            parse_g1_budget_override(Some("999999")),
+            Some(Duration::from_millis(G1_BUDGET_OVERRIDE_MAX_MS))
+        );
+        assert_eq!(
+            parse_g1_budget_override(Some("1")),
+            Some(Duration::from_millis(G1_BUDGET_OVERRIDE_MIN_MS))
+        );
     }
 
     /// The budget comes off the negotiated output caps; absent framerate -> fallback.
