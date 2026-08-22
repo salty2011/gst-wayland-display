@@ -164,8 +164,18 @@ struct Seen {
 /// Drive `waylanddisplaysrc(1080p) ! vulkanscale ! capsfilter(720p) ! enc ! parse` and
 /// flip the capsfilter to 1080p mid-stream. Returns the sizes the parser reported and the
 /// achieved frame rate.
+///
+/// `enc_caps` is an optional capsfilter placed on the ENCODER OUTPUT, written with a
+/// trailing `! ` when non-empty (e.g. `"! video/x-h265,profile=main "`). It exists
+/// because a Vulkan encoder whose src template advertises a profile its own
+/// `H265ProfileMap`/`H264ProfileMap` cannot map will happily negotiate that profile when
+/// downstream leaves it free, and then fail to open the video session. Pinning the
+/// profile is what the node-agent's encode pipeline already does
+/// (`node-agent/src/session/pipeline/caps.rs`), so pinning it here keeps the test on the
+/// same negotiation path production uses.
 fn flip(
     enc: &str,
+    enc_caps: &str,
     parse: &str,
     dec: &str,
     fmt: &str,
@@ -176,7 +186,7 @@ fn flip(
          ! video/x-raw(memory:VulkanImage),format={fmt},width=1920,height=1080,framerate=60/1 \
          ! vulkanscale name=scale \
          ! capsfilter name=cf caps=video/x-raw\\(memory:VulkanImage\\),format={fmt},width=1280,height=720 \
-         ! {enc} ! {parse} ! {dec} ! fakesink name=sink sync=false"
+         ! {enc} {enc_caps}! {parse} ! {dec} ! fakesink name=sink sync=false"
     );
     let pipeline = gst::parse::launch(&desc)
         .map_err(|e| format!("parse: {e}"))?
@@ -293,7 +303,7 @@ fn flip(
     Ok((sizes, fps, buffers))
 }
 
-fn run_flip_for(enc: &str, parse: &str, dec: &str, fmt: &str) {
+fn run_flip_for(enc: &str, enc_caps: &str, parse: &str, dec: &str, fmt: &str) {
     init();
     let Some(node) = render_node_for(&["nvidia"]) else {
         skip!("no nvidia render node")
@@ -307,7 +317,7 @@ fn run_flip_for(enc: &str, parse: &str, dec: &str, fmt: &str) {
     if !have(dec) {
         skip!("no {dec} (the bitstream oracle)");
     }
-    let (sizes, fps, buffers) = match flip(enc, parse, dec, fmt, &node) {
+    let (sizes, fps, buffers) = match flip(enc, enc_caps, parse, dec, fmt, &node) {
         Ok(v) => v,
         // The encoder could not even open a video session on this driver — nothing to do
         // with the scaler (the same pipeline without `vulkanscale` fails identically), so
@@ -336,22 +346,34 @@ fn run_flip_for(enc: &str, parse: &str, dec: &str, fmt: &str) {
 #[test]
 #[ignore = "needs an nvidia GPU with vulkanh264enc; run via ci/harness.sh gpu"]
 fn h264_live_resize_reaches_the_bitstream() {
-    run_flip_for("vulkanh264enc", "h264parse", "vulkanh264dec", "NV12");
+    run_flip_for("vulkanh264enc", "", "h264parse", "vulkanh264dec", "NV12");
 }
 
 #[test]
 #[ignore = "needs an nvidia GPU with vulkanh265enc; run via ci/harness.sh gpu"]
 fn h265_live_resize_reaches_the_bitstream() {
-    // vulkanh265enc is Main-10 only in this build: an 8-bit NV12 profile makes
-    // vkGetPhysicalDeviceVideoCapabilitiesKHR reject the session outright, which is why
-    // the production HEVC path negotiates P010 too. This is also the P010 shader's test.
-    run_flip_for("vulkanh265enc", "h265parse", "vulkanh265dec", "P010_10LE");
+    // NOT a Main-10-only encoder, and NOT a driver limitation — that was this test's
+    // own misdiagnosis. `vulkanh265enc`'s src template advertises
+    // `{ main, main-10, main-444 }`, but `H265ProfileMap[]` in vkh265enc.c maps only
+    // main / main-10 / main-still-picture. With downstream free, negotiation lands on
+    // `main-444`, `gst_vulkan_h265_profile_type()` returns
+    // STD_VIDEO_H265_PROFILE_IDC_INVALID, and the driver correctly rejects it with
+    // `Video profile format not supported (-1000023003)` from
+    // vkGetPhysicalDeviceVideoCapabilitiesKHR. Pinning `profile=main` — exactly what the
+    // node-agent encode pipeline does — makes 8-bit NV12 HEVC work.
+    run_flip_for(
+        "vulkanh265enc",
+        "! video/x-h265,profile=main ",
+        "h265parse",
+        "vulkanh265dec",
+        "NV12",
+    );
 }
 
 #[test]
 #[ignore = "needs an nvidia GPU with the vendored vulkanav1enc; run via ci/harness.sh gpu"]
 fn av1_live_resize_reaches_the_bitstream() {
-    run_flip_for("vulkanav1enc", "av1parse", "vulkanav1dec", "NV12");
+    run_flip_for("vulkanav1enc", "", "av1parse", "vulkanav1dec", "NV12");
 }
 
 /// Two sequential encode sessions in ONE process, each stepping down and back up. The
@@ -372,16 +394,23 @@ fn multi_session_live_resize() {
         }
     }
     for session in 1..=2 {
-        let (sizes, _, _) = flip("vulkanh264enc", "h264parse", "vulkanh264dec", "NV12", &node)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "session {session}: {e}\n\
+        let (sizes, _, _) = flip(
+            "vulkanh264enc",
+            "",
+            "h264parse",
+            "vulkanh264dec",
+            "NV12",
+            &node,
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "session {session}: {e}\n\
                      A device loss here means the image lacks \
                      deploy/patches/vulkan/vulkan-enc-output-state-on-resize.patch: the \
                      encoder kept the launch-size video session and DPB pool across the \
                      size change."
-                )
-            });
+            )
+        });
         assert_eq!(
             sizes,
             vec![(1280, 720), (1920, 1080)],
