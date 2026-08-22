@@ -54,7 +54,13 @@ struct SrcViews {
 }
 
 /// One output ring slot: the encode-src buffer handed downstream plus the private
-/// scratch/command/descriptor state that lets `RING` frames be recorded independently.
+/// scratch/command/descriptor state it is scaled through.
+///
+/// The ring is **not** for GPU/CPU overlap — [`VulkanScaler::scale`] waits its fence before
+/// returning, so exactly one dispatch is ever in flight. It exists because the *encoder*
+/// keeps a reference to the buffer it was handed until its own encode completes, and a slot
+/// must not be rewritten while it does; depth is what stops that wait from being the common
+/// case.
 struct ScaleOut {
     image: vk::Image,
     buffer: gst::Buffer,
@@ -65,7 +71,6 @@ struct ScaleOut {
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
     desc_set: vk::DescriptorSet,
-    in_flight: bool,
 }
 
 /// Owns the compute pipeline and the output ring for one negotiated in→out size pair.
@@ -116,9 +121,9 @@ const P010_SCALE_SPV: &[u8] = include_bytes!("shaders/p010_scale.spv");
 impl VulkanScaler {
     /// Build a scaler that writes `dst_w`x`dst_h` `fmt` frames on the encoder's device.
     ///
-    /// `ring` is the output depth; the caller must keep it at or above the encoder's
-    /// reference depth plus one in-flight frame (floor 4) or a slot comes round while the
-    /// encoder still holds it and every frame pays a stall.
+    /// `ring` is the output depth. Keep it at or above the number of buffers the encoder
+    /// holds at once (floor 4) or a slot comes round while the encoder still references it
+    /// and every frame pays the writability poll in [`Self::scale`].
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         device_gst: gstreamer_vulkan::VulkanDevice,
@@ -289,18 +294,30 @@ impl VulkanScaler {
 
         let idx = self.next;
         self.next = (self.next + 1) % self.outputs.len();
-        if self.outputs[idx].in_flight {
-            self.device
-                .wait_for_fences(&[self.outputs[idx].fence], true, u64::MAX)?;
-            self.device.reset_fences(&[self.outputs[idx].fence])?;
-            self.outputs[idx].in_flight = false;
-        }
-        // Never overwrite a slot the encoder still references (the producer's G1 gate,
-        // same failure mode: a GPU data hazard that shows up as green bars or device loss).
+
+        // Never overwrite a slot the encoder still references (the producer's G1 gate, same
+        // failure mode: a GPU data hazard that shows up as green bars or device loss). The
+        // wait is a poll because the thing being waited on is a GStreamer mini-object
+        // refcount, and GStreamer exposes no way to block until a buffer becomes writable —
+        // there is no condition variable, and a pad probe on the encoder would tell us about
+        // the frame it took, not the frame it released. In steady state the slot is free on
+        // the first read (the ring is deeper than the encoder's hold), so the loop body
+        // normally never runs.
+        //
+        // On timeout we return an error, which `VulkanScale::prepare_output_buffer` turns
+        // into an element error and a `FlowError` — the session fails closed. We deliberately
+        // do NOT re-emit a stale frame the way the producer's G1 gate does: the producer is a
+        // live source that must keep the belt moving, whereas a filter dropping a resize into
+        // silence would leave the stream at the wrong size with no diagnosis.
         let mut waited = 0u32;
         while self.outputs[idx].buffer.get_mut().is_none() {
             if waited >= 10_000 {
-                return Err("vulkanscale: output slot still referenced after 1s".into());
+                return Err(format!(
+                    "vulkanscale: output slot {idx} still held by the encoder after 1s \
+                     (ring depth {})",
+                    self.outputs.len()
+                )
+                .into());
             }
             std::thread::sleep(std::time::Duration::from_micros(100));
             waited += 1;
@@ -764,6 +781,5 @@ unsafe fn create_out(
         cmd,
         fence,
         desc_set,
-        in_flight: false,
     })
 }
