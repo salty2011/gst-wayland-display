@@ -157,10 +157,160 @@ fn ring_used() -> usize {
         n
     })
 }
+// ---------------------------------------------------------------------------------------
+// G1 gate wait budget (issue #504)
+// ---------------------------------------------------------------------------------------
+// The G1 reuse gate runs ON the compositor thread: while it polls, the Wayland event loop
+// is not serviced, so clients never get their buffers back and never present. The original
+// budget was a flat 1 s per frame, which turned any downstream back-pressure (e.g. an
+// encoder blocked pushing into a webrtcbin whose video PeerConnection never connected) into
+// a full compositor stall -- the real fault was then masked by an "app has not presented"
+// timeout. The gate itself is still mandatory (never overwrite a slot the encoder reads);
+// only the *wait* is bounded, to a couple of frame intervals. Past that we do exactly what
+// the old code did after 1 s: drop the freshly-rendered frame, re-emit the previous output,
+// and count it in `busy_drops`. A healthy encoder releases its slot well inside one frame
+// interval, so this changes nothing for a healthy session.
+
+/// Frame intervals of slack the compositor thread may spend inside the G1 gate.
+const G1_BUDGET_FRAMES: u32 = 2;
+/// Budget used when the negotiated framerate is unknown, zero, or variable (0/1).
+const G1_BUDGET_FALLBACK: Duration = Duration::from_millis(33);
+/// Floor/ceiling on the derived budget. The floor keeps a very high framerate from
+/// degenerating into a no-wait spin; the ceiling keeps a very low (or misdeclared) framerate
+/// from re-introducing the multi-hundred-millisecond compositor stall this bound exists to
+/// remove.
+const G1_BUDGET_MIN: Duration = Duration::from_millis(4);
+const G1_BUDGET_MAX: Duration = Duration::from_millis(100);
+/// Poll interval inside the gate (unchanged from the original 1 s implementation).
+const G1_POLL: Duration = Duration::from_micros(100);
+/// The busy condition must persist this long before the first WARN. This preserves the
+/// historical "still referenced after 1s" signal level: a wedged downstream still logs, a
+/// one-frame hiccup still does not.
+const G1_WARN_ONSET: Duration = Duration::from_secs(1);
+/// Once warning, repeat at most this often. Without this, a bounded budget would log at
+/// frame rate for as long as downstream stays wedged.
+const G1_WARN_PERIOD: Duration = Duration::from_secs(5);
+/// Grace period applied before the first completed frame, where a busy slot is fatal (there
+/// is no previous output to re-emit). Kept at the original 1 s so startup behaviour is
+/// unchanged.
+const G1_FIRST_FRAME_GRACE: Duration = Duration::from_secs(1);
+
+/// Operator override for the G1 wait budget, in milliseconds (`WOLF_VULKAN_G1_BUDGET_MS`).
+/// `0`, unset or unparseable means "derive from the negotiated framerate". Clamped to
+/// 1..=5000 ms; set it to `1000` to restore the pre-#504 flat budget. Read once.
+fn g1_budget_override() -> Option<Duration> {
+    use std::sync::OnceLock;
+    static B: OnceLock<Option<Duration>> = OnceLock::new();
+    *B.get_or_init(|| {
+        let ms = std::env::var("WOLF_VULKAN_G1_BUDGET_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|&ms| ms > 0)?;
+        let d = Duration::from_millis(ms.clamp(1, 5_000));
+        tracing::debug!("VulkanNv12: G1 wait budget overridden to {d:?}");
+        Some(d)
+    })
+}
+
+/// Derive the G1 wait budget from a negotiated framerate fraction.
+///
+/// `G1_BUDGET_FRAMES` frame intervals, clamped to `[G1_BUDGET_MIN, G1_BUDGET_MAX]`; a
+/// non-positive numerator or denominator (unknown / variable framerate) yields
+/// `G1_BUDGET_FALLBACK`. Pure so it can be unit-tested without a GPU.
+fn g1_budget_from_framerate(num: i32, den: i32) -> Duration {
+    if num <= 0 || den <= 0 {
+        return G1_BUDGET_FALLBACK;
+    }
+    // frames * den/num seconds, in nanoseconds, in u128 so no intermediate can overflow.
+    let nanos = (u128::from(G1_BUDGET_FRAMES) * den as u128 * 1_000_000_000) / num as u128;
+    let d = Duration::from_nanos(nanos.min(u64::MAX as u128) as u64);
+    d.clamp(G1_BUDGET_MIN, G1_BUDGET_MAX)
+}
+
+/// The G1 wait budget for a negotiated output caps: the `WOLF_VULKAN_G1_BUDGET_MS` override
+/// if set, else derived from the caps' `framerate` field (fallback when absent).
+fn g1_budget_for_caps(caps: &gst::Caps) -> Duration {
+    if let Some(d) = g1_budget_override() {
+        return d;
+    }
+    let fps = caps
+        .structure(0)
+        .and_then(|s| s.get::<gst::Fraction>("framerate").ok());
+    match fps {
+        Some(f) => g1_budget_from_framerate(f.numer(), f.denom()),
+        None => G1_BUDGET_FALLBACK,
+    }
+}
+
+/// Time-based rate limiter for the "encode-src slot still referenced" WARN.
+///
+/// The bounded budget means the gate can drop at frame rate while downstream is wedged, so
+/// the log must be limited by wall-clock, not by drop count. Policy: stay silent until the
+/// busy condition has persisted `G1_WARN_ONSET`, then warn at most once per
+/// `G1_WARN_PERIOD`, and emit one recovery line when the condition clears (state change).
+#[derive(Debug, Default)]
+struct BusyWarnLimiter {
+    /// When the current uninterrupted run of busy-drops started.
+    busy_since: Option<Instant>,
+    /// When the last WARN was emitted in this run.
+    last_warn: Option<Instant>,
+    /// Whether this run has warned (so the clear is worth a line).
+    warned: bool,
+}
+
+impl BusyWarnLimiter {
+    /// Record a busy-drop; returns `true` when the caller should emit the WARN, together
+    /// with how long the condition has been running.
+    fn on_busy(&mut self, now: Instant) -> (bool, Duration) {
+        let since = *self.busy_since.get_or_insert(now);
+        let elapsed = now.saturating_duration_since(since);
+        if elapsed < G1_WARN_ONSET {
+            return (false, elapsed);
+        }
+        let due = match self.last_warn {
+            Some(t) => now.saturating_duration_since(t) >= G1_WARN_PERIOD,
+            None => true,
+        };
+        if due {
+            self.last_warn = Some(now);
+            self.warned = true;
+        }
+        (due, elapsed)
+    }
+
+    /// Whether a busy run is currently open.
+    fn is_active(&self) -> bool {
+        self.busy_since.is_some()
+    }
+
+    /// End the current busy run if one is open. Returns its duration iff it had warned, so
+    /// the caller logs exactly one recovery line per warned run. Called on every healthy
+    /// frame, so the clock is only read when a run is actually open.
+    fn clear(&mut self) -> Option<Duration> {
+        if !self.is_active() {
+            return None;
+        }
+        self.on_clear(Instant::now())
+    }
+
+    /// `clear` with an injected clock (unit tests).
+    fn on_clear(&mut self, now: Instant) -> Option<Duration> {
+        let since = self.busy_since.take();
+        self.last_warn = None;
+        if std::mem::take(&mut self.warned) {
+            since.map(|t| now.saturating_duration_since(t))
+        } else {
+            None
+        }
+    }
+}
+
 /// PCI vendor id for Nvidia -- its CUDA consumer ignores implicit dma-buf fences.
 const VENDOR_NVIDIA: u32 = 0x10de;
 /// `VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR` -- the layout `vulkanh264enc` expects its input.
 const VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR: i32 = 1_000_299_001;
+
+use std::time::{Duration, Instant};
 
 type Err = Box<dyn std::error::Error>;
 /// An imported RGBA dmabuf (image/memory/view) kept alive until its frame's GPU work ends.
@@ -472,6 +622,12 @@ pub struct VulkanNv12 {
     /// Count of frames dropped because the target encode-src slot was still referenced by
     /// the encoder at reuse time (G1 gate); drives rate-limited logging only.
     busy_drops: u64,
+    /// Wall-clock rate limiter for the G1 "slot still referenced" WARN (#504).
+    busy_warn: BusyWarnLimiter,
+    /// How long the compositor thread may block in the G1 gate before dropping the frame
+    /// (#504). Derived from the negotiated framerate at construction, or forced with
+    /// `WOLF_VULKAN_G1_BUDGET_MS`.
+    g1_budget: Duration,
     width: u32,
     height: u32,
     /// Target output format (NV12 8-bit or P010 10-bit); selects the compute shader, image
@@ -705,6 +861,10 @@ impl VulkanNv12 {
             (vk::Semaphore::null(), None)
         };
 
+        // The dmabuf/VA path does not run the G1 gate (`encode_src == false`); keep a sane
+        // value so the field is never a surprise if that ever changes.
+        let g1_budget = g1_budget_override().unwrap_or(G1_BUDGET_FALLBACK);
+
         Ok(VulkanNv12 {
             _entry: entry,
             instance,
@@ -730,6 +890,8 @@ impl VulkanNv12 {
             cur: 0,
             have_output: false,
             busy_drops: 0,
+            busy_warn: BusyWarnLimiter::default(),
+            g1_budget,
             width,
             height,
             fmt,
@@ -771,7 +933,7 @@ impl VulkanNv12 {
     unsafe fn new_on_shared_inner(
         device_gst: gstreamer_vulkan::VulkanDevice,
         raw: crate::utils::vulkan_share::RawVk,
-        _nv12_caps: &gst::Caps,
+        nv12_caps: &gst::Caps,
         profile: &str,
         width: u32,
         height: u32,
@@ -862,6 +1024,11 @@ impl VulkanNv12 {
             )?);
         }
 
+        // Bound the G1 gate to a couple of frame intervals of the negotiated framerate so a
+        // wedged encoder cannot stall the compositor thread (#504).
+        let g1_budget = g1_budget_for_caps(nv12_caps);
+        tracing::debug!("VulkanNv12: G1 wait budget = {g1_budget:?}");
+
         Ok(VulkanNv12 {
             _entry: entry,
             instance,
@@ -887,6 +1054,8 @@ impl VulkanNv12 {
             cur: 0,
             have_output: false,
             busy_drops: 0,
+            busy_warn: BusyWarnLimiter::default(),
+            g1_budget,
             width,
             height,
             fmt,
@@ -922,9 +1091,19 @@ impl VulkanNv12 {
         // vulkanh26x waits its GstVulkanOperation before returning from encode, and retains
         // the input buffer until then. Writability is therefore the PR #37 completion gate.
         if self.encode_src {
-            let mut waited = 0u32;
+            // This poll runs ON the compositor thread, so the budget is bounded (#504): a
+            // couple of frame intervals, not the historical flat 1 s. Before the first
+            // completed frame there is nothing to re-emit and a busy slot is fatal, so that
+            // case keeps the original 1 s grace.
+            let budget = if self.have_output {
+                self.g1_budget
+            } else {
+                G1_FIRST_FRAME_GRACE
+            };
+            let started = Instant::now();
             while self.outputs[idx].buffer.get_mut().is_none() {
-                if waited >= 10_000 {
+                let waited = started.elapsed();
+                if waited >= budget {
                     // G1 buffer-reuse gate (multi-session Vulkan spec 2c): NEVER overwrite an
                     // encode-src slot the encoder still references. Under WOLF_VULKAN_RING=1
                     // (auto-pinned when HEVC is armed) there is exactly ONE slot, so the old
@@ -939,17 +1118,32 @@ impl VulkanNv12 {
                         );
                     }
                     self.busy_drops = self.busy_drops.saturating_add(1);
-                    if self.busy_drops == 1 || self.busy_drops % 60 == 0 {
+                    // Warn only once the condition has persisted ~1 s (the historical signal
+                    // level), then at most once per G1_WARN_PERIOD -- a wedged downstream now
+                    // drops at frame rate, so a per-drop log would flood.
+                    let (warn, busy_for) = self.busy_warn.on_busy(Instant::now());
+                    if warn {
                         tracing::warn!(
                             slot = idx,
                             busy_drops = self.busy_drops,
-                            "VulkanNv12: encode-src slot still referenced after 1s; dropping new frame, re-emitting previous output"
+                            busy_for_ms = busy_for.as_millis() as u64,
+                            budget_ms = budget.as_millis() as u64,
+                            "VulkanNv12: encode-src slot still referenced after {}s; dropping new frame, re-emitting previous output (downstream is not releasing input buffers)",
+                            G1_WARN_ONSET.as_secs()
                         );
                     }
                     return Ok(());
                 }
-                std::thread::sleep(std::time::Duration::from_micros(100));
-                waited += 1;
+                std::thread::sleep(G1_POLL.min(budget - waited));
+            }
+            // Slot came free: close out any open busy run (one recovery line per warned run).
+            if let Some(busy_for) = self.busy_warn.clear() {
+                tracing::info!(
+                    slot = idx,
+                    busy_drops = self.busy_drops,
+                    busy_for_ms = busy_for.as_millis() as u64,
+                    "VulkanNv12: encode-src slot released; resuming normal frame flow"
+                );
             }
         }
 
@@ -1541,7 +1735,113 @@ impl VulkanNv12 {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use gst::prelude::*;
+
+    fn ms(d: Duration) -> u64 {
+        d.as_millis() as u64
+    }
+
+    /// The budget is G1_BUDGET_FRAMES frame intervals of the negotiated framerate.
+    #[test]
+    fn budget_is_two_frame_intervals_of_the_negotiated_framerate() {
+        assert_eq!(ms(g1_budget_from_framerate(60, 1)), 33); // 2 * 16.66 ms
+        assert_eq!(ms(g1_budget_from_framerate(30, 1)), 66);
+        assert_eq!(ms(g1_budget_from_framerate(120, 1)), 16);
+        // Non-integer framerates (NTSC 59.94) are handled as the fraction they are.
+        assert_eq!(ms(g1_budget_from_framerate(60_000, 1001)), 33);
+    }
+
+    /// An unknown or variable framerate (0/1) falls back to 33 ms, and the clamp keeps a
+    /// misdeclared framerate from re-introducing a long compositor stall (or a no-wait spin).
+    #[test]
+    fn budget_falls_back_and_clamps() {
+        assert_eq!(g1_budget_from_framerate(0, 1), G1_BUDGET_FALLBACK);
+        assert_eq!(g1_budget_from_framerate(30, 0), G1_BUDGET_FALLBACK);
+        assert_eq!(g1_budget_from_framerate(-1, 1), G1_BUDGET_FALLBACK);
+        assert_eq!(ms(G1_BUDGET_FALLBACK), 33);
+        // 1 fps would be 2 s of frame interval; the ceiling caps it.
+        assert_eq!(g1_budget_from_framerate(1, 1), G1_BUDGET_MAX);
+        // 1000 fps would be 2 ms; the floor keeps a real wait.
+        assert_eq!(g1_budget_from_framerate(1000, 1), G1_BUDGET_MIN);
+        // Every derived budget is far below the pre-#504 flat 1 s.
+        for fps in [24, 30, 50, 60, 90, 120, 144, 240] {
+            assert!(g1_budget_from_framerate(fps, 1) <= G1_BUDGET_MAX);
+        }
+    }
+
+    /// The budget comes off the negotiated output caps; absent framerate -> fallback.
+    #[test]
+    fn budget_reads_the_negotiated_caps_framerate() {
+        gst::init().unwrap();
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("format", "NV12")
+            .field("framerate", gst::Fraction::new(60, 1))
+            .build();
+        assert_eq!(ms(g1_budget_for_caps(&caps)), 33);
+
+        let no_fps = gst::Caps::builder("video/x-raw")
+            .field("format", "NV12")
+            .build();
+        assert_eq!(g1_budget_for_caps(&no_fps), G1_BUDGET_FALLBACK);
+    }
+
+    /// The WARN stays silent for the first second of a busy run (the historical signal
+    /// level), then fires at most once per period however many frames are dropped.
+    #[test]
+    fn warn_limiter_waits_for_onset_then_throttles() {
+        let t0 = Instant::now();
+        let mut lim = BusyWarnLimiter::default();
+
+        // A wedged 60 fps session drops ~60 frames in the first second: all silent.
+        for i in 0..60 {
+            let (warn, _) = lim.on_busy(t0 + Duration::from_millis(i * 16));
+            assert!(!warn, "warned before onset at frame {i}");
+        }
+        // Just past the onset: exactly one warn.
+        let (warn, busy_for) = lim.on_busy(t0 + G1_WARN_ONSET);
+        assert!(warn);
+        assert_eq!(busy_for, G1_WARN_ONSET);
+        // The next few seconds of drops are throttled to one line per period.
+        let mut warns = 0;
+        for i in 1..=(60 * 10) {
+            let (w, _) = lim.on_busy(t0 + G1_WARN_ONSET + Duration::from_millis(i * 16));
+            warns += u32::from(w);
+        }
+        // 9.6 s of drops at a 5 s period -> 1 more line.
+        assert_eq!(warns, 1);
+    }
+
+    /// A recovery line is emitted exactly once, and only for a run that actually warned; a
+    /// short hiccup is completely silent and resets the run.
+    #[test]
+    fn warn_limiter_reports_recovery_once_and_resets() {
+        let t0 = Instant::now();
+        let mut lim = BusyWarnLimiter::default();
+        // The production entry point is a no-op (and reads no clock) when no run is open.
+        assert_eq!(lim.clear(), None);
+
+        // Short hiccup: two drops, cleared before onset -> nothing logged at all.
+        assert!(!lim.on_busy(t0).0);
+        assert!(!lim.on_busy(t0 + Duration::from_millis(16)).0);
+        assert!(lim.is_active());
+        assert_eq!(lim.on_clear(t0 + Duration::from_millis(32)), None);
+        assert!(!lim.is_active());
+
+        // Real wedge: warns, then clears once with the run duration.
+        assert!(!lim.on_busy(t0 + Duration::from_secs(10)).0);
+        assert!(lim.on_busy(t0 + Duration::from_secs(11)).0);
+        let cleared = lim
+            .on_clear(t0 + Duration::from_secs(12))
+            .expect("warned run reports its recovery");
+        assert_eq!(cleared, Duration::from_secs(2));
+        // Idempotent: the recovery line is not repeated on later healthy frames.
+        assert!(!lim.is_active());
+        assert_eq!(lim.on_clear(t0 + Duration::from_secs(13)), None);
+
+        // A new run starts clean (onset re-applies).
+        assert!(!lim.on_busy(t0 + Duration::from_secs(20)).0);
+    }
 
     /// ParentBufferMeta turns the cached slot header into a completion sentinel that
     /// survives BaseSrc/downstream shallow header copies. No GPU required (spec 2c rung-1).
