@@ -5,11 +5,11 @@
 //! Vulkan encoder survives `set_format` at a new size (DPB re-init) while running. It
 //! asserts on the **decoded** frame size: the chain ends `enc ! parse ! dec ! fakesink`
 //! and the size comes off the Vulkan decoder's src caps, which it derives from the SPS /
-//! sequence header it just parsed. That oracle is deliberate — `h264parse` lets the
+//! sequence header it just parsed. That oracle is deliberate: `h264parse` lets the
 //! *upstream* caps override the SPS ("sps should give this but upstream overrides",
-//! gsth264parse.c), and `vulkanh264enc` does not refresh its own src caps on a mid-stream
-//! size change, so the parser alone would report the stale launch size for a bitstream
-//! that really did change.
+//! gsth264parse.c), so on an image whose encoder does not refresh its src caps the parser
+//! reports the stale launch size for a bitstream that really did change. The decoder
+//! cannot be fooled that way.
 //!
 //! The source is `waylanddisplaysrc vulkan=true`, not
 //! `videotestsrc ! vulkanupload ! vulkancolorconvert`: a generic
@@ -19,10 +19,14 @@
 //! pic->img_view`) with or without this element. Only the producer's single multiplanar
 //! `VIDEO_ENCODE_SRC` image can feed these encoders at all.
 //!
-//! **Run each live-resize test in its own process** (`ci/harness.sh gpu` does). A
-//! mid-stream size change in a *second* Vulkan encode session of the same process makes
-//! the encoder fail with "Failed to encode the frame" after the flip has already landed;
-//! two sequential sessions are fine without a resize, and the first session resizes fine.
+//! **These tests need `vulkan-enc-output-state-on-resize.patch` in the image's GStreamer.**
+//! Stock `vulkanh264enc`/`vulkanh265enc` early-return from `new_sequence` when the profile
+//! is unchanged, so a pure size change keeps the launch-size Vulkan video session and DPB
+//! pool and never refreshes the output caps. A step back UP then encodes into undersized
+//! DPB images: NVENC MMU-faults (Xid 31, `FAULT_PTE ACCESS_TYPE_VIRT_WRITE`) and the next
+//! `vkGetQueryPoolResults` returns `VK_ERROR_DEVICE_LOST`. It is nothing to do with this
+//! element -- the same failure reproduces with the compositor doing the resize and no
+//! `vulkanscale` in the graph -- but it is what `multi_session_live_resize` guards.
 
 use gst::prelude::*;
 use std::sync::{Arc, Mutex, Once};
@@ -348,6 +352,42 @@ fn h265_live_resize_reaches_the_bitstream() {
 #[ignore = "needs an nvidia GPU with the vendored vulkanav1enc; run via ci/harness.sh gpu"]
 fn av1_live_resize_reaches_the_bitstream() {
     run_flip_for("vulkanav1enc", "av1parse", "vulkanav1dec", "NV12");
+}
+
+/// Two sequential encode sessions in ONE process, each stepping down and back up. The
+/// node-agent runs many sessions per process, so this is the shape production actually
+/// has — and the shape that caught the encoder's stale video session / DPB pool: the
+/// SECOND session's step back up used to MMU-fault the GPU (Xid 31) and surface as
+/// `VK_ERROR_DEVICE_LOST` from `vkGetQueryPoolResults`, while the first session was fine.
+#[test]
+#[ignore = "needs an nvidia GPU with vulkanh264enc; run via ci/harness.sh gpu"]
+fn multi_session_live_resize() {
+    init();
+    let Some(node) = render_node_for(&["nvidia"]) else {
+        skip!("no nvidia render node")
+    };
+    for el in ["vulkanh264enc", "h264parse", "vulkanh264dec"] {
+        if !have(el) {
+            skip!("no {el}");
+        }
+    }
+    for session in 1..=2 {
+        let (sizes, _, _) = flip("vulkanh264enc", "h264parse", "vulkanh264dec", "NV12", &node)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "session {session}: {e}\n\
+                     A device loss here means the image lacks \
+                     deploy/patches/vulkan/vulkan-enc-output-state-on-resize.patch: the \
+                     encoder kept the launch-size video session and DPB pool across the \
+                     size change."
+                )
+            });
+        assert_eq!(
+            sizes,
+            vec![(1280, 720), (1920, 1080)],
+            "session {session}: both sizes must reach the bitstream"
+        );
+    }
 }
 
 /// At the launch size the element must cost nothing: `GstBaseTransform` passthrough means

@@ -189,21 +189,11 @@ phase_gpu() {
   local node="${FORCE_NODE:-${NODE_FOR_VENDOR[amd]:-${NODE_FOR_VENDOR[intel]:-${NODE_FOR_VENDOR[nvidia]:-}}}}"
   local rel; rel="$([[ $PROFILE == release ]] && echo --release)"
   log "  GPU-gated Rust tests on $node"
+  # The vulkanscale live-resize tests need the image's GStreamer to carry
+  # vulkan-enc-output-state-on-resize.patch: without it a step back UP keeps the
+  # launch-size Vulkan video session + DPB pool and MMU-faults the GPU (Xid 31).
   NV12_TEST_NODE="$node" VULKAN_ENC_NODE="$node" \
-    sh_run "$CARGO" test --workspace $(feature_args) $rel -- --ignored \
-      --skip _live_resize_reaches_the_bitstream || return 1
-  # The vulkanscale live-resize tests get a process each: a mid-stream size change in a
-  # SECOND Vulkan encode session of the same process makes the encoder fail
-  # ("Failed to encode the frame", gsth264encoder.c) even though the resize itself lands.
-  # Two sequential sessions are fine without a resize, and the first session resizes fine,
-  # so this isolates the tests from that (separately tracked) interaction.
-  local t
-  for t in h264 h265 av1; do
-    log "  vulkanscale ${t} live resize (own process)"
-    NV12_TEST_NODE="$node" VULKAN_ENC_NODE="$node" \
-      sh_run "$CARGO" test -p gst-plugin-wayland-display --test vulkanscale $(feature_args) $rel \
-        -- --ignored --exact "${t}_live_resize_reaches_the_bitstream" || return 1
-  done
+    sh_run "$CARGO" test --workspace $(feature_args) $rel -- --ignored
 }
 
 # --- per-vendor encode integration smoke tests -------------------------------
