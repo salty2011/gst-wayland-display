@@ -55,3 +55,33 @@ wayland_display_vk_prepare_encode_image (GstMemory *memory)
   image->barrier.parent.semaphore_value = 0;
   image->barrier.image_layout = VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR;
 }
+
+/* Current tracked layout of a GstVulkanImageMemory. `vulkanscale` records raw
+ * barriers (it does not go through GstVulkanOperation), so it has to read the real
+ * oldLayout of an input image rather than assume one: a producer encode-src image
+ * arrives in VIDEO_ENCODE_SRC_KHR, a generic pool image in whatever the pool's
+ * initial-layout said. */
+gint
+wayland_display_vk_image_layout (GstMemory *memory)
+{
+  g_return_val_if_fail (gst_is_vulkan_image_memory (memory),
+      VK_IMAGE_LAYOUT_UNDEFINED);
+  return (gint) ((GstVulkanImageMemory *) memory)->barrier.image_layout;
+}
+
+/* The VkImageCreateInfo the memory was allocated with -- `vulkanscale` reads the
+ * format (single-plane pool images view directly; multiplanar ones need per-plane
+ * views) and the usage flags. */
+guint32
+wayland_display_vk_image_format (GstMemory *memory)
+{
+  g_return_val_if_fail (gst_is_vulkan_image_memory (memory), 0);
+  return (guint32) ((GstVulkanImageMemory *) memory)->create_info.format;
+}
+
+guint32
+wayland_display_vk_image_usage (GstMemory *memory)
+{
+  g_return_val_if_fail (gst_is_vulkan_image_memory (memory), 0);
+  return (guint32) ((GstVulkanImageMemory *) memory)->create_info.usage;
+}

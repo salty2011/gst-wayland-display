@@ -28,7 +28,10 @@ use gst::prelude::*;
 use gstreamer_vulkan::prelude::*;
 use gstreamer_vulkan::{VulkanDevice, VulkanInstance, VulkanPhysicalDevice, VulkanQueue};
 use gstreamer_vulkan_sys as gstvk;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// One-shot log guard for the encode-src readable-flags fallback.
+static SCALER_READABLE_WARNED: OnceLock<()> = OnceLock::new();
 
 // VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR / VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR via raw
 // values (stable, and avoids depending on the named ash constants existing).
@@ -503,6 +506,41 @@ pub fn alloc_encode_src_buffer(
             PixFmt::Nv12 => vk::Format::G8_B8R8_2PLANE_420_UNORM,
             PixFmt::P010 => vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
         };
+        // Scaler-readable encode-src image (`vulkanscale`, quasar #501). An encode-src
+        // image allocated with TRANSFER_DST|VIDEO_ENCODE_SRC alone cannot be READ by
+        // anything: no SAMPLED/TRANSFER_SRC usage, and no MUTABLE_FORMAT, so the
+        // per-plane R8/R8G8 views a compute shader needs cannot even be created. Ask for
+        // the readable superset first and fall back to the historical flags if the driver
+        // rejects it, so a driver that will not combine SAMPLED with VIDEO_ENCODE_SRC
+        // keeps working exactly as before (only `vulkanscale` loses its input).
+        let view_formats = [image_format, fmt.y_view_format(), fmt.uv_view_format()];
+        let mut flist = vk::ImageFormatListCreateInfo::default().view_formats(&view_formats);
+        let base_usage = vk::ImageUsageFlags::TRANSFER_DST
+            | vk::ImageUsageFlags::from_raw(VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_KHR);
+        let readable_info = vk::ImageCreateInfo::default()
+            .flags(vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE)
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(image_format)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(tiling)
+            .usage(base_usage | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .push_next(&mut profile_list)
+            .push_next(&mut flist);
+
+        let mut mem_ptr = gstvk::gst_vulkan_image_memory_alloc_with_image_info(
+            device.to_glib_none().0,
+            &readable_info as *const vk::ImageCreateInfo as *mut _,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        );
+        let mut scaler_readable = !mem_ptr.is_null();
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(image_format)
@@ -515,18 +553,24 @@ pub fn alloc_encode_src_buffer(
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(tiling)
-            .usage(
-                vk::ImageUsageFlags::TRANSFER_DST
-                    | vk::ImageUsageFlags::from_raw(VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_KHR),
-            )
+            .usage(base_usage)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .push_next(&mut profile_list);
-
-        let mut mem_ptr = gstvk::gst_vulkan_image_memory_alloc_with_image_info(
-            device.to_glib_none().0,
-            &image_info as *const vk::ImageCreateInfo as *mut _,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        );
+        if mem_ptr.is_null() {
+            if SCALER_READABLE_WARNED.set(()).is_ok() {
+                tracing::info!(
+                    "vulkan_share: encode-src image rejected SAMPLED|TRANSFER_SRC|MUTABLE_FORMAT \
+                     -- falling back to the encode-only flags (vulkanscale cannot read these)"
+                );
+            }
+            mem_ptr = gstvk::gst_vulkan_image_memory_alloc_with_image_info(
+                device.to_glib_none().0,
+                &image_info as *const vk::ImageCreateInfo as *mut _,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            );
+            scaler_readable = false;
+        }
+        let _ = scaler_readable;
         let mut effective_tiling = tiling;
         if mem_ptr.is_null() && linear_encsrc {
             // The tiled-fallback promised above: some encoders (NVIDIA Vulkan-Video)
@@ -575,6 +619,24 @@ pub fn alloc_encode_src_buffer(
             );
         }
         Some(buffer)
+    }
+}
+
+/// Recover the `VkImage` of the `idx`-th memory of `buffer`, when that memory is a
+/// `GstVulkanImageMemory`. `vulkanscale` needs this per-memory form because a generic
+/// `GstVulkanImageBufferPool` hands out one single-plane image per plane, while the
+/// encode-src path is a single multiplanar image.
+pub fn recover_vk_image_at(buffer: &gst::Buffer, idx: usize) -> Option<vk::Image> {
+    if idx >= buffer.n_memory() {
+        return None;
+    }
+    let mem_ptr = buffer.peek_memory(idx).as_ptr() as *mut gst::ffi::GstMemory;
+    unsafe {
+        if gstvk::gst_is_vulkan_image_memory(mem_ptr) == gst::glib::ffi::GFALSE {
+            return None;
+        }
+        let image = wayland_display_vk_image(mem_ptr);
+        (image != vk::Image::null()).then_some(image)
     }
 }
 
