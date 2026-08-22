@@ -38,6 +38,44 @@ const VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR: i32 = 1_000_299_001;
 unsafe extern "C" {
     fn wayland_display_vk_image_layout(memory: *mut gst::ffi::GstMemory) -> i32;
     fn wayland_display_vk_image_format(memory: *mut gst::ffi::GstMemory) -> u32;
+    fn wayland_display_vk_image_usage(memory: *mut gst::ffi::GstMemory) -> u32;
+    fn wayland_display_vk_image_flags(memory: *mut gst::ffi::GstMemory) -> u32;
+}
+
+/// Reject an input image the shader may not legally sample, naming the reason.
+///
+/// This is where the producer's flag choice is *read back*. `alloc_encode_src_buffer` asks
+/// for `SAMPLED|TRANSFER_SRC|MUTABLE_FORMAT|EXTENDED_USAGE` and silently falls back to the
+/// encode-only flags when a driver refuses the superset, so the flag set actually used is
+/// recorded on the image itself (`VkImageCreateInfo`) rather than passed alongside it —
+/// every producer of a `GstVulkanImageMemory` carries it, not just ours. Without this check
+/// a non-sampleable or non-mutable image would reach `vkCreateImageView` and be a VUID
+/// violation (undefined behaviour) instead of a diagnosable element error.
+unsafe fn check_sampleable(
+    mem: *mut gst::ffi::GstMemory,
+    plane_views: bool,
+    which: &str,
+) -> Result<(), Err> {
+    let usage = vk::ImageUsageFlags::from_raw(wayland_display_vk_image_usage(mem));
+    let flags = vk::ImageCreateFlags::from_raw(wayland_display_vk_image_flags(mem));
+    if !usage.contains(vk::ImageUsageFlags::SAMPLED) {
+        return Err(format!(
+            "vulkanscale: input {which} was allocated without VK_IMAGE_USAGE_SAMPLED_BIT \
+             (usage {usage:?}) — the compute scaler cannot read it. On the Quasar producer \
+             this means the driver rejected the readable encode-src flag set and \
+             alloc_encode_src_buffer fell back to encode-only; see its log line."
+        )
+        .into());
+    }
+    if plane_views && !flags.contains(vk::ImageCreateFlags::MUTABLE_FORMAT) {
+        return Err(format!(
+            "vulkanscale: input {which} is multiplanar but was not created \
+             VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT (flags {flags:?}) — the per-plane views the \
+             shader samples cannot legally be created on it."
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// The source Y/UV views for one input `VkImage` set, cached because the producer
@@ -612,7 +650,10 @@ impl VulkanScaler {
 
         let (y, uv) = if multiplanar {
             // One multiplanar image: per-plane views, which the image must have been
-            // created MUTABLE_FORMAT for (see vulkan_share::alloc_encode_src_buffer).
+            // created MUTABLE_FORMAT + SAMPLED for (see
+            // vulkan_share::alloc_encode_src_buffer). Verified first: creating those views
+            // on an image that lacks the flags is UB, not an error return.
+            check_sampleable(mem0, true, "image")?;
             (
                 plane_view(
                     &self.device,
@@ -629,8 +670,11 @@ impl VulkanScaler {
             )
         } else {
             // A generic GstVulkanImageBufferPool hands out one single-plane image per
-            // plane; view each with the format it was created with.
+            // plane; view each with the format it was created with. Single-plane views need
+            // no format mutability, only SAMPLED.
             let mem1 = input.peek_memory(1).as_ptr() as *mut gst::ffi::GstMemory;
+            check_sampleable(mem0, false, "plane 0")?;
+            check_sampleable(mem1, false, "plane 1")?;
             (
                 plane_view(
                     &self.device,

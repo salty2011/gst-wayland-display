@@ -85,3 +85,14 @@ wayland_display_vk_image_usage (GstMemory *memory)
   g_return_val_if_fail (gst_is_vulkan_image_memory (memory), 0);
   return (guint32) ((GstVulkanImageMemory *) memory)->create_info.usage;
 }
+
+/* Creation flags of a GstVulkanImageMemory. `vulkanscale` needs MUTABLE_FORMAT on a
+ * multiplanar input before it may create the per-plane R8/R8G8 views its shader samples;
+ * without it the view creation is undefined behaviour rather than a clean failure, so the
+ * element checks this and errors out instead. */
+guint32
+wayland_display_vk_image_flags (GstMemory *memory)
+{
+  g_return_val_if_fail (gst_is_vulkan_image_memory (memory), 0);
+  return (guint32) ((GstVulkanImageMemory *) memory)->create_info.flags;
+}
