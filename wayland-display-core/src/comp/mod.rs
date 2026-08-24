@@ -1009,6 +1009,56 @@ pub(crate) fn apply_output_mode(state: &mut State, size: Size<i32, Physical>, re
     remap_pointer(state, old_logical, new_size);
     announce_ui_scale(state);
     configure_toplevels(state, new_size);
+    configure_pending_toplevels(state, new_size);
+}
+
+/// Send the initial configure to any toplevel still parked in `pending_windows` that has
+/// never had one.
+///
+/// The map path in `wayland/handlers/compositor.rs` needs the `wl_output` (it sizes the
+/// initial configure from the output mode), so a toplevel that commits a mapped buffer
+/// before the output exists is parked there instead. Nothing else would ever wake it: it is
+/// blocked waiting for the configure it never got, so it will not commit again on its own.
+/// This is the wake-up, and it runs from [`apply_output_mode`] -- the one place that is
+/// reached the moment the output comes into existence. Once the client acks and commits, the
+/// normal map path takes over.
+///
+/// A no-op in the ordinary case (the output exists ~140 ms before any client connects, so
+/// `pending_windows` only ever holds toplevels that already have their configure). quasar #487.
+pub(crate) fn configure_pending_toplevels(state: &State, new_size: Size<i32, Logical>) {
+    for window in state.pending_windows.iter() {
+        let Some(toplevel) = window.toplevel() else {
+            continue;
+        };
+        let (initial_configure_sent, max_size) = with_states(toplevel.wl_surface(), |states| {
+            let sent = states
+                .data_map
+                .get::<XdgToplevelSurfaceData>()
+                .map(|attrs| attrs.lock().unwrap().initial_configure_sent)
+                .unwrap_or(false);
+            let max_size = states
+                .cached_state
+                .get::<SurfaceCachedState>()
+                .current()
+                .max_size;
+            (sent, max_size)
+        });
+        if initial_configure_sent {
+            continue;
+        }
+        tracing::info!(
+            ?new_size,
+            "Output now exists: sending the deferred initial configure to a parked toplevel",
+        );
+        toplevel.with_pending_state(|s| {
+            if max_size.w == 0 && max_size.h == 0 {
+                s.size = Some(new_size);
+                s.states.set(XdgState::Fullscreen);
+            }
+            s.states.set(XdgState::Activated);
+        });
+        toplevel.send_configure();
+    }
 }
 
 /// The aspect-preserving scale plus centring offset that maps content of size `surface`

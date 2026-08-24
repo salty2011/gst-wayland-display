@@ -290,6 +290,21 @@ impl WaylandClient {
         window.ack_last_and_commit();
     }
 
+    /// Like [`WaylandClient::setup_window`], but commits **without** acking a configure.
+    ///
+    /// [`WaylandClient::setup_window`] unwraps the last configure it received, which assumes
+    /// the compositor already sent an initial one. A client that maps before the `wl_output`
+    /// exists has had no configure to ack — that is precisely the ordering quasar #487 is
+    /// about — so it commits a mapped buffer bare and waits. Only
+    /// `tests/test_pending_toplevel.rs` drives that ordering.
+    pub fn setup_window_unconfigured(&mut self, width: u16, height: u16) {
+        let window = self.state.windows.last_mut().unwrap();
+        window.set_title("Hello World!");
+        window.attach_new_buffer(self.state.buffer.as_ref().unwrap());
+        window.set_size(width, height);
+        window.commit();
+    }
+
     /// Like [`WaylandClient::setup_window`], but attaches a freshly allocated `width`x`height`
     /// shm buffer filled with a single opaque colour (`0xRRGGBB`), 1:1 with the viewport
     /// destination. Used by the render-size compositing tests, which assert on pixels read
