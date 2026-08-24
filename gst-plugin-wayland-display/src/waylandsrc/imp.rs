@@ -736,6 +736,16 @@ impl ObjectImpl for WaylandDisplaySrc {
         obj.set_automatic_eos(false);
         obj.set_do_timestamp(true);
     }
+
+    #[cfg(feature = "cuda")]
+    fn dispose(&self) {
+        // The raw slot owns one reference on the GstCudaContext from the moment any of
+        // the gst_cuda_* helpers filled it (slot-owns-one-ref model — see
+        // `CUDAContext::wrapper_ref_slot` in wayland-display-core). Wrappers hold their
+        // own references, so this is the slot's only release point.
+        let settings = self.settings.lock().unwrap();
+        unsafe { cuda::CUDAContext::release_slot(settings.cuda_raw_ptr.as_ptr()) };
+    }
 }
 
 impl GstObjectImpl for WaylandDisplaySrc {}

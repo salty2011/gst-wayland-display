@@ -12,6 +12,30 @@
 # detection, per-vendor encoder elements, and the libgstcuda link shim some
 # distros need for the cuda feature.
 #
+# Running inside the quasar-dev container on an NVIDIA box (the setup that runs
+# the #423 churn gates, cuda_element_churn_is_critical_free included):
+#
+#   docker run --rm --gpus all --device /dev/dri \
+#     -v deploy_quasar-nvidia-driver:/opt/quasar/nvidia-driver:ro \
+#     -v <repo>:/workspace -w /workspace \
+#     -e NVIDIA_DRIVER_CAPABILITIES=all \
+#     -e LD_LIBRARY_PATH=/opt/gst/lib64:/opt/quasar/nvidia-driver/lib64 \
+#     quasar-dev:latest ci/harness.sh gpu
+#
+# The driver volume alone is not enough for the compositor; detect_env wires the
+# rest automatically when it sees the volume:
+#   - __EGL_VENDOR_LIBRARY_DIRS must list the volume's glvnd vendor dir AND the
+#     system one, or EGL device enumeration fails with
+#     EglExtensionNotSupported(["EGL_EXT_device_enumeration"]).
+#   - GBM_BACKENDS_PATH must point at the volume's gbm/ (nvidia-drm_gbm.so), or
+#     GBM buffer allocation on the nvidia render node fails with ENOENT
+#     ("Failed to create DMA buffer") and the CUDA path panics in GsCUDABuf.
+#   - __EGL_EXTERNAL_PLATFORM_CONFIG_DIRS likewise gains the volume's
+#     egl_external_platform.d.
+# The quasar-dev image must also carry no baked GStreamer registry (fixed in
+# quasar's Dockerfile.vulkan 2026-08-25) — a GPU-less registry caches
+# `nvcodec: 0 features` and cudaconvert silently never registers.
+#
 # Usage:
 #   ci/harness.sh [options] [phase ...]
 #
@@ -120,6 +144,23 @@ detect_env() {
       nvidia)        NODE_FOR_VENDOR[nvidia]="$n"; HAVE_NVIDIA=1;;
     esac
   done
+
+  # Quasar driver-volume wiring (see the header): when running inside a container
+  # with the deploy_quasar-nvidia-driver volume mounted, the compositor needs the
+  # volume's glvnd/EGL-platform/GBM pieces or EGL device enumeration and GBM
+  # allocation on the nvidia node fail. Only fill what the caller hasn't set.
+  local qv=/opt/quasar/nvidia-driver
+  if [[ $HAVE_NVIDIA -eq 1 && -d "$qv" ]]; then
+    if [[ -z "${__EGL_VENDOR_LIBRARY_DIRS:-}" && -d "$qv/glvnd/egl_vendor.d" ]]; then
+      export __EGL_VENDOR_LIBRARY_DIRS="$qv/glvnd/egl_vendor.d:/etc/glvnd/egl_vendor.d:/usr/share/glvnd/egl_vendor.d"
+    fi
+    if [[ -z "${__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS:-}" && -d "$qv/egl_external_platform.d" ]]; then
+      export __EGL_EXTERNAL_PLATFORM_CONFIG_DIRS="$qv/egl_external_platform.d:/usr/share/egl/egl_external_platform.d"
+    fi
+    if [[ -z "${GBM_BACKENDS_PATH:-}" && -f "$qv/gbm/nvidia-drm_gbm.so" ]]; then
+      export GBM_BACKENDS_PATH="$qv/gbm"
+    fi
+  fi
 }
 
 # choose the feature flags for cargo
@@ -149,6 +190,12 @@ phase_detect() {
     [[ -n "${NODE_FOR_VENDOR[$v]:-}" ]] && echo "      $v -> ${NODE_FOR_VENDOR[$v]}"
   done
   [[ ${#NODE_FOR_VENDOR[@]} -eq 0 ]] && echo "      (none -- GPU phases will be skipped)"
+  if [[ -d /opt/quasar/nvidia-driver ]]; then
+    echo "  nvidia volume   :"
+    echo "      __EGL_VENDOR_LIBRARY_DIRS=${__EGL_VENDOR_LIBRARY_DIRS:-<unset>}"
+    echo "      __EGL_EXTERNAL_PLATFORM_CONFIG_DIRS=${__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS:-<unset>}"
+    echo "      GBM_BACKENDS_PATH=${GBM_BACKENDS_PATH:-<unset>}"
+  fi
   if command -v gst-inspect-1.0 >/dev/null; then
     echo "  encoders        :"
     local e

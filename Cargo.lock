@@ -676,6 +676,7 @@ dependencies = [
  "gstreamer-allocators",
  "gstreamer-base",
  "gstreamer-video",
+ "gstreamer-vulkan",
  "input-event-codes-sys",
  "once_cell",
  "tracing",
