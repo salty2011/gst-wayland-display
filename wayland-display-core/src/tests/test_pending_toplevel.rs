@@ -35,7 +35,16 @@ fn a_toplevel_committed_before_the_output_exists_survives_and_maps() {
 
     // A client that commits a mapped buffer while there is still no output. Before the fix
     // this commit consumed the pending window and dropped it.
-    f.create_window(320, 240);
+    //
+    // Note this cannot go through `Fixture::create_window`: that helper acks the initial
+    // configure, and in this ordering there is no configure to ack — the compositor cannot
+    // size one without an output. Committing bare and waiting is exactly what a real client
+    // does here, and it is why parking alone is not enough (nothing would ever wake it).
+    f.client.create_window();
+    f.round_trip();
+    f.client.setup_window_unconfigured(320, 240);
+    f.round_trip();
+    f.round_trip();
 
     assert_eq!(
         f.server.pending_windows.len(),
