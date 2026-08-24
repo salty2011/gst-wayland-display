@@ -241,6 +241,24 @@ impl CompositorHandler for State {
             .iter_mut()
             .position(|w| w.wl_surface().map(|s| &*s == surface).unwrap_or(false))
         {
+            // PARK, don't drop. Everything below needs the `wl_output` (the initial configure
+            // is sized from its mode, and mapping needs somewhere to map into). This used to
+            // `swap_remove` first and bail on `self.output.is_none()` afterwards, which dropped
+            // the removed `Window` on the floor: it was never re-queued, so the toplevel stayed
+            // unmapped forever and the app was invisible for the whole session. In practice the
+            // output exists ~140 ms before any client connects, so it never fired -- but that is
+            // a timing accident, not an invariant. Leaving the window in `pending_windows` costs
+            // nothing and makes the retry automatic: any later commit re-enters this block, and
+            // `apply_output_mode` (which runs the moment the output is created) sends the
+            // initial configure to whatever is still parked here, so a client that is blocked
+            // waiting for that configure is unblocked too. (quasar #487)
+            if self.output.is_none() {
+                tracing::debug!(
+                    "Toplevel mapped before the output exists; parking it until there is one"
+                );
+                return;
+            }
+
             let window = self.pending_windows.swap_remove(idx);
 
             let toplevel = window.toplevel().unwrap();
@@ -264,10 +282,6 @@ impl CompositorHandler for State {
                         .max_size,
                 )
             });
-
-            if self.output.is_none() {
-                return;
-            }
 
             if !initial_configure_sent {
                 if max_size.w == 0 && max_size.h == 0 {
