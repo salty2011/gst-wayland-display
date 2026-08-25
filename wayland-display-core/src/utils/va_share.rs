@@ -167,10 +167,10 @@ fn va_dmabuf_allocator(display: *mut c_void) -> Option<DmaBufAllocator> {
     static CACHE: OnceLock<Mutex<Option<(usize, DmaBufAllocator)>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(None));
     let mut guard = cache.lock().ok()?;
-    if let Some((d, a)) = guard.as_ref() {
-        if *d == display as usize {
-            return Some(a.clone());
-        }
+    if let Some((d, a)) = guard.as_ref()
+        && *d == display as usize
+    {
+        return Some(a.clone());
     }
     let lib = valib()?;
     let ptr = unsafe { (lib.dmabuf_allocator_new)(display) };

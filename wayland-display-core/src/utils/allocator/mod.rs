@@ -455,7 +455,7 @@ pub enum VideoInfoTypes {
 }
 
 pub trait GsBuffer<R: Renderer> {
-    fn bind(&mut self, renderer: &mut R) -> Result<GlesTarget, R::Error>;
+    fn bind(&mut self, renderer: &mut R) -> Result<GlesTarget<'_>, R::Error>;
 
     fn to_gs_buffer(
         &self,
@@ -469,7 +469,7 @@ pub trait GsBuffer<R: Renderer> {
 }
 
 impl GsBuffer<GlesRenderer> for GsBufferType {
-    fn bind(&mut self, renderer: &mut GlesRenderer) -> Result<GlesTarget, GlesError> {
+    fn bind(&mut self, renderer: &mut GlesRenderer) -> Result<GlesTarget<'_>, GlesError> {
         match self {
             GsBufferType::RAW(buffer) => renderer.bind(&mut buffer.buffer),
             GsBufferType::DMA(buffer) => renderer.bind(&mut buffer.buffer),
@@ -549,8 +549,8 @@ impl GsBuffer<GlesRenderer> for GsBufferType {
                     let gst_buffer = gst_buffer.get_mut().unwrap();
                     buffer.buffer.handles().for_each(|handle| {
                         let fd = handle.as_raw_fd();
-                        let actual_size = seek(&handle.as_fd(), SeekFrom::End(0)).unwrap() as usize;
-                        let _ = seek(&handle.as_fd(), SeekFrom::Start(0)); // Reset seek point
+                        let actual_size = seek(handle.as_fd(), SeekFrom::End(0)).unwrap() as usize;
+                        let _ = seek(handle.as_fd(), SeekFrom::Start(0)); // Reset seek point
 
                         // Use the larger of the two sizes to ensure we have enough space
                         let allocation_size = required_size.max(actual_size);

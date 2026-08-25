@@ -4,7 +4,6 @@ use gst_video::ffi::GstVideoInfo;
 use gst_video::VideoInfo;
 use std::ffi::{c_char, c_uint, c_void, CStr};
 use std::ptr;
-use tracing_subscriber;
 use waylanddisplaycore::{Tracer, WaylandDisplay};
 
 #[no_mangle]
@@ -180,10 +179,10 @@ pub extern "C" fn display_touch_frame(dpy: *mut WaylandDisplay) {
 #[no_mangle]
 pub extern "C" fn display_get_frame(dpy: *mut WaylandDisplay) -> *mut GstBuffer {
     let display = unsafe { &mut *dpy };
-    let _span = match display.tracer.as_ref() {
-        Some(tracer) => Some(tracer.trace("display_get_frame")),
-        None => None,
-    };
+    let _span = display
+        .tracer
+        .as_ref()
+        .map(|tracer| tracer.trace("display_get_frame"));
     match display.frame() {
         Ok(mut frame) => {
             let ptr = frame.make_mut().as_mut_ptr();

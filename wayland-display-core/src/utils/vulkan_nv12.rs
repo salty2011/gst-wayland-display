@@ -460,8 +460,8 @@ unsafe fn pick_physical_device(
             let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
             let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut drm);
             instance.get_physical_device_properties2(d, &mut p2);
-            (drm.has_render != 0 && drm.render_minor as i64 == minor as i64)
-                || (drm.has_primary != 0 && drm.primary_minor as i64 == minor as i64)
+            (drm.has_render != 0 && drm.render_minor == minor as i64)
+                || (drm.has_primary != 0 && drm.primary_minor == minor as i64)
         });
         if matched.is_some() {
             return matched;
@@ -1265,8 +1265,12 @@ impl VulkanNv12 {
             0,
             std::slice::from_raw_parts(pc.as_ptr() as *const u8, 8),
         );
-        self.device
-            .cmd_dispatch(cmd, (self.width / 2 + 7) / 8, (self.height / 2 + 7) / 8, 1);
+        self.device.cmd_dispatch(
+            cmd,
+            (self.width / 2).div_ceil(8),
+            (self.height / 2).div_ceil(8),
+            1,
+        );
 
         if direct {
             // LINEAR direct: the compute output *is* the export image. Flush the shader

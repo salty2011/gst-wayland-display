@@ -882,7 +882,7 @@ impl ElementImpl for WaylandDisplaySrc {
                 let settings = self.settings.lock().unwrap();
                 settings.cuda_raw_ptr.as_ptr()
             };
-            match CUDAContext::new_from_set_context(&elem, &context, -1, cuda_raw_ptr) {
+            match CUDAContext::new_from_set_context(&elem, context, -1, cuda_raw_ptr) {
                 Ok(ctx) => {
                     let mut settings = self.settings.lock().unwrap();
                     if settings.cuda_context.is_none() {
@@ -957,16 +957,15 @@ impl WaylandDisplaySrc {
         // re-import (and radeonsi-VA then fails). Behind interpipe (`nv12=true`) a
         // LINEAR/encoder mismatch is expected -- the consumer's vapostproc imports it -- so
         // only flag it on the direct path.
-        if !prefer_nv12 {
-            if let Some(pref) = encoder_pref {
-                if pref != modifier {
-                    tracing::warn!(
-                        "waylandsrc: exporting NV12 modifier {modifier:#x} but the VA encoder \
+        if !prefer_nv12
+            && let Some(pref) = encoder_pref
+            && pref != modifier
+        {
+            tracing::warn!(
+                "waylandsrc: exporting NV12 modifier {modifier:#x} but the VA encoder \
                          on {render_path} imports {pref:#x}; a direct encode needs a vapostproc \
                          bridge"
-                    );
-                }
-            }
+            );
         }
         Ok(())
     }
@@ -1166,10 +1165,11 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             let encoder_pref =
                 waylanddisplaycore::utils::va_query::import_nv12_modifier(&render_path);
             let mut ordered: Vec<u64> = Vec::new();
-            if let Some(p) = encoder_pref {
-                if p != DRM_FORMAT_MOD_INVALID && exportable.contains(&p) {
-                    ordered.push(p);
-                }
+            if let Some(p) = encoder_pref
+                && p != DRM_FORMAT_MOD_INVALID
+                && exportable.contains(&p)
+            {
+                ordered.push(p);
             }
             if exportable.contains(&DRM_FORMAT_MOD_LINEAR) {
                 ordered.push(DRM_FORMAT_MOD_LINEAR);
@@ -1257,15 +1257,15 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         // restart, no rebuild). `WOLF_HDR_MASTERING` is a full gst mastering-display-info
         // string (R:G:B:W chroma *50000, then max:min luminance in 0.0001 cd/m^2);
         // `WOLF_HDR_CLL` is "maxCLL:maxFALL" in cd/m^2. Empty/unset => leave as computed.
-        if let Ok(v) = std::env::var("WOLF_HDR_MASTERING") {
-            if !v.trim().is_empty() {
-                hdr_mastering = v;
-            }
+        if let Ok(v) = std::env::var("WOLF_HDR_MASTERING")
+            && !v.trim().is_empty()
+        {
+            hdr_mastering = v;
         }
-        if let Ok(v) = std::env::var("WOLF_HDR_CLL") {
-            if !v.trim().is_empty() {
-                hdr_cll = v;
-            }
+        if let Ok(v) = std::env::var("WOLF_HDR_CLL")
+            && !v.trim().is_empty()
+        {
+            hdr_cll = v;
         }
         // SDR colorimetry for the P010 path under WOLF_HDR_CM when the content is not PQ:
         // BT.709 (primaries=bt709, transfer=bt709, matrix=bt709, range=limited) and NO
@@ -1365,7 +1365,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
     }
 
     fn event(&self, event: &Event) -> bool {
-        if self.handle_event(&event) {
+        if self.handle_event(event) {
             return true;
         }
         self.parent_event(event)
@@ -1437,7 +1437,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                 // present, releasing the config copy drops the caps below its true count.
                 let caps = unsafe { gst::Caps::from_glib_none(outcaps.unwrap().as_ptr()) };
                 let stream = cuda_ctx.stream().expect("failed to get CUDA stream");
-                pool.configure(&caps, &stream, size, min, max)
+                pool.configure(&caps, stream, size, min, max)
                     .expect("failed to configure CUDA pool");
 
                 let updated_size = pool.get_updated_size().expect("failed to get updated size");
@@ -1534,8 +1534,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                             .expect("failed to get drm format");
                     let format = dma_formats
                         .iter()
-                        .filter(|dma_format| dma_format.code == chosen_format)
-                        .next()
+                        .find(|dma_format| dma_format.code == chosen_format)
                         .expect("failed to find a matching DRM format for the CUDA format");
                     let modifier: u64 = format.modifier.into();
                     let video_info =
@@ -1622,33 +1621,30 @@ impl BaseSrcImpl for WaylandDisplaySrc {
         }
 
         #[cfg(feature = "cuda")]
-        match display.get_render_device() {
-            Some(render_device) => {
-                if *render_device.pci_vendor() == PCIVendor::NVIDIA && !have_cuda_context {
-                    tracing::info!(
-                        "Acquiring a CudaContext from the pipeline, you can manually set the `cuda-device-id` property to override this behavior"
-                    );
-                    let cuda_raw_ptr = {
-                        let settings = self.settings.lock().unwrap();
-                        settings.cuda_raw_ptr.as_ptr()
-                    };
-                    match CUDAContext::new_from_gstreamer(&elem, -1, cuda_raw_ptr) {
-                        Ok(cuda_context) => {
-                            let mut settings = self.settings.lock().unwrap();
-                            if settings.cuda_context.is_none() {
-                                tracing::info!("Acquired a CudaContext via new_from_gstreamer");
-                                settings.cuda_context = Some(Arc::new(Mutex::new(cuda_context)));
-                            } else {
-                                tracing::info!("Acquired a CudaContext via set_context");
-                            }
+        if let Some(render_device) = display.get_render_device() {
+            if *render_device.pci_vendor() == PCIVendor::NVIDIA && !have_cuda_context {
+                tracing::info!(
+                    "Acquiring a CudaContext from the pipeline, you can manually set the `cuda-device-id` property to override this behavior"
+                );
+                let cuda_raw_ptr = {
+                    let settings = self.settings.lock().unwrap();
+                    settings.cuda_raw_ptr.as_ptr()
+                };
+                match CUDAContext::new_from_gstreamer(&elem, -1, cuda_raw_ptr) {
+                    Ok(cuda_context) => {
+                        let mut settings = self.settings.lock().unwrap();
+                        if settings.cuda_context.is_none() {
+                            tracing::info!("Acquired a CudaContext via new_from_gstreamer");
+                            settings.cuda_context = Some(Arc::new(Mutex::new(cuda_context)));
+                        } else {
+                            tracing::info!("Acquired a CudaContext via set_context");
                         }
-                        Err(err) => {
-                            gst::warning!(CAT, "Failed to acquire a CudaContext: {}", err);
-                        }
+                    }
+                    Err(err) => {
+                        gst::warning!(CAT, "Failed to acquire a CudaContext: {}", err);
                     }
                 }
             }
-            None => {}
         }
 
         for path in input_devices {
@@ -1723,38 +1719,37 @@ impl PushSrcImpl for WaylandDisplaySrc {
         // WOLF_HDR_CM: surface compositor OUTPUT HDR-state changes on the bus so Wolf can
         // drive dynamic HDR<->SDR switching. The compositor only signals on an actual
         // change, so this posts at most one message per transition.
-        if std::env::var("WOLF_HDR_CM").is_ok() {
-            if let Some((hdr, mastering, cll)) = state.display.poll_hdr_state() {
-                // Store the active surface's real mastering / CLL metadata so the next
-                // `caps()` stamps it onto the P010 HDR caps (else the hardcoded defaults).
-                *self.hdr_meta.lock().unwrap() = (mastering, cll);
-                let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
-                let structure = Structure::builder("wolf-hdr-state")
-                    .field("hdr", hdr)
-                    .build();
-                if let Err(err) =
-                    elem.post_message(Application::builder(structure).src(&elem).build())
-                {
-                    gst::warning!(CAT, "Failed to post wolf-hdr-state message: {}", err);
-                }
+        if std::env::var("WOLF_HDR_CM").is_ok()
+            && let Some((hdr, mastering, cll)) = state.display.poll_hdr_state()
+        {
+            // Store the active surface's real mastering / CLL metadata so the next
+            // `caps()` stamps it onto the P010 HDR caps (else the hardcoded defaults).
+            *self.hdr_meta.lock().unwrap() = (mastering, cll);
+            let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
+            let structure = Structure::builder("wolf-hdr-state")
+                .field("hdr", hdr)
+                .build();
+            if let Err(err) = elem.post_message(Application::builder(structure).src(&elem).build())
+            {
+                gst::warning!(CAT, "Failed to post wolf-hdr-state message: {}", err);
+            }
 
-                // Drive the live HDR-colorimetry state. On an actual change, mark the src pad
-                // for reconfiguration: BaseSrc's streaming loop calls
-                // `gst_pad_check_reconfigure()` before the next buffer, which re-runs
-                // negotiate -> `caps()`/`fixate()`/`set_caps`, producing the new colorimetry
-                // (BT.2100 PQ <-> BT.709) and pushing a fresh CAPS event downstream. The
-                // downstream encoder re-emits its VUI + HDR SEI at the next IDR.
-                if self.hdr_active.swap(hdr, Ordering::Relaxed) != hdr {
-                    gst::info!(
-                        CAT,
-                        "WOLF_HDR_CM: HDR colorimetry state changed to {}; forcing src-pad renegotiation",
-                        hdr
-                    );
-                    self.obj()
-                        .upcast_ref::<gst_base::BaseSrc>()
-                        .src_pad()
-                        .mark_reconfigure();
-                }
+            // Drive the live HDR-colorimetry state. On an actual change, mark the src pad
+            // for reconfiguration: BaseSrc's streaming loop calls
+            // `gst_pad_check_reconfigure()` before the next buffer, which re-runs
+            // negotiate -> `caps()`/`fixate()`/`set_caps`, producing the new colorimetry
+            // (BT.2100 PQ <-> BT.709) and pushing a fresh CAPS event downstream. The
+            // downstream encoder re-emits its VUI + HDR SEI at the next IDR.
+            if self.hdr_active.swap(hdr, Ordering::Relaxed) != hdr {
+                gst::info!(
+                    CAT,
+                    "WOLF_HDR_CM: HDR colorimetry state changed to {}; forcing src-pad renegotiation",
+                    hdr
+                );
+                self.obj()
+                    .upcast_ref::<gst_base::BaseSrc>()
+                    .src_pad()
+                    .mark_reconfigure();
             }
         }
 

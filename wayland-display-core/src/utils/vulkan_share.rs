@@ -198,8 +198,8 @@ unsafe fn physical_index_for_minor(
             let mut drm = vk::PhysicalDeviceDrmPropertiesEXT::default();
             let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut drm);
             ash_inst.get_physical_device_properties2(d, &mut p2);
-            if (drm.has_render != 0 && drm.render_minor as i64 == minor as i64)
-                || (drm.has_primary != 0 && drm.primary_minor as i64 == minor as i64)
+            if (drm.has_render != 0 && drm.render_minor == minor as i64)
+                || (drm.has_primary != 0 && drm.primary_minor == minor as i64)
             {
                 tracing::info!(
                     "vulkan_share: selected physical device {i} '{}' (matches render minor {minor}, video-encode capable)",

@@ -125,7 +125,7 @@ impl EGLImage {
         if egl_image != ffi::EGL_NO_IMAGE_KHR {
             Ok(EGLImage {
                 image: egl_image,
-                egl_display: Arc::new(egl_display.clone()),
+                egl_display: Arc::new(*egl_display),
                 egl_extensions,
             })
         } else {

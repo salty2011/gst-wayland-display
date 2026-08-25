@@ -12,7 +12,7 @@ pub fn get_egl_device_for_node(drm_node: &DrmNode) -> EGLDevice {
     let drm_node = drm_node
         .node_with_type(NodeType::Render)
         .and_then(Result::ok)
-        .unwrap_or(drm_node.clone());
+        .unwrap_or(*drm_node);
     EGLDevice::enumerate()
         .expect("Failed to enumerate EGLDevices")
         .find(|d| d.try_get_render_node().unwrap_or_default() == Some(drm_node))
@@ -50,6 +50,6 @@ pub fn setup_renderer(render_node: Option<DrmNode>) -> GlesRenderer {
     // texture-format limits), so they're in the renderer's importable set already. (A GLES3
     // context fails to configure in this headless/surfaceless EGL setup and isn't needed.)
     let context = EGLContext::new(&egl).expect("Failed to initialize EGL context");
-    let renderer = unsafe { GlesRenderer::new(context) }.expect("Failed to initialize renderer");
-    renderer
+
+    unsafe { GlesRenderer::new(context) }.expect("Failed to initialize renderer")
 }

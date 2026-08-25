@@ -129,35 +129,34 @@ impl CompositorHandler for State {
             });
             if let Some(dmabuf) = maybe_dmabuf {
                 // Explicit sync: block the commit on the client's acquire timeline point.
-                if let Some(acquire_point) = acquire_point {
-                    if let Ok((blocker, source)) = acquire_point.generate_blocker() {
-                        if let Some(client) = surface.client() {
-                            let res = state.handle.insert_source(source, move |_, _, data| {
-                                let dh = data.dh.clone();
-                                data.client_compositor_state(&client)
-                                    .blocker_cleared(data, &dh);
-                                Ok(())
-                            });
-                            if res.is_ok() {
-                                add_blocker(surface, blocker);
-                                return;
-                            }
-                        }
+                if let Some(acquire_point) = acquire_point
+                    && let Ok((blocker, source)) = acquire_point.generate_blocker()
+                    && let Some(client) = surface.client()
+                {
+                    let res = state.handle.insert_source(source, move |_, _, data| {
+                        let dh = data.dh.clone();
+                        data.client_compositor_state(&client)
+                            .blocker_cleared(data, &dh);
+                        Ok(())
+                    });
+                    if res.is_ok() {
+                        add_blocker(surface, blocker);
+                        return;
                     }
                 }
                 // Implicit sync fallback: the client isn't using linux-drm-syncobj-v1,
                 // so block on the dmabuf's implicit read-fence instead.
-                if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ) {
-                    if let Some(client) = surface.client() {
-                        let res = state.handle.insert_source(source, move |_, _, data| {
-                            let dh = data.dh.clone();
-                            data.client_compositor_state(&client)
-                                .blocker_cleared(data, &dh);
-                            Ok(())
-                        });
-                        if res.is_ok() {
-                            add_blocker(surface, blocker);
-                        }
+                if let Ok((blocker, source)) = dmabuf.generate_blocker(Interest::READ)
+                    && let Some(client) = surface.client()
+                {
+                    let res = state.handle.insert_source(source, move |_, _, data| {
+                        let dh = data.dh.clone();
+                        data.client_compositor_state(&client)
+                            .blocker_cleared(data, &dh);
+                        Ok(())
+                    });
+                    if res.is_ok() {
+                        add_blocker(surface, blocker);
                     }
                 }
             }
@@ -197,11 +196,11 @@ impl CompositorHandler for State {
         let app_toplevel = self
             .space
             .elements()
-            .any(|w| w.wl_surface().map(|s| &*s == &app_root).unwrap_or(false))
+            .any(|w| w.wl_surface().map(|s| *s == app_root).unwrap_or(false))
             || self
                 .pending_windows
                 .iter()
-                .any(|w| w.wl_surface().map(|s| &*s == &app_root).unwrap_or(false));
+                .any(|w| w.wl_surface().map(|s| *s == app_root).unwrap_or(false));
         if app_toplevel && attached_new_buffer {
             self.app_surface_commits.fetch_add(1, Ordering::Relaxed);
         }
@@ -379,9 +378,7 @@ impl CompositorHandler for State {
                 // allowed.
                 popup.send_configure().expect("initial configure failed");
             }
-
-            return;
-        };
+        }
     }
 }
 

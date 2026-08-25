@@ -248,7 +248,7 @@ fn hdr_spike_gles_readback(
 impl State {
     pub fn create_frame(
         &mut self,
-    ) -> Result<(gst::Buffer, RenderOutputResult), OutputDamageTrackerError<GlesError>> {
+    ) -> Result<(gst::Buffer, RenderOutputResult<'_>), OutputDamageTrackerError<GlesError>> {
         assert!(self.output.is_some());
         assert!(self.dtr.is_some());
         assert!(self.video_info.is_some());
@@ -441,12 +441,11 @@ impl State {
         // WOLF_HDR_SPIKE, only on an fp16 target, and logged once (cheap, a handful of pixels).
         if std::env::var("WOLF_HDR_SPIKE").is_ok()
             && render_rgba_fourcc == Some(Fourcc::Abgr16161616f)
+            && let Some(vi) = self.video_info.as_ref()
         {
-            if let Some(vi) = self.video_info.as_ref() {
-                let (w, h) = (vi.width() as i32, vi.height() as i32);
-                if !HDR_READBACK_DONE.swap(true, Ordering::Relaxed) {
-                    hdr_spike_gles_readback(&mut self.renderer, &target, w, h);
-                }
+            let (w, h) = (vi.width() as i32, vi.height() as i32);
+            if !HDR_READBACK_DONE.swap(true, Ordering::Relaxed) {
+                hdr_spike_gles_readback(&mut self.renderer, &target, w, h);
             }
         }
 
