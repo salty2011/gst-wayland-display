@@ -337,6 +337,10 @@ fn confine_mouse_absolute_movement() {
 /// receive a wl_pointer.enter. The armed `pending_pointer_refocus` flag forces the next
 /// motion to cycle smithay's focus (leave -> enter) instead of taking its same-target
 /// motion-only arm.
+///
+/// Upstream #44 hardened this into the map-time race reproduced with `recreate_pointer`;
+/// that harness path needs the server-side fixture this file drives, so the edge-trigger
+/// semantics are exercised directly here.
 #[test]
 fn pending_refocus_re_emits_enter() {
     let mut f = Fixture::new();
@@ -367,6 +371,19 @@ fn pending_refocus_re_emits_enter() {
             .iter()
             .any(|e| matches!(e, MouseEvents::Pointer(wl_pointer::Event::Enter { .. }))),
         "expected a re-emitted wl_pointer.enter, got: {:?}",
+        client_events
+    );
+    clean_events(client_events);
+
+    // A second motion is motion-only again (the trigger is spent, see `move_mouse`).
+    f.server.pointer_motion(0, 0, delta, delta);
+    f.round_trip();
+    let client_events = f.client.get_client_events();
+    assert!(
+        !client_events
+            .iter()
+            .any(|e| matches!(e, MouseEvents::Pointer(wl_pointer::Event::Enter { .. }))),
+        "the refocus must not repeat on later motions, got: {:?}",
         client_events
     );
 }

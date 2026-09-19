@@ -19,11 +19,13 @@ use smithay::{
     },
     desktop::Window,
     desktop::space::SpaceElement,
-    input::pointer::CursorImageStatus,
+    input::pointer::{CursorImageAttributes, CursorImageStatus},
     render_elements,
+    wayland::compositor::with_states,
     utils::{Logical, Physical, Point, Rectangle, Scale, Size},
 };
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 pub const CURSOR_DATA_BYTES: &[u8] = include_bytes!("../../resources/cursor.rgba");
 
@@ -288,10 +290,31 @@ impl State {
                     .map_err(OutputDamageTrackerError::Rendering)?,
                 )],
                 CursorImageStatus::Surface(wl_surface) => {
+                    // A client submits its cursor image together with a HOTSPOT: the point
+                    // inside the image that must sit on the pointer (an arrow's tip, a
+                    // crosshair's centre). Render at pointer - hotspot, exactly as smithay's
+                    // own anvil example does. Without this, every client whose hotspot is not
+                    // (0,0) has its cursor drawn offset by the hotspot -- invisible for
+                    // conventional arrows (hotspot ~0,0), glaring for centre-hotspot cursors
+                    // (Mindustry ships 64x64 cursors with a (32,32) hotspot: drawn 32px
+                    // down-right of the real pointer, so clicks land up-left of the visible
+                    // cursor). Upstream PR #53.
+                    let hotspot = with_states(wl_surface, |states| {
+                        states
+                            .data_map
+                            .get::<Mutex<CursorImageAttributes>>()
+                            .map(|attrs| attrs.lock().unwrap().hotspot)
+                            .unwrap_or_else(|| (0, 0).into())
+                    });
+                    // The hotspot lives in the cursor surface's LOGICAL coordinates; convert
+                    // to render space before subtracting, in the same way the pointer
+                    // location below is a logical point.
+                    let hotspot_pos: Point<f64, Logical> =
+                        (self.pointer_location - hotspot.to_f64());
                     smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
                         &mut self.renderer,
                         wl_surface,
-                        self.pointer_location.to_physical_precise_round(output_scale),
+                        hotspot_pos.to_physical_precise_round(output_scale),
                         output_scale,
                         1.,
                         Kind::Cursor,

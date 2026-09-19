@@ -353,7 +353,7 @@ impl State {
                     self,
                     None,
                     &MotionEvent {
-                        location: under_pos,
+                        location: self.pointer_location,
                         serial: SERIAL_COUNTER.next_serial(),
                         time: event_time_msec,
                     },
@@ -884,6 +884,20 @@ mod tests {
     }
 
     #[test]
+    fn scancode_to_keycode_adds_xkb_offset() {
+        let mut harness = TestState::new();
+        let state = harness.state();
+
+        // xkb/X11 keycodes are evdev scancodes plus the historical +8 offset.
+        for scancode in [0u32, 1, 30, 103, 240] {
+            assert_eq!(
+                state.scancode_to_keycode(scancode),
+                Keycode::new(scancode + 8)
+            );
+        }
+    }
+
+    #[test]
     fn clamp_coords_uses_the_logical_extent_not_the_physical_mode() {
         let mut harness = TestState::new();
         let state = harness.state();
@@ -918,5 +932,36 @@ mod tests {
             "expected a clamp to the 500x500 logical extent, got {clamped:?}",
         );
         assert!(clamped.x > 490.0 && clamped.y > 490.0);
+    }
+
+    #[test]
+    fn clamp_coords_passes_through_in_bounds() {
+        let mut harness = TestState::new();
+        let state = harness.state();
+        let output = Output::new(
+            "HEADLESS-1".into(),
+            PhysicalProperties {
+                make: "Virtual".into(),
+                model: "Wolf".into(),
+                size: (0, 0).into(),
+                subpixel: Subpixel::Unknown,
+            },
+        );
+        output.create_global::<State>(&state.dh);
+        output.change_current_state(
+            Some(smithay::output::Mode {
+                size: (100, 100).into(),
+                refresh: 1000,
+            }),
+            None,
+            None,
+            None,
+        );
+        state.output = Some(output);
+
+        // A point already inside the output is returned unchanged.
+        let inside = Point::from((42.0, 17.0));
+        let clamped = state.clamp_coords(inside);
+        assert_eq!(clamped, inside);
     }
 }
