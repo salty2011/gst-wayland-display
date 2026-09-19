@@ -21,11 +21,11 @@ use smithay::{
     desktop::space::SpaceElement,
     input::pointer::{CursorImageAttributes, CursorImageStatus},
     render_elements,
-    wayland::compositor::with_states,
     utils::{Logical, Physical, Point, Rectangle, Scale, Size},
+    wayland::compositor::with_states,
 };
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const CURSOR_DATA_BYTES: &[u8] = include_bytes!("../../resources/cursor.rgba");
 
@@ -273,14 +273,17 @@ impl State {
         // The cursor lives in RENDER space (its location is `pointer_location`, which input
         // clamps to the output's logical extent), so it is built at the same scale here and
         // scaled below together with the client surfaces.
-        let cursor_elements: Vec<CursorElement<GlesRenderer>> =
-            if Instant::now().duration_since(self.last_pointer_movement) < Duration::from_secs(5) {
-                match &self.cursor_state {
+        let cursor_elements: Vec<CursorElement<GlesRenderer>> = if Instant::now()
+            .duration_since(self.last_pointer_movement)
+            < Duration::from_secs(5)
+        {
+            match &self.cursor_state {
                 CursorImageStatus::Named(_cursor_icon) => vec![CursorElement::Memory(
                     // TODO: icon?
                     MemoryRenderBufferRenderElement::from_buffer(
                         &mut self.renderer,
-                        self.pointer_location.to_physical_precise_round(output_scale),
+                        self.pointer_location
+                            .to_physical_precise_round(output_scale),
                         &self.cursor_element,
                         None,
                         None,
@@ -322,9 +325,9 @@ impl State {
                 }
                 CursorImageStatus::Hidden => vec![],
             }
-            } else {
-                vec![]
-            };
+        } else {
+            vec![]
+        };
 
         // The framebuffer is always ENCODE-sized; the scene is composited at the RENDER size and
         // upscaled into it (aspect-preserving, centred). Both are the same size unless a render

@@ -353,7 +353,7 @@ impl State {
                     self,
                     None,
                     &MotionEvent {
-                        location: self.pointer_location,
+                        location: under_pos,
                         serial: SERIAL_COUNTER.next_serial(),
                         time: event_time_msec,
                     },

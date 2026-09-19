@@ -47,9 +47,19 @@ wayland_display_vk_prepare_encode_image (GstMemory *memory)
   /* Preserve PR #37's fan-out contract, but make it header-checked rather than
    * writing guessed Rust byte offsets. The producer CPU-waits its write fence and
    * vulkanh26x synchronously waits encode completion before dropping the buffer. */
-  if (image->barrier.parent.semaphore != VK_NULL_HANDLE)
-    vkDestroySemaphore (image->device->device,
-        image->barrier.parent.semaphore, NULL);
+  if (image->barrier.parent.semaphore != VK_NULL_HANDLE) {
+    /* Resolve through gst instead of calling vkDestroySemaphore directly. A direct call
+     * puts libvulkan in DT_NEEDED, and ash is declared features = ["loaded"] so a missing
+     * loader must stay a runtime error -- hard-linking it would break the CUDA and VA
+     * builds, which never wanted Vulkan. */
+    PFN_vkDestroySemaphore destroy_semaphore =
+        (PFN_vkDestroySemaphore) gst_vulkan_device_get_proc_address (image->device,
+        "vkDestroySemaphore");
+    if (destroy_semaphore)
+      destroy_semaphore (image->device->device, image->barrier.parent.semaphore, NULL);
+    else
+      GST_WARNING ("vkDestroySemaphore unavailable; encode-src semaphore not freed");
+  }
   gst_clear_object (&image->barrier.parent.queue);
   image->barrier.parent.semaphore = VK_NULL_HANDLE;
   image->barrier.parent.semaphore_value = 0;
