@@ -58,6 +58,43 @@ fn first_readable_rejection(device: &VulkanDevice) -> bool {
     true
 }
 
+/// The encode-src tiling each device has already committed to, once one ring slot's
+/// allocation has picked one.
+///
+/// `alloc_encode_src_buffer` runs once per ring slot -- several times per session. Without a
+/// latch, a transient allocation failure (fragmentation, momentary VRAM pressure) on one slot
+/// could pick a different tiling than its siblings, leaving the ring inhomogeneous: some
+/// frames would take the corrupting tiled path this whole change exists to avoid. Once a
+/// device has landed on a tiling, every later call for that device is pinned to it -- no
+/// re-probing, no ladder.
+static ENCSRC_TILING_LATCH: OnceLock<Mutex<Vec<(usize, vk::ImageTiling)>>> = OnceLock::new();
+
+/// The tiling already latched for `device`, if any ring slot has allocated one yet.
+fn latched_encsrc_tiling(device: &VulkanDevice) -> Option<vk::ImageTiling> {
+    let key = device_key(device);
+    let latch = ENCSRC_TILING_LATCH
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    latch.iter().find(|(k, _)| *k == key).map(|(_, t)| *t)
+}
+
+/// Record `tiling` as the latched choice for `device`. Returns `true` if this call is the one
+/// that set it (so the caller can log the effective tiling exactly once per device instead of
+/// once per ring slot).
+fn latch_encsrc_tiling(device: &VulkanDevice, tiling: vk::ImageTiling) -> bool {
+    let key = device_key(device);
+    let mut latch = ENCSRC_TILING_LATCH
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap();
+    if latch.iter().any(|(k, _)| *k == key) {
+        return false;
+    }
+    latch.push((key, tiling));
+    true
+}
+
 // VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR / VK_IMAGE_LAYOUT_VIDEO_ENCODE_SRC_KHR via raw
 // values (stable, and avoids depending on the named ash constants existing).
 const VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_KHR: u32 = 0x0000_2000;
@@ -510,22 +547,76 @@ pub fn alloc_encode_src_buffer(
         let profiles = [profile_info];
         let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
 
-        // RX 9070 / GFX12 (RDNA4) workaround: radv mishandles a LINEAR->tiled (different
-        // swizzle mode) vkCmdCopyImage on GFX12 (cf. Mesa 26.0.2 "radv: fix copying images
-        // with different swizzle modes on SDMA7"), corrupting the encoder's tiled NV12 input
-        // (green band / shifted image). Allocating the encode-src LINEAR makes the
-        // scratch->encode-src copy LINEAR->LINEAR (no swizzle change), avoiding that path --
-        // *if* the GFX12 VCN encoder accepts a linear input image. Opt-in (the tiled default
-        // works on RDNA3 and on a fixed radv); falls back to tiled if the LINEAR *allocation*
-        // fails (a driver that accepts the LINEAR image but corrupts or fails at encode time
-        // is not covered by the fallback).
-        let linear_encsrc = std::env::var("WOLF_VULKAN_LINEAR_ENCSRC")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        let tiling = if linear_encsrc {
-            vk::ImageTiling::LINEAR
+        // A SECOND, identical profile chain for the encode-only builder below. `push_next`
+        // takes `&mut`, and the ladder keeps both `ImageCreateInfo`s alive across the whole
+        // loop, so they cannot share one chain: the readable builder's borrow of
+        // `profile_list` is still live when the encode-only builder is used. The two chains
+        // are byte-identical by construction -- they are built from the same `fmt`,
+        // `bit_depth` and `std_h264_idc` -- so this is duplication for the borrow checker,
+        // not a behavioural difference.
+        let mut h264_eo =
+            vk::VideoEncodeH264ProfileInfoKHR::default().std_profile_idc(std_h264_idc);
+        let mut h265_eo = vk::VideoEncodeH265ProfileInfoKHR::default()
+            .std_profile_idc(vk::native::StdVideoH265ProfileIdc_STD_VIDEO_H265_PROFILE_IDC_MAIN_10);
+        let mut profile_info_eo = vk::VideoProfileInfoKHR::default()
+            .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+            .luma_bit_depth(bit_depth)
+            .chroma_bit_depth(bit_depth);
+        profile_info_eo = match fmt {
+            PixFmt::P010 => profile_info_eo
+                .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H265)
+                .push_next(&mut h265_eo),
+            PixFmt::Nv12 => profile_info_eo
+                .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
+                .push_next(&mut h264_eo),
+        };
+        let profiles_eo = [profile_info_eo];
+        let mut profile_list_eo = vk::VideoProfileListInfoKHR::default().profiles(&profiles_eo);
+
+        // LINEAR-first encode-src, falling back to tiled (OPTIMAL) when a driver refuses it.
+        //
+        // radv mishandles a LINEAR-scratch -> tiled-encode-src `vkCmdCopyImage` (different
+        // swizzle modes) on several AMD generations -- GFX12/RDNA4 (cf. Mesa 26.0.2 "radv: fix
+        // copying images with different swizzle modes on SDMA7") and GFX10.3/RDNA2 have both
+        // been observed -- corrupting the encoder's tiled NV12 input (green band / shifted
+        // image). Allocating the encode-src image LINEAR makes that copy LINEAR->LINEAR (no
+        // swizzle change), avoiding the mishandled path. **This does not remove the copy** --
+        // the encode-src path always stages through a LINEAR STORAGE scratch image
+        // (`vulkan_nv12.rs`, `create_encode_output` / `record()` with `direct: false`); only
+        // the destination tiling of that copy changes.
+        //
+        // Drivers that refuse a LINEAR encode-src allocation outright (NVIDIA Vulkan-Video)
+        // fall back to OPTIMAL automatically below, so no configuration is needed on any
+        // vendor -- this is why LINEAR is now the unconditional default rather than an opt-in.
+        // The one case the fallback cannot cover, carried over from the old opt-in comment: a
+        // driver that *accepts* a LINEAR encode-src image but corrupts the picture or fails at
+        // encode time (rather than at allocation time) is not detected here.
+        //
+        // `WOLF_VULKAN_LINEAR_ENCSRC` is retained, inverted, as a diagnostic-only escape hatch:
+        // `0`/`false`/`off` forces OPTIMAL-only (no LINEAR attempt), reproducing the historical
+        // shipping behaviour exactly -- this is also how the corruption above is deliberately
+        // reproduced for testing. Any other value, including the `1`/`true` operators were
+        // previously told to set as the interim AMD workaround, is treated identically to
+        // unset: an operator who followed the old instructions must not get a behaviour change
+        // or a hard failure now that the default has flipped. No user needs to set this knob.
+        let want_linear = {
+            let raw = std::env::var("WOLF_VULKAN_LINEAR_ENCSRC").unwrap_or_default();
+            let v = raw.trim();
+            !(v.eq_ignore_ascii_case("0")
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off"))
+        };
+        let tiling_candidates: &[vk::ImageTiling] = if want_linear {
+            &[vk::ImageTiling::LINEAR, vk::ImageTiling::OPTIMAL]
         } else {
-            vk::ImageTiling::OPTIMAL
+            &[vk::ImageTiling::OPTIMAL]
+        };
+        // Ring homogeneity: once a tiling has been decided for this device (by an earlier ring
+        // slot's call), every later call is pinned to it -- no re-probing, no risk of a
+        // transient failure splitting one ring across two tilings. See `latch_encsrc_tiling`.
+        let tiling_candidates: Vec<vk::ImageTiling> = match latched_encsrc_tiling(device) {
+            Some(t) => vec![t],
+            None => tiling_candidates.to_vec(),
         };
         let image_format = match fmt {
             PixFmt::Nv12 => vk::Format::G8_B8R8_2PLANE_420_UNORM,
@@ -553,6 +644,9 @@ pub fn alloc_encode_src_buffer(
         let mut flist = vk::ImageFormatListCreateInfo::default().view_formats(&view_formats);
         let base_usage = vk::ImageUsageFlags::TRANSFER_DST
             | vk::ImageUsageFlags::from_raw(VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_KHR);
+        // Base builders, tiling left at the `default()` value -- each candidate in the ladder
+        // below sets it via `.tiling(t)` (both `ImageCreateInfo`s are `Copy`, so this clones
+        // rather than consuming the original on every iteration).
         let readable_info = vk::ImageCreateInfo::default()
             .flags(vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE)
             .image_type(vk::ImageType::TYPE_2D)
@@ -565,7 +659,6 @@ pub fn alloc_encode_src_buffer(
             .mip_levels(1)
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(tiling)
             .usage(base_usage | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC)
             .initial_layout(vk::ImageLayout::UNDEFINED)
             .push_next(&mut profile_list)
@@ -581,15 +674,6 @@ pub fn alloc_encode_src_buffer(
         let want_readable = std::env::var("WOLF_VULKAN_ENCSRC_READABLE")
             .map(|v| v != "0")
             .unwrap_or(true);
-        let mut mem_ptr = if want_readable {
-            gstvk::gst_vulkan_image_memory_alloc_with_image_info(
-                device.to_glib_none().0,
-                &readable_info as *const vk::ImageCreateInfo as *mut _,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            )
-        } else {
-            std::ptr::null_mut()
-        };
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(image_format)
@@ -601,51 +685,86 @@ pub fn alloc_encode_src_buffer(
             .mip_levels(1)
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(tiling)
             .usage(base_usage)
             .initial_layout(vk::ImageLayout::UNDEFINED)
-            .push_next(&mut profile_list);
-        if mem_ptr.is_null() {
-            if first_readable_rejection(device) {
-                tracing::warn!(
-                    "vulkan_share: encode-src image on GstVulkanDevice {:?} rejected \
-                     SAMPLED|TRANSFER_SRC|MUTABLE_FORMAT -- falling back to the encode-only \
-                     flags. Encoding is unaffected; vulkanscale cannot read these images and \
-                     will fail the session closed if it is in the graph.",
-                    device_key(device) as *const ()
+            .push_next(&mut profile_list_eo);
+
+        // The ladder is tiling-outer, flags-inner: for each candidate tiling (LINEAR then
+        // OPTIMAL, or just OPTIMAL when forced), try the readable superset before falling back
+        // to encode-only flags at that SAME tiling, and only move to the next tiling once both
+        // flag variants have failed at this one. This ordering is load-bearing -- see the
+        // module comment above `alloc_encode_src_buffer`'s tiling setup: a flags-outer ladder
+        // would make NVIDIA silently lose the readable superset (it rejects LINEAR outright, at
+        // any flags), which breaks `vulkanscale` there today. Tiling-outer means NVIDIA's first
+        // two attempts (readable+LINEAR, encode-only+LINEAR) both fail on tiling, and its third
+        // attempt (readable+OPTIMAL) succeeds -- byte-identical to what it gets today.
+        let mut mem_ptr = std::ptr::null_mut();
+        let mut effective_tiling = tiling_candidates[0];
+        let mut readable_lost_at: Option<vk::ImageTiling> = None;
+        for t in tiling_candidates.iter().copied() {
+            if want_readable {
+                let ri = readable_info.tiling(t);
+                mem_ptr = gstvk::gst_vulkan_image_memory_alloc_with_image_info(
+                    device.to_glib_none().0,
+                    &ri as *const vk::ImageCreateInfo as *mut _,
+                    vk::MemoryPropertyFlags::DEVICE_LOCAL,
                 );
+                if !mem_ptr.is_null() {
+                    effective_tiling = t;
+                    break;
+                }
             }
-            mem_ptr = gstvk::gst_vulkan_image_memory_alloc_with_image_info(
+            let ii = image_info.tiling(t);
+            let p = gstvk::gst_vulkan_image_memory_alloc_with_image_info(
                 device.to_glib_none().0,
-                &image_info as *const vk::ImageCreateInfo as *mut _,
+                &ii as *const vk::ImageCreateInfo as *mut _,
                 vk::MemoryPropertyFlags::DEVICE_LOCAL,
             );
-        }
-        let mut effective_tiling = tiling;
-        if mem_ptr.is_null() && linear_encsrc {
-            // The tiled-fallback promised above: some encoders (NVIDIA Vulkan-Video)
-            // reject a LINEAR encode-src image outright, so a failed LINEAR alloc must
-            // not kill the whole vulkan output -- retry with the tiled default.
-            tracing::warn!(
-                "vulkan_share: LINEAR encode-src alloc failed (WOLF_VULKAN_LINEAR_ENCSRC) -- \
-                 falling back to tiled (OPTIMAL)"
-            );
-            let image_info = image_info.tiling(vk::ImageTiling::OPTIMAL);
-            effective_tiling = vk::ImageTiling::OPTIMAL;
-            mem_ptr = gstvk::gst_vulkan_image_memory_alloc_with_image_info(
-                device.to_glib_none().0,
-                &image_info as *const vk::ImageCreateInfo as *mut _,
-                vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            );
+            if !p.is_null() {
+                mem_ptr = p;
+                effective_tiling = t;
+                if want_readable {
+                    // The readable attempt at THIS tiling failed but encode-only at the same
+                    // tiling succeeded -- the loss is attributable to the flags, not the
+                    // tiling. Only this observation licenses the readable-rejection warning
+                    // below; a failure that's really about tiling (e.g. NVIDIA rejecting
+                    // LINEAR) must not be blamed on SAMPLED|TRANSFER_SRC|MUTABLE_FORMAT.
+                    readable_lost_at = Some(t);
+                }
+                break;
+            }
         }
         if mem_ptr.is_null() {
             tracing::warn!("vulkan_share: gst_vulkan_image_memory_alloc_with_image_info failed");
             return None;
         }
-        if linear_encsrc {
+        if let Some(t) = readable_lost_at
+            && first_readable_rejection(device)
+        {
+            tracing::warn!(
+                "vulkan_share: encode-src image on GstVulkanDevice {:?} rejected \
+                     SAMPLED|TRANSFER_SRC|MUTABLE_FORMAT -- falling back to the encode-only \
+                     flags. Encoding is unaffected; vulkanscale cannot read these images and \
+                     will fail the session closed if it is in the graph. (observed at \
+                     tiling={t:?})",
+                device_key(device) as *const ()
+            );
+        }
+        if latch_encsrc_tiling(device, effective_tiling) {
+            if want_linear && effective_tiling == vk::ImageTiling::OPTIMAL {
+                tracing::warn!(
+                    "vulkan_share: LINEAR encode-src allocation refused by the driver -- using \
+                     tiled (OPTIMAL). This is expected on NVIDIA; no action is needed."
+                );
+            }
             tracing::info!(
-                "vulkan_share: encode-src allocated with tiling={:?} (WOLF_VULKAN_LINEAR_ENCSRC)",
-                effective_tiling
+                "vulkan_share: encode-src tiling={:?} (WOLF_VULKAN_LINEAR_ENCSRC {})",
+                effective_tiling,
+                if want_linear {
+                    "unset = linear-first"
+                } else {
+                    "forced-tiled"
+                }
             );
         }
         // PR #37 intentionally seeds the encode layout and disables the per-memory
