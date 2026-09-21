@@ -1,7 +1,8 @@
 # gst-wayland-display:vulkan
 #
 # A Fedora image carrying patched GStreamer 1.28.4 (Vulkan video encode enabled +
-# the vulkanh264enc DPB-pool patch + the vulkanh265enc element) with the
+# the vulkanh264enc DPB-pool/rate-control patches + the vulkanh265enc and
+# vulkanav1enc elements + the encoder-library retarget fix) with the
 # gst-wayland-display plugin installed.
 # It is the single source of the gst-1.28.4-Vulkan + plugin build and serves as the
 # base image for wolf:vulkan (which compiles Wolf on top and inherits the plugin).
@@ -55,11 +56,17 @@ RUN dnf install -y \
 # --- Patched GStreamer 1.28.4 -> /opt/gst -----------------------------------
 COPY patches/vkh264enc-dpb-pool-in-new-sequence.patch /tmp/dpb.patch
 COPY patches/vulkanh265enc.patch /tmp/h265.patch
+COPY patches/vkh264enc-rc-fix.patch /tmp/rc-fix.patch
+COPY patches/gstreamer-vulkan-rc-retarget-no-reset.patch /tmp/rc-retarget.patch
+COPY patches/vulkanav1enc.patch /tmp/av1.patch
 RUN git clone --depth 1 --branch ${GST_VERSION} \
       https://gitlab.freedesktop.org/gstreamer/gstreamer.git /tmp/gstreamer && \
     cd /tmp/gstreamer && \
     git apply /tmp/dpb.patch && \
     git apply /tmp/h265.patch && \
+    git apply /tmp/rc-fix.patch && \
+    git apply /tmp/rc-retarget.patch && \
+    git apply /tmp/av1.patch && \
     # auto_features=disabled leaves several subprojects' docs/meson.build referring
     # to an undefined plugins_cache_generator; short-circuit each when doc is off.
     for d in subprojects/*/docs/meson.build docs/meson.build; do \
@@ -86,7 +93,7 @@ RUN git clone --depth 1 --branch ${GST_VERSION} \
       -Dnls=disabled -Dgst-examples=disabled -Drs=disabled && \
     meson compile -C build && \
     meson install -C build && \
-    rm -rf /tmp/gstreamer /tmp/dpb.patch /tmp/h265.patch
+    rm -rf /tmp/gstreamer /tmp/dpb.patch /tmp/h265.patch /tmp/rc-fix.patch /tmp/rc-retarget.patch /tmp/av1.patch
 
 ENV PKG_CONFIG_PATH=/opt/gst/lib64/pkgconfig \
     LD_LIBRARY_PATH=/opt/gst/lib64 \
@@ -110,9 +117,16 @@ RUN git clone --depth 1 https://github.com/games-on-whales/gst-interpipe.git /tm
 
 # --- Rust toolchain (gstreamer-rs 0.25 + cargo-c need >= 1.94) + the plugin ---
 ENV CARGO_HOME=/root/.cargo RUSTUP_HOME=/root/.rustup
+# cargo-c is pinned because it is installed from crates.io at build time, so an
+# unpinned `cargo install` picks up whatever is newest and drifts away from the
+# toolchain pinned above. cargo-c 0.10.24 raised its MSRV to rustc 1.95 and broke
+# this layer against RUST_VERSION=1.94.0; 0.10.23 is the last release supporting
+# 1.94. `--locked` uses cargo-c's own Cargo.lock so a transitive dependency
+# raising ITS MSRV cannot break the build again without a deliberate bump here.
+# Raise both this pin and RUST_VERSION together.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
       sh -s -- -y --default-toolchain ${RUST_VERSION} --profile minimal && \
-    cargo install cargo-c
+    cargo install cargo-c --version 0.10.23 --locked
 
 # Cache-bust the plugin source COPY + compile. The registry build cache (cache-from/
 # cache-to mode=max) can serve a STALE `cargo cinstall` layer even when src/ changed,
