@@ -96,6 +96,21 @@ impl KeyboardGrab<State> for StaleGrab {
 const TOLERANCE: usize = 2;
 const CYCLES: usize = 8;
 
+/// `keymap_fd_count` reads a PROCESS-global number while cargo runs the rest of this
+/// binary's tests in parallel threads, each holding its own fixture (and so its own
+/// keymap fd) for the duration. A single sample can therefore read another test's
+/// fixtures as growth. Re-sample a few times and keep the lowest reading: the leak
+/// under test is permanent, so it survives every sample, while a neighbouring
+/// fixture's fd disappears as soon as that test finishes.
+fn settled_keymap_fd_count() -> usize {
+    let mut lowest = keymap_fd_count();
+    for _ in 0..5 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        lowest = lowest.min(keymap_fd_count());
+    }
+    lowest
+}
+
 #[test]
 fn keymap_memfd_is_released_on_compositor_teardown() {
     // Warm-up cycle: the first compositor pulls in process-lifetime singletons
@@ -108,7 +123,7 @@ fn keymap_memfd_is_released_on_compositor_teardown() {
         f.server.release_seat();
         drop(f);
     }
-    let after = keymap_fd_count();
+    let after = settled_keymap_fd_count();
 
     assert!(
         after <= baseline + TOLERANCE,
@@ -137,7 +152,7 @@ fn keymap_memfd_is_released_when_a_grab_is_still_active() {
         f.server.release_seat();
         drop(f);
     }
-    let after = keymap_fd_count();
+    let after = settled_keymap_fd_count();
 
     assert!(
         after <= baseline + TOLERANCE,
