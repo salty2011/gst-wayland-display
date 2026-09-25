@@ -25,7 +25,7 @@
 # AV1 decode only), so a vulkan-encoder host resolved AV1 per session onto the
 # vendor HW encoder (NVENC/VA) — the one codec leaving the Vulkan zero-copy
 # path, and on NVIDIA the one codec still riding the crash-affected NVENC
-# teardown path (Quasar issue #489, an NVIDIA-driver UAF spanning the 595/610
+# teardown path (an NVIDIA-driver use-after-free spanning the 595/610
 # branches)
 # library. Upstream (Igalia) has AV1 encode "in the pipeline" but nothing
 # published as of 2026-08.
@@ -4230,10 +4230,10 @@ index 0000000..276a5cd
 +G_END_DECLS
 diff --git a/subprojects/gst-plugins-bad/tests/check/elements/vkencoderetarget.c b/subprojects/gst-plugins-bad/tests/check/elements/vkencoderetarget.c
 new file mode 100644
-index 0000000..264f1b0
+index 0000000..aae733c
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/tests/check/elements/vkencoderetarget.c
-@@ -0,0 +1,194 @@
+@@ -0,0 +1,279 @@
 +/* GStreamer
 + *
 + * Copyright (C) 2026 GStreamer developers
@@ -4258,8 +4258,14 @@ index 0000000..264f1b0
 + *
 + *  - vulkanav1enc only advertises the input it can encode (8-bit 4:2:0
 + *    NV12), whatever else the driver's AV1 encode profile supports.
++ *  - vulkanh265enc only advertises the profiles and input it can encode
++ *    (Main / Main 10 from NV12 / P010), whatever else the driver's H.265
++ *    encode profiles support (e.g. main-444 from NV24).
 + *  - a live bitrate retarget issued from a non-streaming thread while the
-+ *    encoder is running is applied without error, for every encoder.
++ *    encoder is running is applied without error, for every encoder. Each
++ *    encoder is a separate test, so one failing encoder can't hide another.
++ *    The pipelines leave the output profile open, so they also check that
++ *    each encoder negotiates a profile it can start by itself.
 + *
 + * The encoder elements are only registered when a Vulkan device with the
 + * matching video encode queue is present; every test skips otherwise, so
@@ -4273,10 +4279,6 @@ index 0000000..264f1b0
 +#include <gst/check/gstcheck.h>
 +
 +#define N_FRAMES 300
-+
-+static const gchar *encoders[] = {
-+  "vulkanh264enc", "vulkanh265enc", "vulkanav1enc",
-+};
 +
 +static gboolean
 +have_element (const gchar * name)
@@ -4319,6 +4321,75 @@ index 0000000..264f1b0
 +
 +  gst_caps_unref (caps);
 +  gst_object_unref (sinkpad);
++  gst_object_unref (enc);
++}
++
++GST_END_TEST;
++
++static gboolean
++string_in (const gchar * value, const gchar * const *allowed)
++{
++  return value && g_strv_contains (allowed, value);
++}
++
++/* Every value of @field in @caps (a string or a list of strings) must be one
++ * of @allowed. */
++static void
++check_field_subset (GstCaps * caps, const gchar * field,
++    const gchar * const *allowed)
++{
++  guint i, j;
++
++  fail_if (gst_caps_is_empty (caps));
++  for (i = 0; i < gst_caps_get_size (caps); i++) {
++    const GValue *v =
++        gst_structure_get_value (gst_caps_get_structure (caps, i), field);
++
++    fail_unless (v != NULL, "no %s field", field);
++    if (G_VALUE_HOLDS_STRING (v)) {
++      fail_unless (string_in (g_value_get_string (v), allowed),
++          "unexpected %s %s", field, g_value_get_string (v));
++      continue;
++    }
++    fail_unless (GST_VALUE_HOLDS_LIST (v), "%s is neither string nor list",
++        field);
++    for (j = 0; j < gst_value_list_get_size (v); j++) {
++      const GValue *item = gst_value_list_get_value (v, j);
++
++      fail_unless (string_in (g_value_get_string (item), allowed),
++          "unexpected %s %s", field, g_value_get_string (item));
++    }
++  }
++}
++
++GST_START_TEST (test_h265_caps_encodable_only)
++{
++  static const gchar *const formats[] = { "NV12", "P010_10LE", NULL };
++  static const gchar *const profiles[] = { "main", "main-10", NULL };
++  GstElement *enc;
++  GstPad *pad;
++  GstCaps *caps;
++
++  if (!have_element ("vulkanh265enc"))
++    return;
++
++  enc = gst_element_factory_make ("vulkanh265enc", NULL);
++  fail_unless (enc != NULL);
++
++  pad = gst_element_get_static_pad (enc, "sink");
++  caps = gst_pad_get_pad_template_caps (pad);
++  GST_INFO ("vulkanh265enc sink template: %" GST_PTR_FORMAT, caps);
++  check_field_subset (caps, "format", formats);
++  gst_caps_unref (caps);
++  gst_object_unref (pad);
++
++  pad = gst_element_get_static_pad (enc, "src");
++  caps = gst_pad_get_pad_template_caps (pad);
++  GST_INFO ("vulkanh265enc src template: %" GST_PTR_FORMAT, caps);
++  check_field_subset (caps, "profile", profiles);
++  gst_caps_unref (caps);
++  gst_object_unref (pad);
++
 +  gst_object_unref (enc);
 +}
 +
@@ -4403,12 +4474,23 @@ index 0000000..264f1b0
 +  gst_object_unref (pipeline);
 +}
 +
-+GST_START_TEST (test_live_retarget_from_app_thread)
++GST_START_TEST (test_live_retarget_h264)
 +{
-+  guint i;
++  run_live_retarget ("vulkanh264enc");
++}
 +
-+  for (i = 0; i < G_N_ELEMENTS (encoders); i++)
-+    run_live_retarget (encoders[i]);
++GST_END_TEST;
++
++GST_START_TEST (test_live_retarget_h265)
++{
++  run_live_retarget ("vulkanh265enc");
++}
++
++GST_END_TEST;
++
++GST_START_TEST (test_live_retarget_av1)
++{
++  run_live_retarget ("vulkanav1enc");
 +}
 +
 +GST_END_TEST;
@@ -4422,7 +4504,10 @@ index 0000000..264f1b0
 +  suite_add_tcase (s, tc_basic);
 +  tcase_set_timeout (tc_basic, 240);
 +  tcase_add_test (tc_basic, test_av1_sink_caps_nv12_only);
-+  tcase_add_test (tc_basic, test_live_retarget_from_app_thread);
++  tcase_add_test (tc_basic, test_h265_caps_encodable_only);
++  tcase_add_test (tc_basic, test_live_retarget_h264);
++  tcase_add_test (tc_basic, test_live_retarget_h265);
++  tcase_add_test (tc_basic, test_live_retarget_av1);
 +
 +  return s;
 +}

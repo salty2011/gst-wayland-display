@@ -1,6 +1,6 @@
 diff --git a/subprojects/gst-plugins-bad/ext/vulkan/base/gsth265encoder.c b/subprojects/gst-plugins-bad/ext/vulkan/base/gsth265encoder.c
 new file mode 100644
-index 0000000..196d986
+index 0000000..28c1e0a
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/ext/vulkan/base/gsth265encoder.c
 @@ -0,0 +1,3047 @@
@@ -1887,12 +1887,12 @@ index 0000000..196d986
 +
 +    if (candidate->profile < *profile)
 +      continue;
-+    /* Still-picture and intra-only profiles forbid inter (P/B) pictures, so
-+     * they are unsuitable for a general video encoder. */
-+    if (candidate->profile == GST_H265_PROFILE_MAIN_STILL_PICTURE
-+        || candidate->profile == GST_H265_PROFILE_MAIN_INTRA
-+        || candidate->profile == GST_H265_PROFILE_MAIN_10_INTRA) {
-+      GST_INFO_OBJECT (self, "Skipping intra-only profile %s",
++    /* Only the 4:2:0 Main and Main 10 profiles are implemented. This also
++     * skips the still-picture and intra-only profiles, which forbid inter
++     * (P/B) pictures, and the format range extensions (e.g. main-444). */
++    if (candidate->profile != GST_H265_PROFILE_MAIN
++        && candidate->profile != GST_H265_PROFILE_MAIN_10) {
++      GST_INFO_OBJECT (self, "Skipping unsupported profile %s",
 +          candidate->profile_name);
 +      continue;
 +    }
@@ -3441,10 +3441,10 @@ index ee93c9c..c01eb11 100644
    'vkvp9dec.c',
 diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c
 new file mode 100644
-index 0000000..44b246f
+index 0000000..6ff60ce
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/ext/vulkan/vkh265enc.c
-@@ -0,0 +1,2886 @@
+@@ -0,0 +1,2926 @@
 +/* GStreamer
 + * Copyright (C) 2025 Igalia, S.L.
 + *     Author: Stéphane Cerveau <scerveau@igalia.com>
@@ -3555,7 +3555,7 @@ index 0000000..44b246f
 +  GstH265PPS pps;
 +  gsize coded_buffer_size;
 +
-+  /* Quasar (resolution spec, robust form): the driver's authoritative SPS/PPS
++  /* The driver's authoritative SPS/PPS
 +   * NAL units (Annex B, from vkGetEncodedVideoSessionParametersKHR), emitted
 +   * verbatim by _write_headers instead of bit-writing self->sps/pps. Parsing the
 +   * driver's SPS and re-bit-writing it round-trips through gst_h265_bit_writer_sps
@@ -4558,7 +4558,7 @@ index 0000000..44b246f
 +
 +  gst_h265_parser_free (parser);
 +
-+  /* Quasar: identify_nalu returns NO_NAL_END on the last NAL of the
++  /* identify_nalu returns NO_NAL_END on the last NAL of the
 +   * blob (no trailing start code) - that is a successful full parse,
 +   * not a failure. */
 +  return res == GST_H265_PARSER_OK || res == GST_H265_PARSER_NO_NAL_END;
@@ -4696,9 +4696,7 @@ index 0000000..44b246f
 +          &overrides, &feedback, &data_size, &data, &err))
 +    return GST_FLOW_ERROR;
 +
-+  /* Quasar (A1, resolution spec
-+   * docs/design/plans/2026-07-24-vulkanh265enc-conformance-resolution-spec.md):
-+   * honor the driver-returned SPS/PPS for the emitted bitstream.
++  /* Honor the driver-returned SPS/PPS for the emitted bitstream.
 +   *
 +   * NVIDIA (RTX 5090) advertises only VK_VIDEO_ENCODE_H265_CTB_SIZE_32, so the
 +   * driver encodes on a 32x32 CTB grid (init_std_sps() derives that from caps).
@@ -4837,7 +4835,7 @@ index 0000000..44b246f
 +        GST_VIDEO_INFO_HEIGHT (info), "alignment", G_TYPE_STRING, "au",
 +        "stream-format", G_TYPE_STRING, "byte-stream", NULL);
 +
-+    /* Quasar (resolution spec): propagate the input colorimetry (and chroma
++    /* Propagate the input colorimetry (and chroma
 +     * siting) onto the coded-video caps, exactly as nvh265enc/vah265enc do.
 +     * webrtcbin derives the WebRTC color-space signalling from these caps; with
 +     * them absent (the upstream element left them off), a receiver has no
@@ -5071,7 +5069,7 @@ index 0000000..44b246f
 +    nal_size = sizeof (nal_buf);
 +    memset (nal_buf, 0, sizeof (nal_buf));
 +
-+    /* Quasar robust form: emit the driver's authoritative SPS NAL verbatim
++    /* Emit the driver's authoritative SPS NAL verbatim
 +     * (Annex B, start code included). Fall back to the bit-writer only if the
 +     * driver returned nothing. */
 +    if (self->driver_sps_nal && self->driver_sps_nal_size > 0
@@ -5105,7 +5103,7 @@ index 0000000..44b246f
 +    guint8 nal_buf[4096] = { 0, };
 +    guint nal_size = sizeof (nal_buf);
 +
-+    /* Quasar robust form: emit the driver's authoritative PPS NAL verbatim. */
++    /* Emit the driver's authoritative PPS NAL verbatim. */
 +    if (self->driver_pps_nal && self->driver_pps_nal_size > 0
 +        && offset + self->driver_pps_nal_size <= (guint) orig_size) {
 +      memcpy (info.data + offset, self->driver_pps_nal,
@@ -5348,9 +5346,7 @@ index 0000000..44b246f
 +      .first_slice_segment_in_pic_flag =
 +          slice_hdr->first_slice_segment_in_pic_flag,
 +      .dependent_slice_segment_flag = slice_hdr->dependent_slice_segment_flag,
-+      /* Quasar (A1 completion, resolution spec
-+       * docs/design/plans/2026-07-24-vulkanh265enc-conformance-resolution-spec.md):
-+       * source the slice-level in-loop-filter flags FROM the now-authoritative
++      /* Source the slice-level in-loop-filter flags FROM the now-authoritative
 +       * SPS/PPS instead of hardcoding them. The upstream MR #5739 values
 +       * (cu_chroma_qp_offset_enabled_flag=1, deblocking_filter_override_flag=1)
 +       * disagree with the parameter sets the encoder actually signals
@@ -6021,13 +6017,13 @@ index 0000000..44b246f
 +   * gst_h265_encoder_reconfigure(). The base class's configure() drains the
 +   * encoder and calls gst_h265_encoder_reset(), which zeroes
 +   * gop.cur_frame_index — so the very next frame is an IDR that restarts the
-+   * GOP. Measured on Tower with deploy/diag/vulkan_rc_retarget_probe.c: with the
-+   * reconfigure, a retarget emits a key frame 0-1 frames later and realigns
-+   * idr-period to the retarget point, i.e. under sustained ABR the keyframe
-+   * interval collapses to the retarget interval. Removing the video-session
-+   * reset alone does not fix that; the reconfigure is the IDR's actual source.
-+   * Before start() there is nothing live to update, so the normal reconfigure
-+   * path still runs. */
++   * GOP. Measured on an NVIDIA RTX 5090 with a standalone retarget probe:
++   * with the reconfigure, a retarget emits a key frame 0-1 frames later and
++   * realigns idr-period to the retarget point, i.e. under sustained ABR the
++   * keyframe interval collapses to the retarget interval. Removing the
++   * video-session reset alone does not fix that; the reconfigure is the
++   * IDR's actual source. Before start() there is nothing live to update, so
++   * the normal reconfigure path still runs. */
 +  if (bitrate_changed) {
 +    if (self->encoder && gst_vulkan_encoder_is_started (self->encoder)) {
 +      /* only record the request: this is the application thread, while
@@ -6079,10 +6075,10 @@ index 0000000..44b246f
 +  parent_class = g_type_class_peek_parent (klass);
 +
 +  src_doc_caps = gst_caps_from_string ("video/x-h265, "
-+      "profile = { (string) high, (string) main, (string) constrained-baseline }, "
++      "profile = { (string) main, (string) main-10 }, "
 +      "stream-format = (string) byte-stream, alignment = (string) au");
 +  sink_doc_caps = gst_caps_from_string (GST_VIDEO_CAPS_MAKE_WITH_FEATURES
-+      (GST_CAPS_FEATURE_MEMORY_VULKAN_IMAGE, "NV12"));
++      (GST_CAPS_FEATURE_MEMORY_VULKAN_IMAGE, "{ NV12, P010_10LE }"));
 +
 +  sink_pad_template =
 +      gst_pad_template_new ("sink", GST_PAD_SINK, GST_PAD_ALWAYS, cdata->raw);
@@ -6277,6 +6273,44 @@ index 0000000..44b246f
 +  g_free (cdata);
 +}
 +
++/* The element encodes the 4:2:0 Main and Main 10 profiles only (see
++ * H265ProfileMap and gst_h265_encoder_negotiate_default()), from NV12 and
++ * P010 input. gst_vulkan_physical_device_codec_caps() reports every profile
++ * the driver can encode, including the format range extensions (e.g.
++ * main-444 with NV24 input), so narrow the pad templates to what the
++ * element implements. Without this, a downstream that leaves the profile
++ * open negotiates one new_sequence() cannot start. */
++static gboolean
++_h265_restrict_to_encodable (GstCaps ** codec, GstCaps ** raw)
++{
++  GstCaps *filter, *tmp;
++
++  filter = gst_caps_from_string ("video/x-h265, "
++      "profile = (string) { main, main-10 }");
++  tmp = gst_caps_intersect (*codec, filter);
++  gst_caps_unref (filter);
++  gst_caps_unref (*codec);
++  *codec = tmp;
++
++  filter = gst_caps_from_string ("video/x-raw("
++      GST_CAPS_FEATURE_MEMORY_VULKAN_IMAGE
++      "), format = (string) { NV12, P010_10LE }");
++  tmp = gst_caps_intersect (*raw, filter);
++  gst_caps_unref (filter);
++  gst_caps_unref (*raw);
++  *raw = tmp;
++
++  if (gst_caps_is_empty (*codec) || gst_caps_is_empty (*raw)) {
++    gst_clear_caps (codec);
++    gst_clear_caps (raw);
++    return FALSE;
++  }
++
++  *codec = gst_caps_simplify (*codec);
++  *raw = gst_caps_simplify (*raw);
++  return TRUE;
++}
++
 +gboolean
 +gst_vulkan_h265_encoder_register (GstPlugin * plugin, GstVulkanDevice * device,
 +    guint rank)
@@ -6301,6 +6335,12 @@ index 0000000..44b246f
 +          VK_VIDEO_CODEC_OPERATION_ENCODE_H265_BIT_KHR, &codec, &raw)) {
 +    gst_plugin_add_status_warning (plugin,
 +        "Unable to query H.265 encoder properties");
++    return FALSE;
++  }
++
++  if (!_h265_restrict_to_encodable (&codec, &raw)) {
++    gst_plugin_add_status_warning (plugin,
++        "The Vulkan device can't encode H.265 Main or Main 10 4:2:0");
 +    return FALSE;
 +  }
 +

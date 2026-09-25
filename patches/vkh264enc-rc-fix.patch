@@ -1,5 +1,5 @@
 diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
-index 6841983..9d2546c 100644
+index 6841983..f36fe4b 100644
 --- a/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
 +++ b/subprojects/gst-plugins-bad/ext/vulkan/vkh264enc.c
 @@ -127,6 +127,10 @@ struct _GstVulkanH264Encoder
@@ -120,13 +120,13 @@ index 6841983..9d2546c 100644
 +   * gst_h264_encoder_reconfigure(). The base class's configure() drains the
 +   * encoder and calls gst_h264_encoder_reset(), which zeroes
 +   * gop.cur_frame_index — so the very next frame is an IDR that restarts the
-+   * GOP. Measured on Tower with deploy/diag/vulkan_rc_retarget_probe.c: with the
-+   * reconfigure, a retarget emits a key frame 0-1 frames later and realigns
-+   * idr-period to the retarget point, i.e. under sustained ABR the keyframe
-+   * interval collapses to the retarget interval. Removing the video-session
-+   * reset alone does not fix that; the reconfigure is the IDR's actual source.
-+   * Before start() there is nothing live to update, so the normal reconfigure
-+   * path still runs. */
++   * GOP. Measured on an NVIDIA RTX 5090 with a standalone retarget probe:
++   * with the reconfigure, a retarget emits a key frame 0-1 frames later and
++   * realigns idr-period to the retarget point, i.e. under sustained ABR the
++   * keyframe interval collapses to the retarget interval. Removing the
++   * video-session reset alone does not fix that; the reconfigure is the
++   * IDR's actual source. Before start() there is nothing live to update, so
++   * the normal reconfigure path still runs. */
 +  if (bitrate_changed) {
 +    if (self->encoder && gst_vulkan_encoder_is_started (self->encoder)) {
 +      /* only record the request: this is the application thread, while

@@ -68,13 +68,12 @@
 # Dependency: this patch's Fix A requires vkh264enc-rc-fix.patch to already
 # be applied -- gst_vulkan_encoder_request_rc_reset(), the sibling
 # gst_vulkan_encoder_request_rc_update(), and the priv->rc_update field do
-# not exist in stock GStreamer 1.28.4. Apply after (in order) the Quasar
-# vulkan patch chain's vkh264enc-rc-fix.patch. Fix B has no such dependency;
+# not exist in stock GStreamer 1.28.4. Apply after (in order) this
+# patch chain's vkh264enc-rc-fix.patch. Fix B has no such dependency;
 # gst_vulkan_encoder_picture_clear() is unmodified by any of the other
-# patches in the chain and the fix applies equally to stock 1.28.4. See
-# libpatch-NOTES.md for the full GOW-baseline and six-patch overlap analysis.
+# patches in the chain and the fix applies equally to stock 1.28.4.
 #
-# Scope: no QUASAR_* anything, no Quasar policy -- pure library bugfix,
+# Scope: no application-specific policy -- pure library bugfix,
 # upstreamable independently of vulkanav1enc.patch. License: LGPL, inherited
 # from gst-plugins-bad, same as the file it touches.
 #
