@@ -78,17 +78,22 @@
 # upstreamable independently of vulkanav1enc.patch. License: LGPL, inherited
 # from gst-plugins-bad, same as the file it touches.
 #
+# 2026-09-25: regenerated with git. The previous revision's last hunk header
+# undercounted its lines, so `git apply` silently dropped Fix A's code change
+# and only the doc comment landed. Both request functions also now set
+# rc_update atomically (see vkh264enc-rc-fix.patch).
+#
 # Upstream status: not filed as of 2026-08-21 (companion to the existing
 # unreported vkh264enc-rc-fix.patch / vkh264enc-num-slices.patch filings
 # against gstreamer/gstreamer noted in deploy/patches/vulkan/README.md).
 diff --git a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c
-index 0b92160..a1b2c3d 100644
+index a243241..735da63 100644
 --- a/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c
 +++ b/subprojects/gst-plugins-bad/gst-libs/gst/vulkan/gstvkencoder-private.c
-@@ -294,7 +294,11 @@ gst_vulkan_encoder_picture_clear (GstVulkanEncoderPicture * pic,
-
+@@ -283,7 +283,11 @@ gst_vulkan_encoder_picture_clear (GstVulkanEncoderPicture * pic,
+ 
    priv = gst_vulkan_encoder_get_instance_private (self);
-
+ 
 -  if (pic->dpb_slot.slotIndex > 0) {
 +  /* PATCH (rc-retarget-no-reset): -1 is the "no slot" sentinel used
 +   * throughout this file (see the setup slot below and the assignment two
@@ -98,10 +103,7 @@ index 0b92160..a1b2c3d 100644
      priv->slots[pic->dpb_slot.slotIndex] = NULL;
      pic->dpb_slot.slotIndex = -1;
    }
-@@ -1580,17 +1584,28 @@ gst_vulkan_encoder_request_rc_update (GstVulkanEncoder * self)
-
- /**
-  * gst_vulkan_encoder_request_rc_reset:
+@@ -1472,9 +1476,20 @@ gst_vulkan_encoder_request_rc_update (GstVulkanEncoder * self)
   * @self: a #GstVulkanEncoder
   *
   * Request that the rate-control state be re-applied to the running video
@@ -125,14 +127,12 @@ index 0b92160..a1b2c3d 100644
   */
  void
  gst_vulkan_encoder_request_rc_reset (GstVulkanEncoder * self)
- {
-   GstVulkanEncoderPrivate *priv;
-
-   g_return_if_fail (GST_IS_VULKAN_ENCODER (self));
-
+@@ -1486,7 +1501,7 @@ gst_vulkan_encoder_request_rc_reset (GstVulkanEncoder * self)
    priv = gst_vulkan_encoder_get_instance_private (self);
-
+ 
    if (priv->started)
 -    priv->session_reset = TRUE;
-+    priv->rc_update = TRUE;
++    g_atomic_int_set (&priv->rc_update, TRUE);
  }
+ 
+ GType

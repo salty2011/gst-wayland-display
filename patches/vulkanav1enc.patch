@@ -47,115 +47,25 @@
 # -> 9.55 Mbps measured over 600 frames; upstream libs_vkvideoencodeav1
 # conformance stays green; Khronos validation layer run clean.
 #
+# Review fixes (2026-09-25, games-on-whales/gst-wayland-display#62):
+#  - av1_encode_caps() queries only Main 8-bit 4:2:0 and keeps only NV12, so
+#    the sink template never advertises a format new_sequence() rejects
+#    (previously every chroma format / bit depth the driver offered, e.g.
+#    P010, was installed as sink caps).
+#  - a live bitrate write from set_property() only records the request
+#    (update_bitrate, under the object lock); encode_frame() applies it on
+#    the streaming thread, so self->rc and the encoder's rc_update flag are
+#    never written concurrently with a frame being recorded.
+#  - tests/check/elements/vkencoderetarget.c: sink-caps check plus a live
+#    retarget stress run from a second thread for all three Vulkan encoders
+#    (skips without a Vulkan encode device).
+#
 # Upstream status: GStreamer has restricted submissions (no MR path for us);
 # offered to games-on-whales/gst-wayland-display patches/ alongside the
 # rc-fix + rc-retarget prerequisites. Regenerate on every GStreamer re-pin.
-diff --git a/subprojects/gst-plugins-bad/ext/vulkan/gstvkvideocaps.c b/subprojects/gst-plugins-bad/ext/vulkan/gstvkvideocaps.c
-index 8817839..e6cfa5f 100644
---- a/subprojects/gst-plugins-bad/ext/vulkan/gstvkvideocaps.c
-+++ b/subprojects/gst-plugins-bad/ext/vulkan/gstvkvideocaps.c
-@@ -483,6 +483,39 @@ av1_decode_caps (GstVulkanPhysicalDevice * device,
-   return TRUE;
- }
- 
-+static gboolean
-+av1_encode_caps (GstVulkanPhysicalDevice * device,
-+    GstVulkanVideoProfile * profile, GstCaps ** codec_caps_ptr,
-+    GstCaps ** raw_caps_ptr)
-+{
-+  GstCaps *codec_caps, *raw_caps;
-+
-+  profile->codec.av1enc.sType =
-+      VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_PROFILE_INFO_KHR;
-+
-+  codec_caps = gst_caps_new_empty ();
-+  raw_caps = gst_caps_new_empty ();
-+
-+  /* the element only implements Main profile (8-bit 4:2:0) */
-+  profile->codec.av1enc.stdProfile = STD_VIDEO_AV1_PROFILE_MAIN;
-+
-+  try_get_caps (device, profile, codec_caps, raw_caps);
-+
-+  if (!check_caps (&codec_caps, &raw_caps))
-+    return FALSE;
-+
-+  gst_caps_set_simple (codec_caps, "alignment", G_TYPE_STRING, "tu",
-+      "stream-format", G_TYPE_STRING, "obu-stream", NULL);
-+
-+  gst_caps_set_features_simple (raw_caps,
-+      gst_caps_features_new (GST_CAPS_FEATURE_MEMORY_VULKAN_IMAGE, NULL));
-+
-+  *codec_caps_ptr = codec_caps;
-+  *raw_caps_ptr = raw_caps;
-+
-+  return TRUE;
-+}
-+
- static const StdVideoVP9Profile vp9_profile[] = {
-   STD_VIDEO_VP9_PROFILE_0, STD_VIDEO_VP9_PROFILE_1, STD_VIDEO_VP9_PROFILE_2,
-   STD_VIDEO_VP9_PROFILE_3,
-@@ -554,7 +587,7 @@ gst_vulkan_physical_device_codec_caps (GstVulkanPhysicalDevice * device,
-     case VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR:
-       return av1_decode_caps (device, &profile, codec_caps, raw_caps);
-     case VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR:
--      return FALSE;             /* unimplemented */
-+      return av1_encode_caps (device, &profile, codec_caps, raw_caps);
-     case VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR:
-       return vp9_decode_caps (device, &profile, codec_caps, raw_caps);
-     default:
-diff --git a/subprojects/gst-plugins-bad/ext/vulkan/gstvulkan.c b/subprojects/gst-plugins-bad/ext/vulkan/gstvulkan.c
-index 5f8a97f..9efaee3 100644
---- a/subprojects/gst-plugins-bad/ext/vulkan/gstvulkan.c
-+++ b/subprojects/gst-plugins-bad/ext/vulkan/gstvulkan.c
-@@ -50,6 +50,7 @@
- #include "vkvp9dec.h"
- #include "vkh264enc.h"
- #include "vkh265enc.h"
-+#include "vkav1enc.h"
- #endif
- 
- GST_DEBUG_CATEGORY_EXTERN (gst_vulkan_debug);
-@@ -129,6 +130,10 @@ plugin_init (GstPlugin * plugin)
-               VK_KHR_VIDEO_ENCODE_H265_EXTENSION_NAME)) {
-         ret |= gst_vulkan_h265_encoder_register (plugin, device, GST_RANK_NONE);
-       }
-+      if (gst_vulkan_device_is_extension_enabled (device,
-+              VK_KHR_VIDEO_ENCODE_AV1_EXTENSION_NAME)) {
-+        ret |= gst_vulkan_av1_encoder_register (plugin, device, GST_RANK_NONE);
-+      }
- #endif /* GST_VULKAN_HAVE_VIDEO_EXTENSIONS */
-       ret |= gst_vulkan_sink_register (plugin, device, GST_RANK_NONE);
-       gst_object_unref (device);
-diff --git a/subprojects/gst-plugins-bad/ext/vulkan/meson.build b/subprojects/gst-plugins-bad/ext/vulkan/meson.build
-index c01eb11..efeaa7b 100644
---- a/subprojects/gst-plugins-bad/ext/vulkan/meson.build
-+++ b/subprojects/gst-plugins-bad/ext/vulkan/meson.build
-@@ -35,8 +35,10 @@ glsc_sources = [
- video_sources = [
-   'base/gsth264encoder.c',
-   'base/gsth265encoder.c',
-+  'base/gstav1encoder.c',
-   'gstvkvideocaps.c',
-   'vkav1dec.c',
-+  'vkav1enc.c',
-   'vkh264enc.c',
-   'vkh265enc.c',
-   'vkh264dec.c',
-diff --git a/subprojects/gst-plugins-bad/tests/check/meson.build b/subprojects/gst-plugins-bad/tests/check/meson.build
-index eddac3c..7b18df2 100644
---- a/subprojects/gst-plugins-bad/tests/check/meson.build
-+++ b/subprojects/gst-plugins-bad/tests/check/meson.build
-@@ -125,6 +125,7 @@ base_tests = [
-   [['libs/vkvideoencodeh264.c'], not gstvulkan_dep.found() or vulkan_conf.get('GST_VULKAN_HAVE_VIDEO_EXTENSIONS') != 1, [gstvulkan_dep, gstcodecparsers_dep]],
-   [['libs/vkvideoencodeh265.c'], not gstvulkan_dep.found() or vulkan_conf.get('GST_VULKAN_HAVE_VIDEO_EXTENSIONS') != 1, [gstvulkan_dep, gstcodecparsers_dep]],
-   [['libs/vkvideoencodeav1.c'], not gstvulkan_dep.found() or vulkan_conf.get('GST_VULKAN_HAVE_VIDEO_EXTENSIONS') != 1, [gstvulkan_dep, gstcodecparsers_dep]],
-+  [['libs/vkvideoencodeav1refs.c'], false, [gstvideo_dep, gstcodecparsers_dep]],
-   [['libs/d3d11device.cpp'], not gstd3d11_dep.found(), [gstd3d11_dep]],
-   [['libs/d3d11memory.c'], not gstd3d11_dep.found(), [gstd3d11_dep]],
-   [['libs/cudamemory.c'], not gstcuda_dep.found(), [gstcuda_dep, gstcuda_stub_dep]],
 diff --git a/subprojects/gst-plugins-bad/ext/vulkan/base/gstav1encoder.c b/subprojects/gst-plugins-bad/ext/vulkan/base/gstav1encoder.c
 new file mode 100644
-index 00000000..4eb96397
+index 0000000..4eb9639
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/ext/vulkan/base/gstav1encoder.c
 @@ -0,0 +1,1339 @@
@@ -1500,7 +1410,7 @@ index 00000000..4eb96397
 +}
 diff --git a/subprojects/gst-plugins-bad/ext/vulkan/base/gstav1encoder.h b/subprojects/gst-plugins-bad/ext/vulkan/base/gstav1encoder.h
 new file mode 100644
-index 00000000..2387e1f1
+index 0000000..2387e1f
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/ext/vulkan/base/gstav1encoder.h
 @@ -0,0 +1,328 @@
@@ -1832,12 +1742,116 @@ index 00000000..2387e1f1
 +}
 +
 +G_END_DECLS
+diff --git a/subprojects/gst-plugins-bad/ext/vulkan/gstvkvideocaps.c b/subprojects/gst-plugins-bad/ext/vulkan/gstvkvideocaps.c
+index 8817839..0032b96 100644
+--- a/subprojects/gst-plugins-bad/ext/vulkan/gstvkvideocaps.c
++++ b/subprojects/gst-plugins-bad/ext/vulkan/gstvkvideocaps.c
+@@ -483,6 +483,52 @@ av1_decode_caps (GstVulkanPhysicalDevice * device,
+   return TRUE;
+ }
+ 
++static gboolean
++av1_encode_caps (GstVulkanPhysicalDevice * device,
++    GstVulkanVideoProfile * profile, GstCaps ** codec_caps_ptr,
++    GstCaps ** raw_caps_ptr)
++{
++  GstCaps *codec_caps = NULL, *raw_caps = NULL, *nv12, *tmp;
++
++  profile->codec.av1enc.sType =
++      VK_STRUCTURE_TYPE_VIDEO_ENCODE_AV1_PROFILE_INFO_KHR;
++
++  /* The element implements Main profile, 8-bit 4:2:0 only, and its
++   * new_sequence() accepts NV12 input only. Query exactly that
++   * configuration rather than every chroma format and bit depth the driver
++   * offers (try_get_caps()), so the pad templates never advertise a format
++   * the element would reject at runtime, e.g. P010 on a driver with 10-bit
++   * AV1 encode. */
++  profile->codec.av1enc.stdProfile = STD_VIDEO_AV1_PROFILE_MAIN;
++  profile->profile.chromaSubsampling = VK_VIDEO_CHROMA_SUBSAMPLING_420_BIT_KHR;
++  profile->profile.chromaBitDepth = VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR;
++  profile->profile.lumaBitDepth = VK_VIDEO_COMPONENT_BIT_DEPTH_8_BIT_KHR;
++
++  if (!try_profile (device, profile, &codec_caps, &raw_caps))
++    return FALSE;
++
++  /* a driver may also expose other 8-bit 4:2:0 layouts (e.g. 3-plane) */
++  nv12 = gst_caps_from_string ("video/x-raw, format = (string) NV12");
++  tmp = gst_caps_intersect (raw_caps, nv12);
++  gst_caps_unref (nv12);
++  gst_caps_unref (raw_caps);
++  raw_caps = tmp;
++
++  if (!check_caps (&codec_caps, &raw_caps))
++    return FALSE;
++
++  gst_caps_set_simple (codec_caps, "alignment", G_TYPE_STRING, "tu",
++      "stream-format", G_TYPE_STRING, "obu-stream", NULL);
++
++  gst_caps_set_features_simple (raw_caps,
++      gst_caps_features_new (GST_CAPS_FEATURE_MEMORY_VULKAN_IMAGE, NULL));
++
++  *codec_caps_ptr = codec_caps;
++  *raw_caps_ptr = raw_caps;
++
++  return TRUE;
++}
++
+ static const StdVideoVP9Profile vp9_profile[] = {
+   STD_VIDEO_VP9_PROFILE_0, STD_VIDEO_VP9_PROFILE_1, STD_VIDEO_VP9_PROFILE_2,
+   STD_VIDEO_VP9_PROFILE_3,
+@@ -554,7 +600,7 @@ gst_vulkan_physical_device_codec_caps (GstVulkanPhysicalDevice * device,
+     case VK_VIDEO_CODEC_OPERATION_DECODE_AV1_BIT_KHR:
+       return av1_decode_caps (device, &profile, codec_caps, raw_caps);
+     case VK_VIDEO_CODEC_OPERATION_ENCODE_AV1_BIT_KHR:
+-      return FALSE;             /* unimplemented */
++      return av1_encode_caps (device, &profile, codec_caps, raw_caps);
+     case VK_VIDEO_CODEC_OPERATION_DECODE_VP9_BIT_KHR:
+       return vp9_decode_caps (device, &profile, codec_caps, raw_caps);
+     default:
+diff --git a/subprojects/gst-plugins-bad/ext/vulkan/gstvulkan.c b/subprojects/gst-plugins-bad/ext/vulkan/gstvulkan.c
+index 5f8a97f..9efaee3 100644
+--- a/subprojects/gst-plugins-bad/ext/vulkan/gstvulkan.c
++++ b/subprojects/gst-plugins-bad/ext/vulkan/gstvulkan.c
+@@ -50,6 +50,7 @@
+ #include "vkvp9dec.h"
+ #include "vkh264enc.h"
+ #include "vkh265enc.h"
++#include "vkav1enc.h"
+ #endif
+ 
+ GST_DEBUG_CATEGORY_EXTERN (gst_vulkan_debug);
+@@ -129,6 +130,10 @@ plugin_init (GstPlugin * plugin)
+               VK_KHR_VIDEO_ENCODE_H265_EXTENSION_NAME)) {
+         ret |= gst_vulkan_h265_encoder_register (plugin, device, GST_RANK_NONE);
+       }
++      if (gst_vulkan_device_is_extension_enabled (device,
++              VK_KHR_VIDEO_ENCODE_AV1_EXTENSION_NAME)) {
++        ret |= gst_vulkan_av1_encoder_register (plugin, device, GST_RANK_NONE);
++      }
+ #endif /* GST_VULKAN_HAVE_VIDEO_EXTENSIONS */
+       ret |= gst_vulkan_sink_register (plugin, device, GST_RANK_NONE);
+       gst_object_unref (device);
+diff --git a/subprojects/gst-plugins-bad/ext/vulkan/meson.build b/subprojects/gst-plugins-bad/ext/vulkan/meson.build
+index c01eb11..efeaa7b 100644
+--- a/subprojects/gst-plugins-bad/ext/vulkan/meson.build
++++ b/subprojects/gst-plugins-bad/ext/vulkan/meson.build
+@@ -35,8 +35,10 @@ glsc_sources = [
+ video_sources = [
+   'base/gsth264encoder.c',
+   'base/gsth265encoder.c',
++  'base/gstav1encoder.c',
+   'gstvkvideocaps.c',
+   'vkav1dec.c',
++  'vkav1enc.c',
+   'vkh264enc.c',
+   'vkh265enc.c',
+   'vkh264dec.c',
 diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c b/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c
 new file mode 100644
-index 00000000..fb56a309
+index 0000000..35b89cb
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.c
-@@ -0,0 +1,2316 @@
+@@ -0,0 +1,2340 @@
 +/* GStreamer
 + * Copyright (C) 2026 Igalia, S.L.
 + *
@@ -1983,6 +1997,9 @@ index 00000000..fb56a309
 +  } prop;
 +
 +  gboolean update_props;
++  /* trap 9b: a live bitrate change recorded by set_property() and applied by
++   * encode_frame() on the streaming thread. Protected by the object lock. */
++  gboolean update_bitrate;
 +
 +  struct
 +  {
@@ -3204,9 +3221,21 @@ index 00000000..fb56a309
 +  /* *INDENT-ON* */
 +}
 +
++static void _update_live_bitrate (GstVulkanAV1Encoder * self);
++
 +static void
 +update_properties_unlocked (GstVulkanAV1Encoder * self)
 +{
++  /* trap 9b: the rate-control state (self->rc) and the encoder's pending
++   * rate-control update are only ever written from the streaming thread,
++   * here, so recording a frame never sees a half-applied retarget. */
++  if (self->update_bitrate) {
++    self->update_bitrate = FALSE;
++    GST_OBJECT_UNLOCK (self);
++    _update_live_bitrate (self);
++    GST_OBJECT_LOCK (self);
++  }
++
 +  if (!self->update_props)
 +    return;
 +
@@ -3514,7 +3543,9 @@ index 00000000..fb56a309
 + * sustained ABR the keyframe interval would collapse to the retarget
 + * interval (the exact defect the h264 element's rc-fix patched out).
 + * Shares _derive_rc_targets() with the configure path (bug A6: it used to
-+ * carry its own copy of the clamp, which is how the two drifted). */
++ * carry its own copy of the clamp, which is how the two drifted).
++ * Streaming thread only: it is called from update_properties_unlocked(),
++ * never from set_property(). */
 +static void
 +_update_live_bitrate (GstVulkanAV1Encoder * self)
 +{
@@ -3891,10 +3922,17 @@ index 00000000..fb56a309
 +   * interval. Before start() there is nothing live to update, so the
 +   * normal reconfigure path still runs. */
 +  if (bitrate_changed) {
-+    if (self->encoder && gst_vulkan_encoder_is_started (self->encoder))
-+      _update_live_bitrate (self);
-+    else
++    if (self->encoder && gst_vulkan_encoder_is_started (self->encoder)) {
++      /* only record the request: this is the application thread, while
++       * the rate-control state is read by the streaming thread as it
++       * records each frame. encode_frame() applies it before the next
++       * frame, like the QP properties and the base class reconfigure(). */
++      GST_OBJECT_LOCK (self);
++      self->update_bitrate = TRUE;
++      GST_OBJECT_UNLOCK (self);
++    } else {
 +      reconfigure = TRUE;
++    }
 +  }
 +
 +  if (reconfigure)
@@ -4156,7 +4194,7 @@ index 00000000..fb56a309
 +}
 diff --git a/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.h b/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.h
 new file mode 100644
-index 00000000..276a5cd0
+index 0000000..276a5cd
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/ext/vulkan/vkav1enc.h
 @@ -0,0 +1,30 @@
@@ -4190,9 +4228,209 @@ index 00000000..276a5cd0
 +                                                                 guint rank);
 +
 +G_END_DECLS
+diff --git a/subprojects/gst-plugins-bad/tests/check/elements/vkencoderetarget.c b/subprojects/gst-plugins-bad/tests/check/elements/vkencoderetarget.c
+new file mode 100644
+index 0000000..264f1b0
+--- /dev/null
++++ b/subprojects/gst-plugins-bad/tests/check/elements/vkencoderetarget.c
+@@ -0,0 +1,194 @@
++/* GStreamer
++ *
++ * Copyright (C) 2026 GStreamer developers
++ *
++ * This library is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Library General Public
++ * License as published by the Free Software Foundation; either
++ * version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Library General Public License for more details.
++ *
++ * You should have received a copy of the GNU Library General Public
++ * License along with this library; if not, write to the
++ * Free Software Foundation, Inc., 51 Franklin St, Fifth Floor,
++ * Boston, MA 02110-1301, USA.
++ */
++
++/* Element-level checks for the Vulkan video encoders:
++ *
++ *  - vulkanav1enc only advertises the input it can encode (8-bit 4:2:0
++ *    NV12), whatever else the driver's AV1 encode profile supports.
++ *  - a live bitrate retarget issued from a non-streaming thread while the
++ *    encoder is running is applied without error, for every encoder.
++ *
++ * The encoder elements are only registered when a Vulkan device with the
++ * matching video encode queue is present; every test skips otherwise, so
++ * this file builds and passes on machines without a GPU. */
++
++#ifdef HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#include <gst/gst.h>
++#include <gst/check/gstcheck.h>
++
++#define N_FRAMES 300
++
++static const gchar *encoders[] = {
++  "vulkanh264enc", "vulkanh265enc", "vulkanav1enc",
++};
++
++static gboolean
++have_element (const gchar * name)
++{
++  GstElementFactory *factory = gst_element_factory_find (name);
++
++  if (!factory) {
++    GST_INFO ("%s not available (no Vulkan encode device), skipping", name);
++    return FALSE;
++  }
++
++  gst_object_unref (factory);
++  return TRUE;
++}
++
++GST_START_TEST (test_av1_sink_caps_nv12_only)
++{
++  GstElement *enc;
++  GstPad *sinkpad;
++  GstCaps *caps;
++  guint i;
++
++  if (!have_element ("vulkanav1enc"))
++    return;
++
++  enc = gst_element_factory_make ("vulkanav1enc", NULL);
++  fail_unless (enc != NULL);
++
++  sinkpad = gst_element_get_static_pad (enc, "sink");
++  caps = gst_pad_get_pad_template_caps (sinkpad);
++  GST_INFO ("vulkanav1enc sink template: %" GST_PTR_FORMAT, caps);
++
++  fail_if (gst_caps_is_empty (caps));
++  for (i = 0; i < gst_caps_get_size (caps); i++) {
++    GstStructure *s = gst_caps_get_structure (caps, i);
++
++    fail_unless_equals_string (gst_structure_get_string (s, "format"),
++        "NV12");
++  }
++
++  gst_caps_unref (caps);
++  gst_object_unref (sinkpad);
++  gst_object_unref (enc);
++}
++
++GST_END_TEST;
++
++typedef struct
++{
++  GstElement *enc;
++  gint stop;
++  guint n_sets;
++} RetargetCtx;
++
++static gpointer
++retarget_thread (gpointer data)
++{
++  RetargetCtx *ctx = data;
++
++  /* alternate between two setpoints as fast as possible, from a thread
++   * that is not the streaming thread */
++  while (!g_atomic_int_get (&ctx->stop)) {
++    g_object_set (ctx->enc, "bitrate", (ctx->n_sets & 1) ? 4000 : 2000, NULL);
++    ctx->n_sets++;
++    g_usleep (500);
++  }
++
++  return NULL;
++}
++
++static void
++run_live_retarget (const gchar * name)
++{
++  GstElement *pipeline;
++  GstBus *bus;
++  GstMessage *msg;
++  GThread *thread;
++  RetargetCtx ctx = { NULL, };
++  GError *err = NULL;
++  gchar *desc;
++
++  if (!have_element (name))
++    return;
++
++  desc = g_strdup_printf ("videotestsrc num-buffers=%d pattern=ball ! "
++      "video/x-raw,format=NV12,width=640,height=480,framerate=60/1 ! "
++      "vulkanupload ! %s name=enc rate-control=cbr bitrate=3000 ! "
++      "fakesink sync=false", N_FRAMES, name);
++  pipeline = gst_parse_launch (desc, &err);
++  g_free (desc);
++  fail_unless (pipeline != NULL, "%s", err ? err->message : "no pipeline");
++  g_clear_error (&err);
++
++  ctx.enc = gst_bin_get_by_name (GST_BIN (pipeline), "enc");
++  fail_unless (ctx.enc != NULL);
++
++  fail_if (gst_element_set_state (pipeline, GST_STATE_PLAYING) ==
++      GST_STATE_CHANGE_FAILURE);
++
++  thread = g_thread_new ("retarget", retarget_thread, &ctx);
++
++  bus = gst_element_get_bus (pipeline);
++  msg = gst_bus_timed_pop_filtered (bus, 60 * GST_SECOND,
++      GST_MESSAGE_EOS | GST_MESSAGE_ERROR);
++
++  g_atomic_int_set (&ctx.stop, 1);
++  g_thread_join (thread);
++
++  fail_unless (msg != NULL, "%s: timed out waiting for EOS", name);
++  if (GST_MESSAGE_TYPE (msg) == GST_MESSAGE_ERROR) {
++    gchar *dbg = NULL;
++
++    gst_message_parse_error (msg, &err, &dbg);
++    fail ("%s: %s (%s)", name, err->message, GST_STR_NULL (dbg));
++  }
++  GST_INFO ("%s: %u live bitrate changes during %d frames", name, ctx.n_sets,
++      N_FRAMES);
++  fail_unless (ctx.n_sets > 0);
++
++  gst_message_unref (msg);
++  gst_object_unref (bus);
++  gst_element_set_state (pipeline, GST_STATE_NULL);
++  gst_object_unref (ctx.enc);
++  gst_object_unref (pipeline);
++}
++
++GST_START_TEST (test_live_retarget_from_app_thread)
++{
++  guint i;
++
++  for (i = 0; i < G_N_ELEMENTS (encoders); i++)
++    run_live_retarget (encoders[i]);
++}
++
++GST_END_TEST;
++
++static Suite *
++vkencoderetarget_suite (void)
++{
++  Suite *s = suite_create ("vkencoderetarget");
++  TCase *tc_basic = tcase_create ("general");
++
++  suite_add_tcase (s, tc_basic);
++  tcase_set_timeout (tc_basic, 240);
++  tcase_add_test (tc_basic, test_av1_sink_caps_nv12_only);
++  tcase_add_test (tc_basic, test_live_retarget_from_app_thread);
++
++  return s;
++}
++
++GST_CHECK_MAIN (vkencoderetarget);
 diff --git a/subprojects/gst-plugins-bad/tests/check/libs/vkvideoencodeav1refs.c b/subprojects/gst-plugins-bad/tests/check/libs/vkvideoencodeav1refs.c
 new file mode 100644
-index 00000000..4813c371
+index 0000000..4813c37
 --- /dev/null
 +++ b/subprojects/gst-plugins-bad/tests/check/libs/vkvideoencodeav1refs.c
 @@ -0,0 +1,1173 @@
@@ -5369,3 +5607,23 @@ index 00000000..4813c371
 +#else
 +GST_CHECK_MAIN (av1refs);
 +#endif
+diff --git a/subprojects/gst-plugins-bad/tests/check/meson.build b/subprojects/gst-plugins-bad/tests/check/meson.build
+index eddac3c..8621ebc 100644
+--- a/subprojects/gst-plugins-bad/tests/check/meson.build
++++ b/subprojects/gst-plugins-bad/tests/check/meson.build
+@@ -87,6 +87,7 @@ base_tests = [
+   [['elements/vkdownload.c'], not gstvulkan_dep.found(), [gstvulkan_dep]],
+   [['elements/vkdeviceprovider.c'], not gstvulkan_dep.found(), [gstvulkan_dep]],
+   [['elements/vkupload.c'], not gstvulkan_dep.found(), [gstvulkan_dep]],
++  [['elements/vkencoderetarget.c'], not gstvulkan_dep.found() or vulkan_conf.get('GST_VULKAN_HAVE_VIDEO_EXTENSIONS') != 1, [gstvulkan_dep]],
+   [['elements/voamrwbenc.c'], not voamrwbenc_dep.found(), [voamrwbenc_dep]],
+   [['elements/vp9parse.c'], false, [gstcodecparsers_dep]],
+   [['elements/av1parse.c'], false, [gstcodecparsers_dep]],
+@@ -125,6 +126,7 @@ base_tests = [
+   [['libs/vkvideoencodeh264.c'], not gstvulkan_dep.found() or vulkan_conf.get('GST_VULKAN_HAVE_VIDEO_EXTENSIONS') != 1, [gstvulkan_dep, gstcodecparsers_dep]],
+   [['libs/vkvideoencodeh265.c'], not gstvulkan_dep.found() or vulkan_conf.get('GST_VULKAN_HAVE_VIDEO_EXTENSIONS') != 1, [gstvulkan_dep, gstcodecparsers_dep]],
+   [['libs/vkvideoencodeav1.c'], not gstvulkan_dep.found() or vulkan_conf.get('GST_VULKAN_HAVE_VIDEO_EXTENSIONS') != 1, [gstvulkan_dep, gstcodecparsers_dep]],
++  [['libs/vkvideoencodeav1refs.c'], false, [gstvideo_dep, gstcodecparsers_dep]],
+   [['libs/d3d11device.cpp'], not gstd3d11_dep.found(), [gstd3d11_dep]],
+   [['libs/d3d11memory.c'], not gstd3d11_dep.found(), [gstd3d11_dep]],
+   [['libs/cudamemory.c'], not gstcuda_dep.found(), [gstcuda_dep, gstcuda_stub_dep]],
