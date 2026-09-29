@@ -23,7 +23,11 @@ use smithay::{
     utils::{Logical, Point, SERIAL_COUNTER, Serial, Size},
     wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint},
 };
-use std::{os::unix::io::OwnedFd, path::Path, time::Instant};
+use std::{
+    os::unix::io::{AsRawFd, OwnedFd},
+    path::Path,
+    time::Instant,
+};
 
 /// Map a RENDER-space position back into the coordinate space a window is composited from:
 /// the exact inverse of the `Rescale`-about-`origin` + `Relocate`-by-`offset` pair
@@ -50,14 +54,33 @@ type PointerFocus = (Option<(Window, Point<f64, Logical>)>, Point<f64, Logical>)
 
 pub struct NixInterface;
 
+/// `EVIOCGRAB`, `_IOW('E', 0x90, int)`.
+const EVIOCGRAB: u64 = 0x4004_4590;
+
 impl LibinputInterface for NixInterface {
     fn open_restricted(&mut self, path: &Path, flags: i32) -> Result<OwnedFd, i32> {
-        open(
+        let fd = open(
             path,
             OFlags::from_bits_truncate(flags as u32),
             Mode::empty(),
         )
-        .map_err(|err| err.raw_os_error())
+        .map_err(|err| err.raw_os_error())?;
+        // The devices this compositor is given are its host's virtual keyboard and mouse,
+        // created for this display alone. The host kernel treats them as real input
+        // devices and its own handlers (the console keyboard, SysRq, mousedev) attach to
+        // every keyboard and mouse, so without an exclusive grab the host would receive
+        // the same input. Grab them so only this compositor does. A device that cannot be
+        // grabbed is still used, and the failure is logged.
+        // SAFETY: EVIOCGRAB takes an int by value on an evdev fd this function owns.
+        let rc = unsafe { libc::ioctl(fd.as_raw_fd(), EVIOCGRAB as _, 1 as libc::c_int) };
+        if rc != 0 {
+            tracing::warn!(
+                path = %path.display(),
+                error = %std::io::Error::last_os_error(),
+                "could not take the input device exclusively"
+            );
+        }
+        Ok(fd)
     }
     fn close_restricted(&mut self, fd: OwnedFd) {
         let _ = fd;
