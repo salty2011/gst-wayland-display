@@ -34,6 +34,13 @@ use wayland_protocols::{
     },
     xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base},
 };
+use wayland_protocols_wlr::output_management::v1::client::{
+    zwlr_output_configuration_head_v1::ZwlrOutputConfigurationHeadV1,
+    zwlr_output_configuration_v1::{self, ZwlrOutputConfigurationV1},
+    zwlr_output_head_v1::{self, ZwlrOutputHeadV1},
+    zwlr_output_manager_v1::{self, ZwlrOutputManagerV1},
+    zwlr_output_mode_v1::{self, ZwlrOutputModeV1},
+};
 
 pub struct WaylandClient {
     conn: Connection,
@@ -76,6 +83,48 @@ struct State {
     pub mouse_events: Vec<MouseEvents>,
     pub output: Option<wl_output::WlOutput>,
     pub output_events: Vec<wl_output::Event>,
+    /// `wlr-output-management` view of the compositor, as this client has been told it.
+    pub wlr: WlrOutputs,
+}
+
+/// What a `zwlr_output_manager_v1` client has learned so far.
+#[derive(Default)]
+pub struct WlrOutputs {
+    pub manager: Option<ZwlrOutputManagerV1>,
+    pub heads: Vec<WlrHead>,
+    /// Every `done` serial received, in order; the last is the one a configuration must carry.
+    pub serials: Vec<u32>,
+    /// Outcome events on configurations, in order: "succeeded" | "failed" | "cancelled".
+    pub results: Vec<&'static str>,
+    /// Configurations kept alive until their result lands.
+    pub configurations: Vec<(
+        ZwlrOutputConfigurationV1,
+        Option<ZwlrOutputConfigurationHeadV1>,
+    )>,
+}
+
+pub struct WlrHead {
+    pub head: ZwlrOutputHeadV1,
+    pub name: Option<String>,
+    pub enabled: Option<bool>,
+    pub modes: Vec<WlrMode>,
+    pub current: Option<ZwlrOutputModeV1>,
+    pub finished: bool,
+}
+
+pub struct WlrMode {
+    pub mode: ZwlrOutputModeV1,
+    pub size: Option<(i32, i32)>,
+    pub refresh: Option<i32>,
+    pub preferred: bool,
+    pub finished: bool,
+}
+
+impl WlrMode {
+    pub fn triple(&self) -> Option<(i32, i32, i32)> {
+        let (w, h) = self.size?;
+        Some((w, h, self.refresh?))
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -175,6 +224,14 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     state.output =
                         Some(registry.bind::<wl_output::WlOutput, _, _>(name, version, qh, ()));
                 }
+                "zwlr_output_manager_v1" => {
+                    state.wlr.manager = Some(registry.bind::<ZwlrOutputManagerV1, _, _>(
+                        name,
+                        version.min(4),
+                        qh,
+                        (),
+                    ));
+                }
                 _ => {}
             }
         }
@@ -229,6 +286,7 @@ impl WaylandClient {
             mouse_events: Vec::new(),
             output: None,
             output_events: Vec::new(),
+            wlr: WlrOutputs::default(),
         };
 
         WaylandClient {
@@ -417,6 +475,66 @@ impl WaylandClient {
 
     /// All `wl_output` events received so far (geometry, mode, scale, done, name,
     /// description). Ownership stays with the client; callers `drain` or inspect.
+    /// The `wlr-output-management` state as this client has been told it.
+    pub fn wlr(&self) -> &WlrOutputs {
+        &self.state.wlr
+    }
+
+    /// Build and `apply` (or `test`) a configuration against the latest serial that enables the
+    /// first head and sets `mode`, given as `(width, height, refresh_mHz)` of an advertised
+    /// mode, or as a custom mode when `custom` is set. `serial` overrides the latest.
+    pub fn wlr_configure(
+        &mut self,
+        mode: (i32, i32, i32),
+        custom: bool,
+        apply: bool,
+        serial: Option<u32>,
+    ) {
+        let manager = self
+            .state
+            .wlr
+            .manager
+            .clone()
+            .expect("zwlr_output_manager_v1 bound");
+        let serial =
+            serial.unwrap_or_else(|| *self.state.wlr.serials.last().expect("a done serial"));
+        let config = manager.create_configuration(serial, &self.qh, ());
+        let head = self.state.wlr.heads.first().expect("a head");
+        let cfg_head = config.enable_head(&head.head, &self.qh, ());
+        if custom {
+            cfg_head.set_custom_mode(mode.0, mode.1, mode.2);
+        } else {
+            let m = head
+                .modes
+                .iter()
+                .find(|m| m.triple() == Some(mode))
+                .expect("the mode is advertised");
+            cfg_head.set_mode(&m.mode);
+        }
+        if apply {
+            config.apply();
+        } else {
+            config.test();
+        }
+        self.state.wlr.configurations.push((config, Some(cfg_head)));
+    }
+
+    /// `apply` a configuration that disables the only head.
+    pub fn wlr_disable_head(&mut self) {
+        let manager = self
+            .state
+            .wlr
+            .manager
+            .clone()
+            .expect("zwlr_output_manager_v1 bound");
+        let serial = *self.state.wlr.serials.last().expect("a done serial");
+        let config = manager.create_configuration(serial, &self.qh, ());
+        let head = self.state.wlr.heads.first().expect("a head");
+        config.disable_head(&head.head);
+        config.apply();
+        self.state.wlr.configurations.push((config, None));
+    }
+
     pub fn get_output_events(&mut self) -> &mut Vec<wl_output::Event> {
         self.state.output_events.as_mut()
     }
@@ -842,3 +960,120 @@ impl Dispatch<zwp_confined_pointer_v1::ZwpConfinedPointerV1, ()> for State {
         }
     }
 }
+
+impl Dispatch<ZwlrOutputManagerV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &ZwlrOutputManagerV1,
+        event: zwlr_output_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        tracing::debug!("{:?}", event);
+        match event {
+            zwlr_output_manager_v1::Event::Head { head } => state.wlr.heads.push(WlrHead {
+                head,
+                name: None,
+                enabled: None,
+                modes: Vec::new(),
+                current: None,
+                finished: false,
+            }),
+            zwlr_output_manager_v1::Event::Done { serial } => state.wlr.serials.push(serial),
+            zwlr_output_manager_v1::Event::Finished => state.wlr.manager = None,
+            _ => {}
+        }
+    }
+
+    wayland_client::event_created_child!(State, ZwlrOutputManagerV1, [
+        zwlr_output_manager_v1::EVT_HEAD_OPCODE => (ZwlrOutputHeadV1, ()),
+    ]);
+}
+
+impl Dispatch<ZwlrOutputHeadV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        head: &ZwlrOutputHeadV1,
+        event: zwlr_output_head_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        tracing::debug!("{:?}", event);
+        let Some(entry) = state.wlr.heads.iter_mut().find(|h| h.head == *head) else {
+            return;
+        };
+        match event {
+            zwlr_output_head_v1::Event::Name { name } => entry.name = Some(name),
+            zwlr_output_head_v1::Event::Enabled { enabled } => entry.enabled = Some(enabled != 0),
+            zwlr_output_head_v1::Event::Mode { mode } => entry.modes.push(WlrMode {
+                mode,
+                size: None,
+                refresh: None,
+                preferred: false,
+                finished: false,
+            }),
+            zwlr_output_head_v1::Event::CurrentMode { mode } => entry.current = Some(mode),
+            zwlr_output_head_v1::Event::Finished => entry.finished = true,
+            _ => {}
+        }
+    }
+
+    wayland_client::event_created_child!(State, ZwlrOutputHeadV1, [
+        zwlr_output_head_v1::EVT_MODE_OPCODE => (ZwlrOutputModeV1, ()),
+    ]);
+}
+
+impl Dispatch<ZwlrOutputModeV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        mode: &ZwlrOutputModeV1,
+        event: zwlr_output_mode_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        tracing::debug!("{:?}", event);
+        let Some(entry) = state
+            .wlr
+            .heads
+            .iter_mut()
+            .flat_map(|h| h.modes.iter_mut())
+            .find(|m| m.mode == *mode)
+        else {
+            return;
+        };
+        match event {
+            zwlr_output_mode_v1::Event::Size { width, height } => {
+                entry.size = Some((width, height))
+            }
+            zwlr_output_mode_v1::Event::Refresh { refresh } => entry.refresh = Some(refresh),
+            zwlr_output_mode_v1::Event::Preferred => entry.preferred = true,
+            zwlr_output_mode_v1::Event::Finished => entry.finished = true,
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZwlrOutputConfigurationV1, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &ZwlrOutputConfigurationV1,
+        event: zwlr_output_configuration_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        tracing::debug!("{:?}", event);
+        let result = match event {
+            zwlr_output_configuration_v1::Event::Succeeded => "succeeded",
+            zwlr_output_configuration_v1::Event::Failed => "failed",
+            zwlr_output_configuration_v1::Event::Cancelled => "cancelled",
+            _ => return,
+        };
+        state.wlr.results.push(result);
+    }
+}
+
+delegate_noop!(State: ignore ZwlrOutputConfigurationHeadV1);
