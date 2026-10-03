@@ -132,6 +132,10 @@ pub struct Settings {
     /// Extra `wl_output` modes to advertise, so an in-app resolution menu has a list to
     /// offer. Empty = none (the historical behaviour). See `forward_display_geometry`.
     mode_ladder: Vec<(i32, i32)>,
+    /// The display's real mode set, each `(width, height, refresh_mHz)` with its own refresh,
+    /// advertised on `wl_output` and through `wlr-output-management`. Empty = none. See
+    /// `forward_display_geometry`.
+    output_modes: Vec<(i32, i32, i32)>,
     #[cfg(feature = "cuda")]
     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
     #[cfg(feature = "cuda")]
@@ -461,6 +465,25 @@ impl ObjectImpl for WaylandDisplaySrc {
                     )
                     .default_value(Some(""))
                     .build(),
+                glib::ParamSpecString::builder("output-modes")
+                    .nick("Output modes")
+                    .blurb(
+                        "Comma-separated list of the modes the display genuinely supports, each \
+                         with its own refresh rate in millihertz, e.g. \
+                         \"2560x1440@143981,1920x1080@60000,1920x1080@119880\" (empty = none). \
+                         Every entry is advertised as a wl_output mode AND through \
+                         wlr-output-management, so a client can ask to be moved to one; the \
+                         request is posted on the bus as a \"quasar-mode-request\" application \
+                         message (fields width, height, refresh-millihz) and nothing changes \
+                         until the owner re-negotiates the caps. Unlike mode-ladder the entries \
+                         are NOT filtered against the encode size. The current mode's refresh \
+                         snaps to the matching entry. Live-writable and sticky across caps \
+                         re-negotiation; set it before the application connects (wl_output sends \
+                         its mode list only at bind). A malformed value is warned about and \
+                         ignored.",
+                    )
+                    .default_value(Some(""))
+                    .build(),
                 glib::ParamSpecUInt64::builder("app-surface-commits")
                     .nick("Application surface buffer commits")
                     .blurb(
@@ -642,6 +665,31 @@ impl ObjectImpl for WaylandDisplaySrc {
                     }
                 }
             }
+            "output-modes" => {
+                let raw = value
+                    .get::<Option<String>>()
+                    .expect("Type checked upstream")
+                    .unwrap_or_default();
+                match parse_output_modes(&raw) {
+                    Some(modes) => {
+                        self.settings.lock().unwrap().output_modes = modes.clone();
+                        if let Some(state) = self.state.lock().unwrap().as_ref() {
+                            state.display.set_output_modes(&modes);
+                        }
+                    }
+                    None => {
+                        gst::warning!(
+                            CAT,
+                            imp = self,
+                            "Ignoring malformed output-modes {:?}; expected a comma-separated \
+                             list of \"WxH@mHz\" (e.g. \"1920x1080@60000\"), each dimension \
+                             1..={} and a positive refresh, or \"\" for none",
+                            raw,
+                            MAX_RENDER_DIMENSION
+                        );
+                    }
+                }
+            }
             _ => unreachable!(),
         }
     }
@@ -713,6 +761,10 @@ impl ObjectImpl for WaylandDisplaySrc {
                     .collect::<Vec<_>>()
                     .join(",")
                     .to_value()
+            }
+            "output-modes" => {
+                let settings = self.settings.lock().unwrap();
+                format_output_modes(&settings.output_modes).to_value()
             }
             "app-surface-commits" => self
                 .state
@@ -999,13 +1051,14 @@ impl WaylandDisplaySrc {
     /// applies the mode exactly once per negotiation. A partial pair (only one dimension
     /// set) is deliberately not forwarded; see `set_property`.
     fn forward_display_geometry(&self) {
-        let (width, height, ui_scale, mode_ladder) = {
+        let (width, height, ui_scale, mode_ladder, output_modes) = {
             let settings = self.settings.lock().unwrap();
             (
                 settings.render_width,
                 settings.render_height,
                 settings.ui_scale,
                 settings.mode_ladder.clone(),
+                settings.output_modes.clone(),
             )
         };
         if width > 0 && height > 0 {
@@ -1018,6 +1071,9 @@ impl WaylandDisplaySrc {
         // against the encode size, which is exactly what just changed.
         if !mode_ladder.is_empty() {
             let _ = self.command_tx.send(Command::ModeLadder(mode_ladder));
+        }
+        if !output_modes.is_empty() {
+            let _ = self.command_tx.send(Command::OutputModes(output_modes));
         }
     }
 }
@@ -1716,6 +1772,22 @@ impl PushSrcImpl for WaylandDisplaySrc {
             );
         }
 
+        // A client asked, through wlr-output-management, to be moved to another advertised
+        // mode. Surface it on the bus; the owner decides (move the display, re-negotiate the
+        // caps) and the compositor changes nothing on its own.
+        if let Some((width, height, refresh_mhz)) = state.display.poll_mode_request() {
+            let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
+            let structure = Structure::builder("quasar-mode-request")
+                .field("width", width)
+                .field("height", height)
+                .field("refresh-millihz", refresh_mhz)
+                .build();
+            if let Err(err) = elem.post_message(Application::builder(structure).src(&elem).build())
+            {
+                gst::warning!(CAT, "Failed to post quasar-mode-request message: {}", err);
+            }
+        }
+
         // WOLF_HDR_CM: surface compositor OUTPUT HDR-state changes on the bus so Wolf can
         // drive dynamic HDR<->SDR switching. The compositor only signals on an actual
         // change, so this posts at most one message per transition.
@@ -1800,6 +1872,38 @@ fn parse_mode_ladder(raw: &str) -> Option<Vec<(i32, i32)>> {
             _ => None,
         })
         .collect()
+}
+
+/// Parse the `output-modes` property's `"WxH@mHz,WxH@mHz,..."` form (e.g.
+/// `"1920x1080@60000,2560x1440@143981"`). `""` is the empty set; any malformed entry
+/// rejects the whole value (`None`).
+fn parse_output_modes(raw: &str) -> Option<Vec<(i32, i32, i32)>> {
+    if raw.is_empty() {
+        return Some(Vec::new());
+    }
+    raw.split(',')
+        .map(|entry| {
+            let (size, refresh) = entry.split_once('@')?;
+            let (w, h) = parse_render_size(size)?;
+            if w <= 0 || h <= 0 {
+                return None;
+            }
+            if refresh.is_empty() || !refresh.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let refresh = refresh.parse::<i32>().ok().filter(|r| *r > 0)?;
+            Some((w, h, refresh))
+        })
+        .collect()
+}
+
+/// Inverse of [`parse_output_modes`].
+fn format_output_modes(modes: &[(i32, i32, i32)]) -> String {
+    modes
+        .iter()
+        .map(|(w, h, r)| format!("{w}x{h}@{r}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// A `/dev/dri/*` render node backs a real `GstVaDisplay`; the `software` (llvmpipe)

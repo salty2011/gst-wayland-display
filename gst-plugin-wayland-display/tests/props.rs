@@ -227,3 +227,38 @@ fn render_size_bounds() {
     assert_eq!(spec.minimum(), 1.0);
     assert_eq!(spec.maximum(), 3.0);
 }
+
+#[test]
+fn output_modes_round_trip_and_default() {
+    let src = make_src();
+    assert_eq!(src.property::<String>("output-modes"), "");
+    src.set_property("output-modes", "2560x1440@143981,1920x1080@60000");
+    assert_eq!(
+        src.property::<String>("output-modes"),
+        "2560x1440@143981,1920x1080@60000"
+    );
+    src.set_property("output-modes", "");
+    assert_eq!(src.property::<String>("output-modes"), "");
+}
+
+#[test]
+fn output_modes_rejects_malformed_values() {
+    let src = make_src();
+    src.set_property("output-modes", "1920x1080@60000");
+    for bad in [
+        "1920x1080",        // no refresh
+        "1920x1080@",       // empty refresh
+        "1920x1080@0",      // zero refresh
+        "1920x1080@-5",     // negative refresh
+        "0x0@60000",        // zero size
+        "1920x1080@60000,", // trailing empty entry
+        "abc",
+    ] {
+        src.set_property("output-modes", bad);
+        assert_eq!(
+            src.property::<String>("output-modes"),
+            "1920x1080@60000",
+            "malformed {bad:?} must be ignored"
+        );
+    }
+}

@@ -51,6 +51,16 @@ pub enum Command {
     /// PREFERRED mode stay the render size regardless. An empty list advertises no extra
     /// modes (the historical behaviour). Sticky across caps re-negotiation.
     ModeLadder(Vec<(i32, i32)>),
+    /// Element -> compositor: the set of `wl_output` modes the display genuinely supports,
+    /// each `(width, height, refresh_mHz)` with its OWN refresh rate -- for a console session,
+    /// the physical monitor's DRM modes. Unlike [`Command::ModeLadder`] these are not filtered
+    /// against the encode size: they are what the session may be *moved to*, and a client may
+    /// request any of them through `wlr-output-management` (see
+    /// [`Command::ModeRequest`]). An empty list advertises none. Sticky across caps
+    /// re-negotiation. The current mode's refresh snaps to the matching entry here, so the
+    /// mode derived from an integer caps framerate (`144/1`) reads as the monitor's real
+    /// `143.981 Hz` entry rather than a second, near-duplicate `144.000 Hz` mode.
+    OutputModes(Vec<(i32, i32, i32)>),
     Buffer(
         SyncSender<Result<gst::Buffer, SwapBuffersError>>,
         Option<Tracer>,
@@ -84,6 +94,18 @@ pub enum Command {
         hdr: bool,
         mastering: Option<String>,
         cll: Option<String>,
+    },
+    /// Compositor -> element signal (reverse direction): a client applied a
+    /// `zwlr_output_configuration_v1` that picks one of the advertised
+    /// [`Command::OutputModes`]. The compositor has already answered `succeeded`; it does
+    /// NOT change its own mode -- the element's owner (the node agent) does that by
+    /// re-negotiating the caps at the requested size and rate, exactly as it would for any
+    /// other mode change, after moving the physical display. Drained by
+    /// [`WaylandDisplay::poll_mode_request`].
+    ModeRequest {
+        width: i32,
+        height: i32,
+        refresh_mhz: i32,
     },
 }
 
@@ -132,6 +154,10 @@ pub struct WaylandDisplay {
     /// OUTPUT HDR state changes. Empty unless `WOLF_HDR_CM` is set; drained by
     /// [`WaylandDisplay::poll_hdr_state`].
     hdr_state_rx: Receiver<Command>,
+    /// Reverse channel (compositor -> element) carrying `Command::ModeRequest` whenever a
+    /// client applies an output configuration; drained by
+    /// [`WaylandDisplay::poll_mode_request`]. Always wired.
+    mode_request_rx: Receiver<Command>,
     app_surface_commits: Arc<AtomicU64>,
     /// Shared with the compositor thread: lifetime count of renderer-degradation events
     /// (rate-limited client-buffer import failures). Delta-sampled by the gst element to post
@@ -168,6 +194,7 @@ impl WaylandDisplay {
         let (envs_tx, envs_rx) = std::sync::mpsc::channel();
         // Reverse channel (compositor -> element) for HDR-state notifications.
         let (hdr_state_tx, hdr_state_rx) = std::sync::mpsc::channel();
+        let (mode_request_tx, mode_request_rx) = std::sync::mpsc::channel();
         let app_surface_commits = Arc::new(AtomicU64::new(0));
         let compositor_commits = Arc::clone(&app_surface_commits);
         let renderer_degraded = Arc::new(AtomicU64::new(0));
@@ -193,6 +220,7 @@ impl WaylandDisplay {
                     devices_tx,
                     envs_tx,
                     hdr_state_tx,
+                    mode_request_tx,
                     compositor_commits,
                     compositor_degraded,
                     compositor_vulkan_share,
@@ -207,6 +235,7 @@ impl WaylandDisplay {
             thread_handle: Some(thread_handle),
             command_tx,
             hdr_state_rx,
+            mode_request_rx,
             app_surface_commits,
             renderer_degraded,
             tracer: None,
@@ -225,6 +254,7 @@ impl WaylandDisplay {
         let (envs_tx, envs_rx) = std::sync::mpsc::channel();
         // Reverse channel (compositor -> element) for HDR-state notifications.
         let (hdr_state_tx, hdr_state_rx) = std::sync::mpsc::channel();
+        let (mode_request_tx, mode_request_rx) = std::sync::mpsc::channel();
         let app_surface_commits = Arc::new(AtomicU64::new(0));
         let compositor_commits = Arc::clone(&app_surface_commits);
         let renderer_degraded = Arc::new(AtomicU64::new(0));
@@ -245,6 +275,7 @@ impl WaylandDisplay {
                 devices_tx,
                 envs_tx,
                 hdr_state_tx,
+                mode_request_tx,
                 compositor_commits,
                 compositor_degraded,
                 compositor_vulkan_share,
@@ -255,6 +286,7 @@ impl WaylandDisplay {
             thread_handle: Some(thread_handle),
             command_tx,
             hdr_state_rx,
+            mode_request_rx,
             app_surface_commits,
             renderer_degraded,
             tracer: None,
@@ -322,6 +354,33 @@ impl WaylandDisplay {
     /// element forwards it again after every caps negotiation for exactly that reason).
     pub fn set_mode_ladder(&self, ladder: &[(i32, i32)]) {
         let _ = self.command_tx.send(Command::ModeLadder(ladder.to_vec()));
+    }
+
+    /// Advertise the display's real mode set (`[(width, height, refresh_mHz), ...]`), each
+    /// mode with its own refresh rate, and let clients pick one through
+    /// `wlr-output-management`; see [`Command::OutputModes`]. Not filtered against the
+    /// encode size. An empty slice advertises none. Sticky across caps re-negotiation.
+    pub fn set_output_modes(&self, modes: &[(i32, i32, i32)]) {
+        let _ = self.command_tx.send(Command::OutputModes(modes.to_vec()));
+    }
+
+    /// Drain pending client mode requests (`wlr-output-management` `apply`), returning the
+    /// most recent `(width, height, refresh_mHz)` or `None` when nothing was requested. The
+    /// compositor has not changed anything on its own; the caller decides whether and how
+    /// to move the display, then re-negotiates the caps.
+    pub fn poll_mode_request(&self) -> Option<(i32, i32, i32)> {
+        let mut latest = None;
+        while let Ok(cmd) = self.mode_request_rx.try_recv() {
+            if let Command::ModeRequest {
+                width,
+                height,
+                refresh_mhz,
+            } = cmd
+            {
+                latest = Some((width, height, refresh_mhz));
+            }
+        }
+        latest
     }
 
     pub fn keyboard_input(&self, key: u32, pressed: bool) {
