@@ -272,3 +272,13 @@ fn follow_client_size_defaults_and_round_trips() {
     src.set_property("follow-client-size", false);
     assert_eq!(src.property::<bool>("follow-client-size"), false);
 }
+
+/// `display-dmabuf` (#450): off by default, so every consumer that does not ask keeps the
+/// renderer's own dmabuf format order; settable before negotiation.
+#[test]
+fn display_dmabuf_defaults_off_and_round_trips() {
+    let src = make_src();
+    assert!(!src.property::<bool>("display-dmabuf"));
+    src.set_property("display-dmabuf", true);
+    assert!(src.property::<bool>("display-dmabuf"));
+}

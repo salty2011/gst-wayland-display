@@ -112,6 +112,8 @@ pub struct Settings {
     input_devices: Vec<String>,
     disable_intel_workaround: bool,
     nv12: bool,
+    /// Order the RGB dmabuf formats for a display consumer (see `display-dmabuf`). Default off.
+    display_dmabuf: bool,
     /// Opt into NV12 `memory:VulkanImage` output on a downstream encoder's shared
     /// `GstVulkanDevice` (zero-copy into `vulkanh264enc`). Default off.
     vulkan: bool,
@@ -372,6 +374,17 @@ impl ObjectImpl for WaylandDisplaySrc {
                     )
                     .default_value(false)
                     .build(),
+                glib::ParamSpecBoolean::builder("display-dmabuf")
+                    .nick("Order dmabuf formats for a display")
+                    .blurb(
+                        "Offer the RGB dmabuf formats in the order a display consumer \
+                         (waylandsink, kmssink) behind a format-agnostic hop such as an \
+                         interpipesink should get them: XRGB8888 first, LINEAR first where \
+                         the GPU renders it, compressed modifiers last. Off: the renderer's \
+                         own order.",
+                    )
+                    .default_value(false)
+                    .build(),
                 glib::ParamSpecBoolean::builder("vulkan")
                     .nick("Prefer NV12 Vulkan output")
                     .blurb(
@@ -582,6 +595,10 @@ impl ObjectImpl for WaylandDisplaySrc {
                 let mut settings = self.settings.lock().unwrap();
                 settings.nv12 = value.get::<bool>().expect("Type checked upstream");
             }
+            "display-dmabuf" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.display_dmabuf = value.get::<bool>().expect("Type checked upstream");
+            }
             "hdr" => {
                 let mut settings = self.settings.lock().unwrap();
                 settings.hdr = value.get::<bool>().expect("Type checked upstream");
@@ -752,6 +769,10 @@ impl ObjectImpl for WaylandDisplaySrc {
             "nv12" => {
                 let settings = self.settings.lock().unwrap();
                 settings.nv12.to_value()
+            }
+            "display-dmabuf" => {
+                let settings = self.settings.lock().unwrap();
+                settings.display_dmabuf.to_value()
             }
             "vulkan" => {
                 let settings = self.settings.lock().unwrap();
@@ -1192,6 +1213,12 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                     }
                 }
 
+                let dma_formats: Vec<_> = dma_formats.iter().copied().collect();
+                let dma_formats = if settings.display_dmabuf {
+                    waylanddisplaycore::utils::allocator::order_formats_for_display(&dma_formats)
+                } else {
+                    dma_formats
+                };
                 dma_formats
                     .iter()
                     .filter_map(|format| drm_to_gst_format(format, disable_workaround))
