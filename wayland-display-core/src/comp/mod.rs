@@ -1168,6 +1168,12 @@ const FOLLOW_CLIENT_SIZE_PENDING_TIMEOUT: Duration = Duration::from_secs(3);
 /// complete no-op -- the very first check -- so behaviour is byte-for-byte identical to
 /// before this existed.
 ///
+/// It is a FALLBACK only: while any client holds a live `zwlr_output_manager_v1`
+/// ([`OutputManagementState::has_bound_managers`]) it never requests, because such a guest
+/// asks for modes explicitly, and a buffer it commits mid-switch -- a stale one at the old
+/// size, say, after a failed reallocation -- would otherwise bounce the display straight
+/// back.
+///
 /// Guards, in order: the flag must be on and `output_modes` non-empty; the toplevel's current
 /// (acked) state must be fullscreen; the committed size is read post-viewport (the same
 /// `RendererSurfaceState::surface_size` `window_fullscreen_fit` compares against, which is
@@ -1237,6 +1243,25 @@ pub(crate) fn maybe_follow_client_size(state: &mut State, window: &Window) {
         return;
     };
 
+    if state.output_mgmt.has_bound_managers() {
+        // A guest that speaks wlr-output-management asks for modes itself; a buffer it
+        // commits mid-switch (e.g. a stale one at the old size) is not a request.
+        tracing::debug!(
+            committed_width = committed.w,
+            committed_height = committed.h,
+            "follow-client-size: not following the client's resize, a wlr-output-management manager is bound"
+        );
+        return;
+    }
+
+    tracing::info!(
+        committed_width = committed.w,
+        committed_height = committed.h,
+        width = candidate.size.w,
+        height = candidate.size.h,
+        refresh_mhz = candidate.refresh,
+        "follow-client-size: following the client's resize as a mode request"
+    );
     if request_mode(state, candidate) {
         state.pending_follow_request = Some((committed, Instant::now()));
     }

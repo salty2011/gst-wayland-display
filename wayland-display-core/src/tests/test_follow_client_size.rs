@@ -73,6 +73,18 @@ fn resize_fullscreen(f: &mut Fixture, buf_w: u16, buf_h: u16) {
     }
 }
 
+/// The fixture's client binds `zwlr_output_manager_v1` on connect. These tests model a guest
+/// that speaks no `wlr-output-management` -- the only kind the fallback serves -- so `stop`
+/// that binding first.
+fn without_wlr_manager(f: &mut Fixture) {
+    f.round_trip();
+    f.client.wlr_stop();
+    f.round_trip();
+    f.round_trip();
+    assert!(f.client.wlr().manager.is_none(), "finished after stop");
+    assert!(!f.server.output_mgmt.has_bound_managers());
+}
+
 const MONITOR: &[(i32, i32, i32)] = &[
     (2560, 1440, 143_981),
     (2560, 1440, 119_998),
@@ -90,6 +102,7 @@ fn off_produces_no_request() {
     assert!(!f.server.follow_client_size, "default is off");
     apply_output_modes(&mut f.server, MONITOR);
     apply_encode(&mut f, 1920, 1080, 60);
+    without_wlr_manager(&mut f);
     map_fullscreen(&mut f, 1920, 1080);
 
     resize_fullscreen(&mut f, 2560, 1440);
@@ -108,6 +121,7 @@ fn on_requests_the_matching_size_with_nearest_refresh() {
     let rx = mode_requests(&mut f);
     apply_output_modes(&mut f.server, MONITOR);
     apply_encode(&mut f, 1920, 1080, 60); // current: 1920x1080 @ 60_000
+    without_wlr_manager(&mut f);
     f.server.follow_client_size = true;
     map_fullscreen(&mut f, 1920, 1080); // matches current: no request yet
 
@@ -126,6 +140,7 @@ fn on_matching_current_size_produces_no_request() {
     let rx = mode_requests(&mut f);
     apply_output_modes(&mut f.server, MONITOR);
     apply_encode(&mut f, 1920, 1080, 60);
+    without_wlr_manager(&mut f);
     f.server.follow_client_size = true;
     map_fullscreen(&mut f, 1920, 1080);
 
@@ -142,6 +157,7 @@ fn on_unadvertised_size_produces_no_request() {
     let rx = mode_requests(&mut f);
     apply_output_modes(&mut f.server, MONITOR);
     apply_encode(&mut f, 1920, 1080, 60);
+    without_wlr_manager(&mut f);
     f.server.follow_client_size = true;
     map_fullscreen(&mut f, 1920, 1080);
 
@@ -158,6 +174,7 @@ fn on_repeated_commit_of_pending_size_requests_once() {
     let rx = mode_requests(&mut f);
     apply_output_modes(&mut f.server, MONITOR);
     apply_encode(&mut f, 1920, 1080, 60);
+    without_wlr_manager(&mut f);
     f.server.follow_client_size = true;
     map_fullscreen(&mut f, 1920, 1080);
 
@@ -182,6 +199,7 @@ fn on_requests_again_after_the_mode_actually_moves() {
     let rx = mode_requests(&mut f);
     apply_output_modes(&mut f.server, MONITOR);
     apply_encode(&mut f, 1920, 1080, 60); // current: 1920x1080 @ 60_000
+    without_wlr_manager(&mut f);
     f.server.follow_client_size = true;
     map_fullscreen(&mut f, 1920, 1080);
 
@@ -204,4 +222,66 @@ fn on_requests_again_after_the_mode_actually_moves() {
         vec![(1920, 1080, 119_880)],
         "nearest to the new current refresh 119_998 among the 1920x1080 entries"
     );
+}
+
+/// (g) Property ON, but a client holds a live `zwlr_output_manager_v1`: that guest asks for
+/// modes itself, so a fullscreen commit at another advertised size -- e.g. a stale buffer
+/// committed mid-switch -- is NOT a request. Once the manager is stopped the fallback
+/// resumes.
+#[test]
+fn on_defers_while_a_wlr_manager_is_bound() {
+    let mut f = Fixture::new_cold();
+    let rx = mode_requests(&mut f);
+    apply_output_modes(&mut f.server, MONITOR);
+    apply_encode(&mut f, 1920, 1080, 60);
+    f.round_trip();
+    assert!(
+        f.client.wlr().manager.is_some(),
+        "the fixture client binds it"
+    );
+    assert!(f.server.output_mgmt.has_bound_managers());
+    f.server.follow_client_size = true;
+    map_fullscreen(&mut f, 1920, 1080);
+
+    resize_fullscreen(&mut f, 2560, 1440);
+    assert!(
+        drain_requests(&rx).is_empty(),
+        "a bound wlr-output-management manager owns mode requests"
+    );
+    assert_eq!(f.server.pending_follow_request, None);
+
+    without_wlr_manager(&mut f);
+    resize_fullscreen(&mut f, 1920, 1080);
+    resize_fullscreen(&mut f, 2560, 1440);
+    assert_eq!(drain_requests(&rx), vec![(2560, 1440, 119_998)]);
+}
+
+/// (h) A manager bound by a client that then disconnects without `stop` must not keep the
+/// fallback disabled for the next guest: the binding is dropped on destruction.
+#[test]
+fn on_resumes_after_the_managing_client_disconnects() {
+    let mut f = Fixture::new_cold();
+    let rx = mode_requests(&mut f);
+    apply_output_modes(&mut f.server, MONITOR);
+    apply_encode(&mut f, 1920, 1080, 60);
+    without_wlr_manager(&mut f);
+    f.server.follow_client_size = true;
+    map_fullscreen(&mut f, 1920, 1080);
+
+    let other = f.connect_extra_client();
+    assert!(other.wlr().manager.is_some(), "the extra client binds it");
+    assert!(f.server.output_mgmt.has_bound_managers());
+    resize_fullscreen(&mut f, 2560, 1440);
+    assert!(drain_requests(&rx).is_empty(), "deferred while bound");
+
+    drop(other);
+    f.round_trip();
+    f.round_trip();
+    assert!(
+        !f.server.output_mgmt.has_bound_managers(),
+        "the disconnected client's binding is gone"
+    );
+    resize_fullscreen(&mut f, 1920, 1080);
+    resize_fullscreen(&mut f, 2560, 1440);
+    assert_eq!(drain_requests(&rx), vec![(2560, 1440, 119_998)]);
 }

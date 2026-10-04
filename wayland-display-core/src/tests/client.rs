@@ -532,6 +532,18 @@ impl WaylandClient {
         self.state.wlr.configurations.push((config, Some(cfg_head)));
     }
 
+    /// `stop` the bound `zwlr_output_manager_v1`, as a client done with output management
+    /// does; the compositor answers `finished`, which clears `wlr().manager`.
+    pub fn wlr_stop(&mut self) {
+        let manager = self
+            .state
+            .wlr
+            .manager
+            .clone()
+            .expect("zwlr_output_manager_v1 bound");
+        manager.stop();
+    }
+
     /// `apply` a configuration that disables the only head.
     pub fn wlr_disable_head(&mut self) {
         let manager = self
