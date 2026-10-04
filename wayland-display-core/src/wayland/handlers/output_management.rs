@@ -91,6 +91,15 @@ impl OutputManagementState {
         }
     }
 
+    /// Whether any client currently holds a live `zwlr_output_manager_v1`. A guest that
+    /// binds the manager asks for modes explicitly, so the `follow-client-size` fallback
+    /// (`maybe_follow_client_size`) defers to it while this is true. Dead bindings are
+    /// pruned on `stop` and when the resource is destroyed (including client disconnect);
+    /// the `is_alive` filter is a belt-and-braces guard for the window in between.
+    pub fn has_bound_managers(&self) -> bool {
+        self.bindings.iter().any(|b| b.manager.is_alive())
+    }
+
     /// The serial the next `create_configuration` must carry.
     pub fn serial(&self) -> u32 {
         self.serial
@@ -273,6 +282,22 @@ impl Dispatch<ZwlrOutputManagerV1, ()> for State {
             _ => {}
         }
     }
+
+    /// The manager is gone -- `finished` was sent after `stop`, or the client disconnected
+    /// without ever stopping. Drop its binding here rather than at the next `publish`, so
+    /// [`OutputManagementState::has_bound_managers`] stops deferring the follow fallback the
+    /// moment the guest that spoke the protocol is gone.
+    fn destroyed(
+        state: &mut State,
+        _client: smithay::reexports::wayland_server::backend::ClientId,
+        manager: &ZwlrOutputManagerV1,
+        _data: &(),
+    ) {
+        state
+            .output_mgmt
+            .bindings
+            .retain(|b| b.manager != *manager && b.manager.is_alive());
+    }
 }
 
 impl Dispatch<ZwlrOutputHeadV1, ()> for State {
@@ -402,6 +427,12 @@ fn resolve(state: &mut State, config: &ZwlrOutputConfigurationV1, data: &ConfigD
     };
     config.succeeded();
     if apply && Some(mode) != output.current_mode() {
+        tracing::info!(
+            width = mode.size.w,
+            height = mode.size.h,
+            refresh_mhz = mode.refresh,
+            "wlr-output-management: client applied a mode"
+        );
         request_mode(state, mode);
     }
 }

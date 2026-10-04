@@ -61,6 +61,13 @@ pub enum Command {
     /// mode derived from an integer caps framerate (`144/1`) reads as the monitor's real
     /// `143.981 Hz` entry rather than a second, near-duplicate `144.000 Hz` mode.
     OutputModes(Vec<(i32, i32, i32)>),
+    /// Element -> compositor: treat a resize of the mapped fullscreen/root toplevel's own
+    /// committed buffer as an implicit mode request, for a nested guest display server that
+    /// speaks no `wlr-output-management` at all but still resizes its own window when the
+    /// user picks a resolution inside it -- the resize IS the request. Only resolutions
+    /// already advertised via [`Command::OutputModes`] are ever requested; refresh is chosen
+    /// nearest the current mode's. Default off.
+    FollowClientSize(bool),
     Buffer(
         SyncSender<Result<gst::Buffer, SwapBuffersError>>,
         Option<Tracer>,
@@ -362,6 +369,13 @@ impl WaylandDisplay {
     /// encode size. An empty slice advertises none. Sticky across caps re-negotiation.
     pub fn set_output_modes(&self, modes: &[(i32, i32, i32)]) {
         let _ = self.command_tx.send(Command::OutputModes(modes.to_vec()));
+    }
+
+    /// Enable/disable treating a resize of the mapped fullscreen/root toplevel's own
+    /// committed buffer as an implicit mode request (`Command::FollowClientSize`); see its
+    /// doc for the nested-guest-with-no-wlr-output-management rationale. Default off.
+    pub fn set_follow_client_size(&self, enabled: bool) {
+        let _ = self.command_tx.send(Command::FollowClientSize(enabled));
     }
 
     /// Drain pending client mode requests (`wlr-output-management` `apply`), returning the

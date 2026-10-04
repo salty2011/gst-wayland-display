@@ -136,6 +136,12 @@ pub struct Settings {
     /// advertised on `wl_output` and through `wlr-output-management`. Empty = none. See
     /// `forward_display_geometry`.
     output_modes: Vec<(i32, i32, i32)>,
+    /// Treat a resize of the mapped fullscreen/root toplevel's own committed buffer as an
+    /// implicit mode request: for a nested guest display server with no
+    /// `wlr-output-management` support, the resize IS the request. Only sizes already in
+    /// `output_modes` are ever requested; refresh stays nearest the current mode's.
+    /// Default off. See `forward_display_geometry`.
+    follow_client_size: bool,
     #[cfg(feature = "cuda")]
     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
     #[cfg(feature = "cuda")]
@@ -484,6 +490,18 @@ impl ObjectImpl for WaylandDisplaySrc {
                     )
                     .default_value(Some(""))
                     .build(),
+                glib::ParamSpecBoolean::builder("follow-client-size")
+                    .nick("Follow client size")
+                    .blurb(
+                        "Treat a resize of the mapped fullscreen application window as an \
+                         implicit mode request, for a nested display server that cannot ask \
+                         for a mode but resizes its own window when the user picks a \
+                         resolution -- the resize IS the request; resolution only, refresh \
+                         stays nearest to current. Only sizes already advertised via \
+                         output-modes are ever requested. Default false.",
+                    )
+                    .default_value(false)
+                    .build(),
                 glib::ParamSpecUInt64::builder("app-surface-commits")
                     .nick("Application surface buffer commits")
                     .blurb(
@@ -690,6 +708,13 @@ impl ObjectImpl for WaylandDisplaySrc {
                     }
                 }
             }
+            "follow-client-size" => {
+                let enabled = value.get::<bool>().expect("Type checked upstream");
+                self.settings.lock().unwrap().follow_client_size = enabled;
+                if let Some(state) = self.state.lock().unwrap().as_ref() {
+                    state.display.set_follow_client_size(enabled);
+                }
+            }
             _ => unreachable!(),
         }
     }
@@ -765,6 +790,10 @@ impl ObjectImpl for WaylandDisplaySrc {
             "output-modes" => {
                 let settings = self.settings.lock().unwrap();
                 format_output_modes(&settings.output_modes).to_value()
+            }
+            "follow-client-size" => {
+                let settings = self.settings.lock().unwrap();
+                settings.follow_client_size.to_value()
             }
             "app-surface-commits" => self
                 .state
@@ -1051,7 +1080,7 @@ impl WaylandDisplaySrc {
     /// applies the mode exactly once per negotiation. A partial pair (only one dimension
     /// set) is deliberately not forwarded; see `set_property`.
     fn forward_display_geometry(&self) {
-        let (width, height, ui_scale, mode_ladder, output_modes) = {
+        let (width, height, ui_scale, mode_ladder, output_modes, follow_client_size) = {
             let settings = self.settings.lock().unwrap();
             (
                 settings.render_width,
@@ -1059,6 +1088,7 @@ impl WaylandDisplaySrc {
                 settings.ui_scale,
                 settings.mode_ladder.clone(),
                 settings.output_modes.clone(),
+                settings.follow_client_size,
             )
         };
         if width > 0 && height > 0 {
@@ -1075,6 +1105,13 @@ impl WaylandDisplaySrc {
         if !output_modes.is_empty() {
             let _ = self.command_tx.send(Command::OutputModes(output_modes));
         }
+        // Replays a value set before `start()` existed, same as the others above. Sent
+        // unconditionally (even `false`) since the compositor default already matches and a
+        // redundant `false` is harmless -- unlike the lists above there is no "empty means
+        // don't touch it" special case to preserve.
+        let _ = self
+            .command_tx
+            .send(Command::FollowClientSize(follow_client_size));
     }
 }
 

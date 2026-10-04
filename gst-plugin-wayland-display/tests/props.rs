@@ -262,3 +262,13 @@ fn output_modes_rejects_malformed_values() {
         );
     }
 }
+
+#[test]
+fn follow_client_size_defaults_and_round_trips() {
+    let src = make_src();
+    assert_eq!(src.property::<bool>("follow-client-size"), false);
+    src.set_property("follow-client-size", true);
+    assert_eq!(src.property::<bool>("follow-client-size"), true);
+    src.set_property("follow-client-size", false);
+    assert_eq!(src.property::<bool>("follow-client-size"), false);
+}

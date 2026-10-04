@@ -442,6 +442,19 @@ impl WaylandClient {
         window.ack_last_and_commit();
     }
 
+    /// Like [`WaylandClient::setup_window_solid_no_viewport`], but commits WITHOUT acking a
+    /// configure: a client resizing its own already-mapped fullscreen window on its own
+    /// initiative (no new configure arrived to ack), exactly what
+    /// `maybe_follow_client_size`'s tests need to drive repeatedly on one window. Re-acking
+    /// an already-acked serial is a protocol error (`wrong configure serial`), which is why
+    /// this exists instead of reusing `setup_window_solid_no_viewport` for every resize.
+    pub fn resize_solid_no_viewport(&mut self, buf_w: u16, buf_h: u16, rgb: u32) {
+        let buffer = self.make_solid_buffer(buf_w, buf_h, rgb);
+        let window = self.state.windows.last_mut().unwrap();
+        window.attach_new_buffer(&buffer);
+        window.commit();
+    }
+
     /// Attach a `w`x`h` solid subsurface at `(x, y)` to the current window's toplevel
     /// surface and commit both. The parent's bbox then covers the subsurface too, which is
     /// what a launcher that renders through subsurfaces looks like — and what the fullscreen
@@ -517,6 +530,18 @@ impl WaylandClient {
             config.test();
         }
         self.state.wlr.configurations.push((config, Some(cfg_head)));
+    }
+
+    /// `stop` the bound `zwlr_output_manager_v1`, as a client done with output management
+    /// does; the compositor answers `finished`, which clears `wlr().manager`.
+    pub fn wlr_stop(&mut self) {
+        let manager = self
+            .state
+            .wlr
+            .manager
+            .clone()
+            .expect("zwlr_output_manager_v1 bound");
+        manager.stop();
     }
 
     /// `apply` a configuration that disables the only head.

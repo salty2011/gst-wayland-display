@@ -1,6 +1,7 @@
 pub(crate) mod client;
 mod device;
 mod fixture;
+mod test_follow_client_size;
 mod test_keymap_fd;
 mod test_mode_ladder;
 mod test_output_modes;
