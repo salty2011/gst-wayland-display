@@ -26,7 +26,7 @@ use smithay::{
     },
 };
 
-use crate::comp::{ClientState, FocusTarget, State};
+use crate::comp::{ClientState, FocusTarget, State, maybe_follow_client_size};
 use std::sync::atomic::Ordering;
 
 /// Whether `WOLF_HDR_CM` is set (read once). Gates the per-surface client-buffer-format
@@ -225,12 +225,20 @@ impl CompositorHandler for State {
             }
         }
 
-        if let Some(window) = self
+        // Found as an owned clone (not a borrow of `self.space`) so that
+        // `maybe_follow_client_size` below can take `self` mutably -- the temporary
+        // iterator's borrow would otherwise be extended across the whole `if let` block.
+        let committed_window = self
             .space
             .elements()
             .find(|w| w.wl_surface().map(|s| &*s == surface).unwrap_or(false))
-        {
+            .cloned();
+        if let Some(window) = committed_window {
             window.on_commit();
+            // `Command::FollowClientSize`: this is the mapped root toplevel's own commit, so
+            // treat a resize as an implicit mode request when the flag is on. A no-op when
+            // it's off (the check inside is the first thing it does).
+            maybe_follow_client_size(self, &window);
         }
         self.popups.commit(surface);
 

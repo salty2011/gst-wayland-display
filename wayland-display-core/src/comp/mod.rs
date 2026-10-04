@@ -184,6 +184,16 @@ pub struct State {
     /// what it renders at now. Sticky across caps re-negotiation. Empty = none (the
     /// historical behaviour: one mode, plus the ladder).
     pub(crate) output_modes: Vec<OutputMode>,
+    /// `Command::FollowClientSize`: treat a resize of the mapped fullscreen/root toplevel's
+    /// own committed buffer as an implicit [`Command::ModeRequest`], for a nested guest that
+    /// speaks no `wlr-output-management` at all but still resizes its own window when the
+    /// user picks a resolution inside it. Default false -- see `maybe_follow_client_size`.
+    pub(crate) follow_client_size: bool,
+    /// Debounce state for [`maybe_follow_client_size`]: the size most recently requested
+    /// through it, and when, while that request is still considered outstanding. Cleared
+    /// either by [`apply_output_mode`] observing the current mode actually become that size,
+    /// or by the 3-second timeout checked in `maybe_follow_client_size` itself.
+    pub(crate) pending_follow_request: Option<(Size<i32, Physical>, Instant)>,
     /// `wlr-output-management` bookkeeping: the bound managers and the head/mode objects
     /// each has been told about. Re-described on every mode-set or current-mode change.
     pub(crate) output_mgmt: OutputManagementState,
@@ -521,6 +531,8 @@ impl State {
             mode_ladder: Vec::new(),
             advertised_ladder: Vec::new(),
             output_modes: Vec::new(),
+            follow_client_size: false,
+            pending_follow_request: None,
             output_mgmt,
             mode_request_tx: None,
             last_render: None,
@@ -962,6 +974,15 @@ pub(crate) fn apply_output_mode(state: &mut State, size: Size<i32, Physical>, re
     // `wlr-output-management` would report a current mode that is not in its own list.
     let refresh_mhz = snap_refresh(&state.output_modes, size, refresh_mhz);
 
+    // The request this mode change satisfies, if any: `maybe_follow_client_size`'s pending
+    // guard clears here -- "the current mode actually becomes that size" -- rather than
+    // waiting for the 3-second timeout or an echoed commit.
+    if let Some((pending_size, _)) = state.pending_follow_request {
+        if pending_size == size {
+            state.pending_follow_request = None;
+        }
+    }
+
     // The LOGICAL extent before the change, for the proportional pointer remap below. Read
     // before `change_current_state`, which updates both halves of it in place.
     let old_logical = output.current_mode().map(|m| {
@@ -1126,6 +1147,98 @@ pub(crate) fn request_mode(state: &State, mode: OutputMode) -> bool {
             })
             .is_ok(),
         None => false,
+    }
+}
+
+/// How long a [`maybe_follow_client_size`] request stays "pending" -- guarding against a
+/// second request for the same size -- before it is assumed lost and tried again. Cleared
+/// earlier, on success, by [`apply_output_mode`].
+const FOLLOW_CLIENT_SIZE_PENDING_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// [`Command::FollowClientSize`]'s behaviour: when `state.follow_client_size` is set, treat
+/// a resize of the mapped, CURRENTLY-FULLSCREEN app-root toplevel's own committed buffer as
+/// an implicit mode request, for a nested guest display server that speaks no
+/// `wlr-output-management` at all but still resizes its own window when the user picks a
+/// resolution inside it -- the resize IS the request. Resolution only: the candidate mode is
+/// chosen by size, with its refresh picked nearest the CURRENT mode's, so refresh stays as
+/// close to unchanged as possible.
+///
+/// Called from the commit handler for `window` exactly when its root `wl_surface` is the one
+/// that just committed (see `wayland/handlers/compositor.rs`). With the flag off this is a
+/// complete no-op -- the very first check -- so behaviour is byte-for-byte identical to
+/// before this existed.
+///
+/// Guards, in order: the flag must be on and `output_modes` non-empty; the toplevel's current
+/// (acked) state must be fullscreen; the committed size is read post-viewport (the same
+/// `RendererSurfaceState::surface_size` `window_fullscreen_fit` compares against, which is
+/// already physical pixels after any `wp_viewport` destination); a size equal to the
+/// CURRENT mode is the echo of an already-applied move, never a new request; a size not
+/// among the advertised `output_modes` is never requested; and a size that already has a
+/// request outstanding (not yet cleared by `apply_output_mode` or the 3-second timeout) is
+/// not re-requested.
+pub(crate) fn maybe_follow_client_size(state: &mut State, window: &Window) {
+    if !state.follow_client_size || state.output_modes.is_empty() {
+        return;
+    }
+    let Some(output) = state.output.clone() else {
+        return;
+    };
+    let Some(current) = output.current_mode() else {
+        return;
+    };
+    let Some(toplevel) = window.toplevel() else {
+        return;
+    };
+
+    let is_fullscreen = with_states(toplevel.wl_surface(), |states| {
+        states
+            .data_map
+            .get::<XdgToplevelSurfaceData>()
+            .and_then(|attrs| attrs.lock().ok())
+            .map(|attrs| attrs.current.states.contains(XdgState::Fullscreen))
+            .unwrap_or(false)
+    });
+    if !is_fullscreen {
+        return;
+    }
+
+    let Some(surface_size) =
+        with_renderer_surface_state(toplevel.wl_surface(), |s| s.surface_size()).flatten()
+    else {
+        return;
+    };
+    // Post-viewport, physical pixels -- see `window_fullscreen_fit`'s identical read.
+    let committed: Size<i32, Physical> = (surface_size.w, surface_size.h).into();
+
+    if committed == current.size {
+        // The echo after the output was already moved -- never a new request.
+        return;
+    }
+
+    if let Some((pending_size, issued_at)) = state.pending_follow_request {
+        if issued_at.elapsed() < FOLLOW_CLIENT_SIZE_PENDING_TIMEOUT {
+            if pending_size == committed {
+                // Already outstanding for this size.
+                return;
+            }
+        } else {
+            state.pending_follow_request = None;
+        }
+    }
+
+    let Some(candidate) = state
+        .output_modes
+        .iter()
+        .filter(|m| m.size == committed)
+        .min_by_key(|m| (m.refresh - current.refresh).abs())
+        .copied()
+    else {
+        // Not one of the advertised modes.
+        return;
+    };
+
+    if request_mode(state, candidate) {
+        state.pending_follow_request = Some((committed, Instant::now()));
     }
 }
 
@@ -1742,6 +1855,10 @@ pub(crate) fn init(
                 Event::Msg(Command::OutputModes(modes)) => {
                     tracing::info!(?modes, "Applying advertised output mode set");
                     apply_output_modes(state, &modes);
+                }
+                Event::Msg(Command::FollowClientSize(enabled)) => {
+                    tracing::info!(enabled, "Setting follow-client-size");
+                    state.follow_client_size = enabled;
                 }
                 Event::Msg(Command::UiScale(scale)) => {
                     tracing::info!(scale, "Applying requested UI scale");
