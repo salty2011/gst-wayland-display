@@ -81,12 +81,23 @@ pub const DMA_RING_MAX: usize = 8;
 const DMA_RING_BUSY_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
 const DMA_RING_BUSY_POLL: std::time::Duration = std::time::Duration::from_millis(1);
 
+/// Frames a released slot sits out before the compositor renders into it again. A consumer
+/// that releases a buffer when it stops *holding* it (a `wl_buffer.release`) does not say
+/// when its GPU stopped *reading* it, and NVIDIA attaches no implicit fence to the dma-buf
+/// that would order our render after that read. Sitting out this many hand-offs keeps the
+/// reuse behind the reader on every path seen so far. `WOLF_DMA_RING_HOLDBACK` overrides
+/// (0 disables).
+const DMA_RING_HOLDBACK_DEFAULT: u64 = 2;
+
 /// One RGB dmabuf output slot: the GBM buffer the compositor renders into, and the
 /// `GstBuffer` that wraps it, built once and handed downstream every time this slot is used.
 struct DmaSlot {
     /// Render target. Kept alive for the slot's lifetime so smithay's per-dmabuf EGLImage +
     /// FBO cache (keyed by this `Dmabuf`) hits on every frame after the first.
     dmabuf: Dmabuf,
+    /// The acquire tick at which this slot was first seen free after being held; `None`
+    /// while it is held (or never handed out). Drives the hold-back.
+    freed_at: Option<u64>,
     /// The slot's cached buffer. Its memories own *duplicated* fds, so they stay valid for
     /// as long as downstream holds them, even after the ring itself is dropped (a caps
     /// change). Downstream never receives this buffer itself, only children that carry a
@@ -113,6 +124,12 @@ struct DmaRing {
     cur: Option<usize>,
     /// Slots added beyond [`DMA_RING_INITIAL`] (logged once each).
     grown: usize,
+    /// Acquire counter: one per frame handed out.
+    tick: u64,
+    /// Frames a released slot sits out before reuse (see [`DMA_RING_HOLDBACK_DEFAULT`]).
+    holdback: u64,
+    /// Times the ring had to reuse a slot inside its hold-back (every slot held or young).
+    holdback_misses: u64,
 }
 
 impl std::fmt::Debug for DmaRing {
@@ -129,9 +146,31 @@ impl std::fmt::Debug for DmaRing {
 
 /// Pick the ring slot for the next frame: the first slot downstream has released, searching
 /// round robin from `next`. `None` when every slot is still held.
+#[cfg(test)]
 fn pick_free_slot(free: &[bool], next: usize) -> Option<usize> {
     let n = free.len();
     (0..n).map(|i| (next + i) % n).find(|&idx| free[idx])
+}
+
+/// Pick the ring slot for the next frame under a hold-back: of the free slots (`freed_at`
+/// `Some`), the one released longest ago, but only if it has sat out at least `holdback`
+/// ticks since it was first seen free. `None` when no free slot is old enough.
+fn pick_aged_slot(freed_at: &[Option<u64>], tick: u64, holdback: u64) -> Option<usize> {
+    freed_at
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, f)| f.map(|t| (idx, t)))
+        .filter(|&(_, t)| tick.saturating_sub(t) >= holdback)
+        .min_by_key(|&(_, t)| t)
+        .map(|(idx, _)| idx)
+}
+
+/// The hold-back in frames: `WOLF_DMA_RING_HOLDBACK` when set to a number, else the default.
+fn ring_holdback_from_env() -> u64 {
+    std::env::var("WOLF_DMA_RING_HOLDBACK")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(DMA_RING_HOLDBACK_DEFAULT)
 }
 
 impl DmaRing {
@@ -144,7 +183,24 @@ impl DmaRing {
         let parent = dmabuf_to_gst_buffer(&dmabuf, &self.video_info, &self.gst_allocator)
             .map_err(|e| tracing::warn!("Failed to wrap DMA ring slot: {e}"))
             .ok()?;
-        Some(DmaSlot { dmabuf, parent })
+        Some(DmaSlot {
+            dmabuf,
+            parent,
+            freed_at: None,
+        })
+    }
+
+    /// Refresh each slot's `freed_at` from its parent's refcount: a slot that just came back
+    /// from downstream is stamped with this tick; a held one is cleared.
+    fn observe_releases(&mut self) {
+        let tick = self.tick;
+        for slot in &mut self.slots {
+            if slot.parent.is_writable() {
+                slot.freed_at.get_or_insert(tick);
+            } else {
+                slot.freed_at = None;
+            }
+        }
     }
 
     /// Reserve a slot no downstream element holds and make it the frame in flight. Grows the
@@ -153,12 +209,27 @@ impl DmaRing {
     /// buffer refs, and rendering into it tears the frame on screen).
     fn acquire(&mut self) -> Result<Dmabuf, String> {
         let started = std::time::Instant::now();
+        self.tick += 1;
         loop {
-            let free: Vec<bool> = self.slots.iter().map(|s| s.parent.is_writable()).collect();
-            if let Some(idx) = pick_free_slot(&free, self.next) {
-                self.next = (idx + 1) % self.slots.len();
-                self.cur = Some(idx);
-                return Ok(self.slots[idx].dmabuf.clone());
+            self.observe_releases();
+            let freed_at: Vec<Option<u64>> = self.slots.iter().map(|s| s.freed_at).collect();
+            if let Some(idx) = pick_aged_slot(&freed_at, self.tick, self.holdback) {
+                return Ok(self.take_slot(idx));
+            }
+            let any_free = freed_at.iter().any(Option::is_some);
+            // Every free slot is still inside its hold-back: grow before reusing a young one.
+            if any_free && self.slots.len() >= DMA_RING_MAX {
+                let idx = pick_aged_slot(&freed_at, self.tick, 0).expect("a free slot");
+                self.holdback_misses += 1;
+                if self.holdback_misses.is_power_of_two() {
+                    tracing::warn!(
+                        slots = self.slots.len(),
+                        age = self.tick - freed_at[idx].unwrap_or(self.tick),
+                        misses = self.holdback_misses,
+                        "DMA ring: reusing a slot inside its hold-back (ring at its ceiling)"
+                    );
+                }
+                return Ok(self.take_slot(idx));
             }
             if self.slots.len() < DMA_RING_MAX {
                 let slot = self
@@ -171,9 +242,7 @@ impl DmaRing {
                     slots = self.slots.len(),
                     "DMA ring: every slot is held downstream; grew the ring"
                 );
-                self.next = 0;
-                self.cur = Some(idx);
-                return Ok(self.slots[idx].dmabuf.clone());
+                return Ok(self.take_slot(idx));
             }
             if started.elapsed() >= DMA_RING_BUSY_BUDGET {
                 return Err(format!(
@@ -184,6 +253,14 @@ impl DmaRing {
             }
             std::thread::sleep(DMA_RING_BUSY_POLL);
         }
+    }
+
+    /// Make `idx` the frame in flight.
+    fn take_slot(&mut self, idx: usize) -> Dmabuf {
+        self.slots[idx].freed_at = None;
+        self.next = (idx + 1) % self.slots.len();
+        self.cur = Some(idx);
+        self.slots[idx].dmabuf.clone()
     }
 
     /// The frame in flight as a fresh child buffer over its slot. The child shares the slot's
@@ -353,10 +430,14 @@ impl GsDmaBuf {
             slots: vec![DmaSlot {
                 dmabuf: first,
                 parent,
+                freed_at: None,
             }],
             next: 0,
             cur: None,
             grown: 0,
+            tick: 0,
+            holdback: ring_holdback_from_env(),
+            holdback_misses: 0,
         };
         while ring.slots.len() < DMA_RING_INITIAL {
             let slot = ring.alloc_slot()?;
@@ -1255,6 +1336,31 @@ mod tests {
     }
 
     /// Free-slot search: round robin from `next`, skipping held slots, `None` when all held.
+    #[test]
+    fn pick_aged_slot_prefers_the_oldest_release_past_the_holdback() {
+        // Slots 1 and 3 free since ticks 5 and 2; at tick 7 with hold-back 2 both qualify,
+        // the older release (slot 3) wins.
+        assert_eq!(
+            pick_aged_slot(&[None, Some(5), None, Some(2)], 7, 2),
+            Some(3)
+        );
+        // Only slot 3 is old enough at tick 6.
+        assert_eq!(
+            pick_aged_slot(&[None, Some(5), None, Some(2)], 6, 2),
+            Some(3)
+        );
+        // Nothing has aged: slot 1 freed this tick, slot 3 one tick ago.
+        assert_eq!(pick_aged_slot(&[None, Some(6), None, Some(5)], 6, 2), None);
+        // Hold-back 0 takes any free slot, oldest first.
+        assert_eq!(
+            pick_aged_slot(&[None, Some(6), None, Some(5)], 6, 0),
+            Some(3)
+        );
+        // All held.
+        assert_eq!(pick_aged_slot(&[None, None], 9, 2), None);
+        assert_eq!(pick_aged_slot(&[], 9, 2), None);
+    }
+
     #[test]
     fn pick_free_slot_round_robin() {
         assert_eq!(pick_free_slot(&[true, true, true, true], 0), Some(0));
