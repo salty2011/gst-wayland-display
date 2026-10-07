@@ -112,8 +112,6 @@ pub struct Settings {
     input_devices: Vec<String>,
     disable_intel_workaround: bool,
     nv12: bool,
-    /// Order the RGB dmabuf formats for a display consumer (see `display-dmabuf`). Default off.
-    display_dmabuf: bool,
     /// Opt into NV12 `memory:VulkanImage` output on a downstream encoder's shared
     /// `GstVulkanDevice` (zero-copy into `vulkanh264enc`). Default off.
     vulkan: bool,
@@ -134,16 +132,6 @@ pub struct Settings {
     /// Extra `wl_output` modes to advertise, so an in-app resolution menu has a list to
     /// offer. Empty = none (the historical behaviour). See `forward_display_geometry`.
     mode_ladder: Vec<(i32, i32)>,
-    /// The display's real mode set, each `(width, height, refresh_mHz)` with its own refresh,
-    /// advertised on `wl_output` and through `wlr-output-management`. Empty = none. See
-    /// `forward_display_geometry`.
-    output_modes: Vec<(i32, i32, i32)>,
-    /// Treat a resize of the mapped fullscreen/root toplevel's own committed buffer as an
-    /// implicit mode request: for a nested guest display server with no
-    /// `wlr-output-management` support, the resize IS the request. Only sizes already in
-    /// `output_modes` are ever requested; refresh stays nearest the current mode's.
-    /// Default off. See `forward_display_geometry`.
-    follow_client_size: bool,
     #[cfg(feature = "cuda")]
     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
     #[cfg(feature = "cuda")]
@@ -374,17 +362,6 @@ impl ObjectImpl for WaylandDisplaySrc {
                     )
                     .default_value(false)
                     .build(),
-                glib::ParamSpecBoolean::builder("display-dmabuf")
-                    .nick("Order dmabuf formats for a display")
-                    .blurb(
-                        "Offer the RGB dmabuf formats in the order a display consumer \
-                         (waylandsink, kmssink) behind a format-agnostic hop such as an \
-                         interpipesink should get them: XRGB8888 first, LINEAR first where \
-                         the GPU renders it, compressed modifiers last. Off: the renderer's \
-                         own order.",
-                    )
-                    .default_value(false)
-                    .build(),
                 glib::ParamSpecBoolean::builder("vulkan")
                     .nick("Prefer NV12 Vulkan output")
                     .blurb(
@@ -484,37 +461,6 @@ impl ObjectImpl for WaylandDisplaySrc {
                     )
                     .default_value(Some(""))
                     .build(),
-                glib::ParamSpecString::builder("output-modes")
-                    .nick("Output modes")
-                    .blurb(
-                        "Comma-separated list of the modes the display genuinely supports, each \
-                         with its own refresh rate in millihertz, e.g. \
-                         \"2560x1440@143981,1920x1080@60000,1920x1080@119880\" (empty = none). \
-                         Every entry is advertised as a wl_output mode AND through \
-                         wlr-output-management, so a client can ask to be moved to one; the \
-                         request is posted on the bus as a \"quasar-mode-request\" application \
-                         message (fields width, height, refresh-millihz) and nothing changes \
-                         until the owner re-negotiates the caps. Unlike mode-ladder the entries \
-                         are NOT filtered against the encode size. The current mode's refresh \
-                         snaps to the matching entry. Live-writable and sticky across caps \
-                         re-negotiation; set it before the application connects (wl_output sends \
-                         its mode list only at bind). A malformed value is warned about and \
-                         ignored.",
-                    )
-                    .default_value(Some(""))
-                    .build(),
-                glib::ParamSpecBoolean::builder("follow-client-size")
-                    .nick("Follow client size")
-                    .blurb(
-                        "Treat a resize of the mapped fullscreen application window as an \
-                         implicit mode request, for a nested display server that cannot ask \
-                         for a mode but resizes its own window when the user picks a \
-                         resolution -- the resize IS the request; resolution only, refresh \
-                         stays nearest to current. Only sizes already advertised via \
-                         output-modes are ever requested. Default false.",
-                    )
-                    .default_value(false)
-                    .build(),
                 glib::ParamSpecUInt64::builder("app-surface-commits")
                     .nick("Application surface buffer commits")
                     .blurb(
@@ -594,10 +540,6 @@ impl ObjectImpl for WaylandDisplaySrc {
             "nv12" => {
                 let mut settings = self.settings.lock().unwrap();
                 settings.nv12 = value.get::<bool>().expect("Type checked upstream");
-            }
-            "display-dmabuf" => {
-                let mut settings = self.settings.lock().unwrap();
-                settings.display_dmabuf = value.get::<bool>().expect("Type checked upstream");
             }
             "hdr" => {
                 let mut settings = self.settings.lock().unwrap();
@@ -700,38 +642,6 @@ impl ObjectImpl for WaylandDisplaySrc {
                     }
                 }
             }
-            "output-modes" => {
-                let raw = value
-                    .get::<Option<String>>()
-                    .expect("Type checked upstream")
-                    .unwrap_or_default();
-                match parse_output_modes(&raw) {
-                    Some(modes) => {
-                        self.settings.lock().unwrap().output_modes = modes.clone();
-                        if let Some(state) = self.state.lock().unwrap().as_ref() {
-                            state.display.set_output_modes(&modes);
-                        }
-                    }
-                    None => {
-                        gst::warning!(
-                            CAT,
-                            imp = self,
-                            "Ignoring malformed output-modes {:?}; expected a comma-separated \
-                             list of \"WxH@mHz\" (e.g. \"1920x1080@60000\"), each dimension \
-                             1..={} and a positive refresh, or \"\" for none",
-                            raw,
-                            MAX_RENDER_DIMENSION
-                        );
-                    }
-                }
-            }
-            "follow-client-size" => {
-                let enabled = value.get::<bool>().expect("Type checked upstream");
-                self.settings.lock().unwrap().follow_client_size = enabled;
-                if let Some(state) = self.state.lock().unwrap().as_ref() {
-                    state.display.set_follow_client_size(enabled);
-                }
-            }
             _ => unreachable!(),
         }
     }
@@ -770,10 +680,6 @@ impl ObjectImpl for WaylandDisplaySrc {
                 let settings = self.settings.lock().unwrap();
                 settings.nv12.to_value()
             }
-            "display-dmabuf" => {
-                let settings = self.settings.lock().unwrap();
-                settings.display_dmabuf.to_value()
-            }
             "vulkan" => {
                 let settings = self.settings.lock().unwrap();
                 settings.vulkan.to_value()
@@ -807,14 +713,6 @@ impl ObjectImpl for WaylandDisplaySrc {
                     .collect::<Vec<_>>()
                     .join(",")
                     .to_value()
-            }
-            "output-modes" => {
-                let settings = self.settings.lock().unwrap();
-                format_output_modes(&settings.output_modes).to_value()
-            }
-            "follow-client-size" => {
-                let settings = self.settings.lock().unwrap();
-                settings.follow_client_size.to_value()
             }
             "app-surface-commits" => self
                 .state
@@ -1101,15 +999,13 @@ impl WaylandDisplaySrc {
     /// applies the mode exactly once per negotiation. A partial pair (only one dimension
     /// set) is deliberately not forwarded; see `set_property`.
     fn forward_display_geometry(&self) {
-        let (width, height, ui_scale, mode_ladder, output_modes, follow_client_size) = {
+        let (width, height, ui_scale, mode_ladder) = {
             let settings = self.settings.lock().unwrap();
             (
                 settings.render_width,
                 settings.render_height,
                 settings.ui_scale,
                 settings.mode_ladder.clone(),
-                settings.output_modes.clone(),
-                settings.follow_client_size,
             )
         };
         if width > 0 && height > 0 {
@@ -1123,16 +1019,6 @@ impl WaylandDisplaySrc {
         if !mode_ladder.is_empty() {
             let _ = self.command_tx.send(Command::ModeLadder(mode_ladder));
         }
-        if !output_modes.is_empty() {
-            let _ = self.command_tx.send(Command::OutputModes(output_modes));
-        }
-        // Replays a value set before `start()` existed, same as the others above. Sent
-        // unconditionally (even `false`) since the compositor default already matches and a
-        // redundant `false` is harmless -- unlike the lists above there is no "empty means
-        // don't touch it" special case to preserve.
-        let _ = self
-            .command_tx
-            .send(Command::FollowClientSize(follow_client_size));
     }
 }
 
@@ -1213,12 +1099,6 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                     }
                 }
 
-                let dma_formats: Vec<_> = dma_formats.iter().copied().collect();
-                let dma_formats = if settings.display_dmabuf {
-                    waylanddisplaycore::utils::allocator::order_formats_for_display(&dma_formats)
-                } else {
-                    dma_formats
-                };
                 dma_formats
                     .iter()
                     .filter_map(|format| drm_to_gst_format(format, disable_workaround))
@@ -1836,22 +1716,6 @@ impl PushSrcImpl for WaylandDisplaySrc {
             );
         }
 
-        // A client asked, through wlr-output-management, to be moved to another advertised
-        // mode. Surface it on the bus; the owner decides (move the display, re-negotiate the
-        // caps) and the compositor changes nothing on its own.
-        if let Some((width, height, refresh_mhz)) = state.display.poll_mode_request() {
-            let elem = self.obj().upcast_ref::<gst::Element>().to_owned();
-            let structure = Structure::builder("quasar-mode-request")
-                .field("width", width)
-                .field("height", height)
-                .field("refresh-millihz", refresh_mhz)
-                .build();
-            if let Err(err) = elem.post_message(Application::builder(structure).src(&elem).build())
-            {
-                gst::warning!(CAT, "Failed to post quasar-mode-request message: {}", err);
-            }
-        }
-
         // WOLF_HDR_CM: surface compositor OUTPUT HDR-state changes on the bus so Wolf can
         // drive dynamic HDR<->SDR switching. The compositor only signals on an actual
         // change, so this posts at most one message per transition.
@@ -1936,38 +1800,6 @@ fn parse_mode_ladder(raw: &str) -> Option<Vec<(i32, i32)>> {
             _ => None,
         })
         .collect()
-}
-
-/// Parse the `output-modes` property's `"WxH@mHz,WxH@mHz,..."` form (e.g.
-/// `"1920x1080@60000,2560x1440@143981"`). `""` is the empty set; any malformed entry
-/// rejects the whole value (`None`).
-fn parse_output_modes(raw: &str) -> Option<Vec<(i32, i32, i32)>> {
-    if raw.is_empty() {
-        return Some(Vec::new());
-    }
-    raw.split(',')
-        .map(|entry| {
-            let (size, refresh) = entry.split_once('@')?;
-            let (w, h) = parse_render_size(size)?;
-            if w <= 0 || h <= 0 {
-                return None;
-            }
-            if refresh.is_empty() || !refresh.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-            let refresh = refresh.parse::<i32>().ok().filter(|r| *r > 0)?;
-            Some((w, h, refresh))
-        })
-        .collect()
-}
-
-/// Inverse of [`parse_output_modes`].
-fn format_output_modes(modes: &[(i32, i32, i32)]) -> String {
-    modes
-        .iter()
-        .map(|(w, h, r)| format!("{w}x{h}@{r}"))
-        .collect::<Vec<_>>()
-        .join(",")
 }
 
 /// A `/dev/dri/*` render node backs a real `GstVaDisplay`; the `software` (llvmpipe)

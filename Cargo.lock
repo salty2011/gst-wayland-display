@@ -1877,7 +1877,6 @@ dependencies = [
  "wayland-backend",
  "wayland-client",
  "wayland-protocols",
- "wayland-protocols-wlr",
  "wayland-scanner",
  "wayland-server",
 ]
@@ -1916,7 +1915,6 @@ checksum = "1cb6cdc73399c0e06504c437fe3cf886f25568dd5454473d565085b36d6a8bbf"
 dependencies = [
  "bitflags 2.13.0",
  "wayland-backend",
- "wayland-client",
  "wayland-protocols",
  "wayland-scanner",
  "wayland-server",

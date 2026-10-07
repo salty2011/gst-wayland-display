@@ -6,7 +6,6 @@ pub mod drm_syncobj;
 pub mod fractional_scale;
 pub mod frog_color_management;
 pub mod output;
-pub mod output_management;
 pub mod pointer_constraints;
 pub mod presentation;
 pub mod relative_pointer;

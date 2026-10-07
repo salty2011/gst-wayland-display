@@ -12,7 +12,7 @@ use gst_video::{VideoFormat, VideoInfo, VideoInfoDmaDrm, VideoMeta};
 use gstreamer_allocators::{DmaBufAllocator, DmaBufAllocatorExtManual};
 use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufAllocator};
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
-use smithay::backend::allocator::{Allocator, Buffer, Format as DrmFormat, Fourcc};
+use smithay::backend::allocator::{Allocator, Buffer, Fourcc};
 use smithay::backend::drm::DrmNode;
 #[cfg(feature = "cuda")]
 use smithay::backend::egl::ffi::egl::types::EGLDisplay;
@@ -478,50 +478,6 @@ impl GsDmaBuf {
     pub fn modifier(&self) -> DrmModifier {
         self.ring.lock().unwrap().modifier
     }
-}
-
-/// True if `m` is an NVIDIA block-linear modifier with framebuffer compression enabled
-/// (`DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D`'s `c` field, bits 23..25, non-zero), e.g.
-/// `0x0300000000e08015`. Compressed surfaces are the riskiest thing to hand another process
-/// or a KMS plane, so a display consumer gets them last.
-fn is_nvidia_compressed_modifier(m: Modifier) -> bool {
-    let v: u64 = m.into();
-    ((v >> 56) & 0xff) == 0x03 && ((v >> 23) & 0x7) != 0
-}
-
-/// Order the renderer's dmabuf formats for a DISPLAY consumer (`waylandsink` into a
-/// compositor, `kmssink`) that negotiates through a format-agnostic hop such as interpipe, so
-/// the first entry is what gets used:
-///   - fourcc: `XRGB8888` (the one format every KMS primary plane and every compositor takes),
-///     then `ARGB8888`, `XBGR8888`, `ABGR8888`, then everything else;
-///   - modifier: LINEAR first wherever the GPU can render it (importable by any consumer, on
-///     any GPU, and scanout-capable), then the GPU's own modifiers in the renderer's order,
-///     with compressed ones (AMD DCC, NVIDIA compression) last.
-///
-/// A stable sort: ties keep the renderer's own order.
-pub fn order_formats_for_display(formats: &[DrmFormat]) -> Vec<DrmFormat> {
-    const FOURCC_PREF: [DrmFourcc; 4] = [
-        DrmFourcc::Xrgb8888,
-        DrmFourcc::Argb8888,
-        DrmFourcc::Xbgr8888,
-        DrmFourcc::Abgr8888,
-    ];
-    let mut out = formats.to_vec();
-    out.sort_by_key(|f| {
-        let fourcc_rank = FOURCC_PREF
-            .iter()
-            .position(|c| *c == f.code)
-            .unwrap_or(FOURCC_PREF.len());
-        let modifier_rank = if f.modifier == Modifier::Linear {
-            0
-        } else if is_amd_dcc_modifier(f.modifier) || is_nvidia_compressed_modifier(f.modifier) {
-            2
-        } else {
-            1
-        };
-        (fourcc_rank, modifier_rank)
-    });
-    out
 }
 
 /// NV12 output via the Vulkan converter: the compositor renders the scene into
@@ -1057,6 +1013,7 @@ mod tests {
     use super::*;
     use crate::utils::renderer::setup_renderer;
     use crate::utils::tests::test_init;
+    use smithay::backend::allocator::Format as DrmFormat;
     use smithay::backend::renderer::Frame;
     use smithay::utils::Transform;
 
@@ -1282,59 +1239,6 @@ mod tests {
         assert_eq!(buf_meta.n_planes(), 1);
     }
 
-    /// Display ordering: XRGB first, LINEAR first within a fourcc, compressed last, and the
-    /// renderer's order kept otherwise.
-    #[test]
-    fn order_formats_for_display_prefers_xrgb_linear_uncompressed() {
-        let f = |code, m: u64| DrmFormat {
-            code,
-            modifier: Modifier::from(m),
-        };
-        const NV_COMPRESSED: u64 = 0x0300_0000_00e0_8015;
-        const NV_H0: u64 = 0x0300_0000_0060_6010;
-        const NV_H5: u64 = 0x0300_0000_0060_6015;
-        const AMD_DCC: u64 = 0x0200_0000_0008_2305;
-        const AMD_TILED: u64 = 0x0200_0000_0000_0301;
-        assert!(is_nvidia_compressed_modifier(Modifier::from(NV_COMPRESSED)));
-        assert!(!is_nvidia_compressed_modifier(Modifier::from(NV_H5)));
-        assert!(!is_nvidia_compressed_modifier(Modifier::from(AMD_DCC)));
-
-        // The order an NVIDIA renderer reports: ABGR before XRGB, compressed interleaved.
-        let nvidia = [
-            f(DrmFourcc::Abgr8888, NV_H0),
-            f(DrmFourcc::Abgr8888, NV_COMPRESSED),
-            f(DrmFourcc::Xrgb8888, NV_COMPRESSED),
-            f(DrmFourcc::Xrgb8888, NV_H0),
-            f(DrmFourcc::Xrgb8888, NV_H5),
-            f(DrmFourcc::Nv12, 0),
-        ];
-        let got = order_formats_for_display(&nvidia);
-        assert_eq!(got[0], f(DrmFourcc::Xrgb8888, NV_H0));
-        assert_eq!(got[1], f(DrmFourcc::Xrgb8888, NV_H5));
-        assert_eq!(got[2], f(DrmFourcc::Xrgb8888, NV_COMPRESSED));
-        assert_eq!(got[3], f(DrmFourcc::Abgr8888, NV_H0));
-        assert_eq!(got.last(), Some(&f(DrmFourcc::Nv12, 0)));
-        assert_eq!(got.len(), nvidia.len());
-
-        // AMD: LINEAR beats the GPU's tiled modifier, DCC goes last.
-        let amd = [
-            f(DrmFourcc::Xrgb8888, AMD_DCC),
-            f(DrmFourcc::Xrgb8888, AMD_TILED),
-            f(DrmFourcc::Xrgb8888, 0),
-            f(DrmFourcc::Argb8888, 0),
-        ];
-        let got = order_formats_for_display(&amd);
-        assert_eq!(
-            got,
-            vec![
-                f(DrmFourcc::Xrgb8888, 0),
-                f(DrmFourcc::Xrgb8888, AMD_TILED),
-                f(DrmFourcc::Xrgb8888, AMD_DCC),
-                f(DrmFourcc::Argb8888, 0),
-            ]
-        );
-    }
-
     /// Free-slot search: round robin from `next`, skipping held slots, `None` when all held.
     #[test]
     fn pick_aged_slot_prefers_the_oldest_release_past_the_holdback() {
@@ -1434,17 +1338,18 @@ mod tests {
         };
         let mut renderer = setup_renderer(Some(render_node));
         let (w, h) = (64, 32);
-        // The format production negotiates with `display-dmabuf`: the first XRGB8888 entry of
-        // the renderer's formats in display order (LINEAR on AMD/Intel; NVIDIA renders only
-        // block-linear).
+        // The first XRGB8888 entry of the renderer's formats, LINEAR preferred (AMD/Intel;
+        // NVIDIA renders only block-linear).
         let formats: Vec<DrmFormat> = <GlesRenderer as Bind<Dmabuf>>::supported_formats(&renderer)
             .unwrap_or_default()
             .iter()
             .copied()
             .collect();
-        let Some(format) = order_formats_for_display(&formats)
-            .into_iter()
-            .find(|f| f.code == DrmFourcc::Xrgb8888)
+        let Some(format) = formats
+            .iter()
+            .copied()
+            .filter(|f| f.code == DrmFourcc::Xrgb8888)
+            .min_by_key(|f| f.modifier != Modifier::Linear)
         else {
             skip!("renderer cannot render XRGB8888 dmabufs");
         };

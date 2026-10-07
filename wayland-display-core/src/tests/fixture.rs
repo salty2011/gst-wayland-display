@@ -21,7 +21,6 @@ pub struct Fixture {
     pub client: WaylandClient,
     pub server: State,
     server_event_loop: EventLoop<'static, State>,
-    socket_path: String,
 }
 
 impl Fixture {
@@ -86,14 +85,14 @@ impl Fixture {
 
         // Setup Wayland client
         let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap();
-        let socket_path = format!("{}/{}", runtime_dir, socket_name);
-        let wclient = WaylandClient::new(UnixStream::connect(&socket_path).unwrap());
+        let wclient = WaylandClient::new(
+            UnixStream::connect(format!("{}/{}", runtime_dir, socket_name)).unwrap(),
+        );
 
         let mut f = Fixture {
             client: wclient,
             server: server_state,
             server_event_loop: event_loop,
-            socket_path,
         };
 
         if seed_output {
@@ -165,25 +164,6 @@ impl Fixture {
         if run_times == 0 {
             panic!("Timeout establishing connection to wayland server!");
         }
-    }
-
-    /// Connect another client to the same compositor and round-trip it until it has bound
-    /// every global. The caller owns it; dropping it disconnects it.
-    pub fn connect_extra_client(&mut self) -> WaylandClient {
-        let mut extra = WaylandClient::new(UnixStream::connect(&self.socket_path).unwrap());
-        for _ in 0..2 {
-            let data = extra.send_sync();
-            let mut run_times = 100;
-            while !data.done.load(Ordering::Relaxed) && run_times > 0 {
-                self.update_server();
-                extra.dispatch();
-                self.update_client();
-                std::thread::sleep(Duration::from_millis(10));
-                run_times -= 1;
-            }
-            assert!(run_times > 0, "timeout round-tripping the extra client");
-        }
-        extra
     }
 
     pub fn update_server(&mut self) {

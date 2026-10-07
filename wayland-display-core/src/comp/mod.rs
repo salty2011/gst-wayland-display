@@ -100,7 +100,6 @@ use crate::utils::renderer::setup_renderer;
 use crate::utils::vulkan_share::VulkanShare;
 use crate::{
     utils::RenderTarget,
-    wayland::handlers::output_management::OutputManagementState,
     wayland::protocols::{
         frog_color_management::create_frog_color_management_global, wl_drm::create_drm_global,
     },
@@ -177,29 +176,6 @@ pub struct State {
     /// because the advertised set is the *filtered* one (rungs ≤ encode) at a specific
     /// refresh rate.
     advertised_ladder: Vec<OutputMode>,
-    /// The display's real mode set (`Command::OutputModes`): every `(size, refresh)` the
-    /// output genuinely supports, each with its own refresh rate, advertised on `wl_output`
-    /// and through `wlr-output-management` so a client can ask to be moved to one. NOT
-    /// filtered against the encode size -- these are what the session may be moved to, not
-    /// what it renders at now. Sticky across caps re-negotiation. Empty = none (the
-    /// historical behaviour: one mode, plus the ladder).
-    pub(crate) output_modes: Vec<OutputMode>,
-    /// `Command::FollowClientSize`: treat a resize of the mapped fullscreen/root toplevel's
-    /// own committed buffer as an implicit [`Command::ModeRequest`], for a nested guest that
-    /// speaks no `wlr-output-management` at all but still resizes its own window when the
-    /// user picks a resolution inside it. Default false -- see `maybe_follow_client_size`.
-    pub(crate) follow_client_size: bool,
-    /// Debounce state for [`maybe_follow_client_size`]: the size most recently requested
-    /// through it, and when, while that request is still considered outstanding. Cleared
-    /// either by [`apply_output_mode`] observing the current mode actually become that size,
-    /// or by the 3-second timeout checked in `maybe_follow_client_size` itself.
-    pub(crate) pending_follow_request: Option<(Size<i32, Physical>, Instant)>,
-    /// `wlr-output-management` bookkeeping: the bound managers and the head/mode objects
-    /// each has been told about. Re-described on every mode-set or current-mode change.
-    pub(crate) output_mgmt: OutputManagementState,
-    /// Reverse channel to the element for `Command::ModeRequest` (a client's
-    /// `zwlr_output_configuration_v1.apply`). `None` only in tests that never wire one.
-    pub(crate) mode_request_tx: Option<Sender<Command>>,
     pub seat: Seat<Self>,
     pub space: Space<Window>,
     pub popups: PopupManager,
@@ -367,7 +343,6 @@ impl State {
         let data_device_state = DataDeviceState::new::<State>(dh);
         let mut dmabuf_state = DmabufState::new();
         let output_state = OutputManagerState::new_with_xdg_output::<State>(dh);
-        let output_mgmt = OutputManagementState::new::<State>(dh);
         let presentation_state = PresentationState::new::<State>(dh, clock.id() as _);
         let relative_ptr_state = RelativePointerManagerState::new::<State>(dh);
         let pointer_constraints_state = PointerConstraintsState::new::<State>(dh);
@@ -530,11 +505,6 @@ impl State {
             ui_scale: 1.0,
             mode_ladder: Vec::new(),
             advertised_ladder: Vec::new(),
-            output_modes: Vec::new(),
-            follow_client_size: false,
-            pending_follow_request: None,
-            output_mgmt,
-            mode_request_tx: None,
             last_render: None,
             current_input_is_pq: false,
 
@@ -968,20 +938,6 @@ pub(crate) fn apply_output_mode(state: &mut State, size: Size<i32, Physical>, re
     let Some(output) = state.output.clone() else {
         return;
     };
-    // The caps carry an integer framerate; the display's real mode may be `143.981 Hz`. When
-    // the advertised mode set has an entry of this size within half a hertz, that entry IS
-    // the current mode -- otherwise `wl_output` would list a near-duplicate pair and
-    // `wlr-output-management` would report a current mode that is not in its own list.
-    let refresh_mhz = snap_refresh(&state.output_modes, size, refresh_mhz);
-
-    // The request this mode change satisfies, if any: `maybe_follow_client_size`'s pending
-    // guard clears here -- "the current mode actually becomes that size" -- rather than
-    // waiting for the 3-second timeout or an echoed commit.
-    if let Some((pending_size, _)) = state.pending_follow_request {
-        if pending_size == size {
-            state.pending_follow_request = None;
-        }
-    }
 
     // The LOGICAL extent before the change, for the proportional pointer remap below. Read
     // before `change_current_state`, which updates both halves of it in place.
@@ -1054,217 +1010,6 @@ pub(crate) fn apply_output_mode(state: &mut State, size: Size<i32, Physical>, re
     announce_ui_scale(state);
     configure_toplevels(state, new_size);
     configure_pending_toplevels(state, new_size);
-    // Tell every `wlr-output-management` client the head's current mode (and mode list)
-    // changed. After the ladder/mode-set reconcile above, so the list it describes is final.
-    let dh = state.dh.clone();
-    state.output_mgmt.publish(&dh, &output);
-}
-
-/// The refresh `wl_output` should carry for `size`: the matching entry of `output_modes`
-/// (same size, within 500 mHz of `refresh_mhz`) when there is one, else `refresh_mhz`
-/// itself. See the call in [`apply_output_mode`].
-pub(crate) fn snap_refresh(
-    output_modes: &[OutputMode],
-    size: Size<i32, Physical>,
-    refresh_mhz: i32,
-) -> i32 {
-    output_modes
-        .iter()
-        .filter(|m| m.size == size)
-        .map(|m| m.refresh)
-        .min_by_key(|r| (r - refresh_mhz).abs())
-        .filter(|r| (r - refresh_mhz).abs() <= 500)
-        .unwrap_or(refresh_mhz)
-}
-
-/// Apply the display's real mode set (`Command::OutputModes`). Non-positive entries are
-/// dropped. Sticky; re-advertised by [`apply_output_mode`] on every caps re-negotiation.
-///
-/// With an Output already up, the set is re-advertised at once. If the current mode's
-/// refresh now has a closer real entry (the snap in [`apply_output_mode`]), the mode is
-/// re-applied so the current mode is one of the advertised ones; otherwise only the
-/// advertised list and the `wlr-output-management` heads are refreshed -- no damage-tracker
-/// rebuild, no configure to any toplevel.
-pub(crate) fn apply_output_modes(state: &mut State, modes: &[(i32, i32, i32)]) {
-    let mut requested: Vec<OutputMode> = Vec::new();
-    for &(w, h, refresh) in modes {
-        if w <= 0 || h <= 0 || refresh <= 0 {
-            continue;
-        }
-        let mode = OutputMode {
-            size: (w, h).into(),
-            refresh,
-        };
-        if !requested.contains(&mode) {
-            requested.push(mode);
-        }
-    }
-    if requested == state.output_modes && state.output.is_some() {
-        tracing::debug!("Output mode set unchanged; nothing to re-apply");
-        return;
-    }
-    state.output_modes = requested;
-
-    let Some(output) = state.output.clone() else {
-        // No output yet: `apply_video_info` will pick the stored set up.
-        return;
-    };
-    let Some(current) = output.current_mode() else {
-        return;
-    };
-    let snapped = snap_refresh(&state.output_modes, current.size, current.refresh);
-    if snapped != current.refresh {
-        apply_output_mode(state, current.size, snapped);
-        return;
-    }
-    let encode: Size<i32, Physical> = state
-        .video_info
-        .as_ref()
-        .map(|vi| (vi.width() as i32, vi.height() as i32).into())
-        .unwrap_or_else(|| effective_render_size(state));
-    advertise_mode_ladder(state, &output, current.refresh, encode);
-    let dh = state.dh.clone();
-    state.output_mgmt.publish(&dh, &output);
-}
-
-/// A client asked, through `wlr-output-management`, to be moved to `mode` (one of the
-/// advertised [`State::output_modes`]). Forwarded to the element; the compositor itself
-/// changes nothing until its owner re-negotiates the caps. Returns whether anyone was
-/// listening.
-pub(crate) fn request_mode(state: &State, mode: OutputMode) -> bool {
-    tracing::info!(
-        width = mode.size.w,
-        height = mode.size.h,
-        refresh_mhz = mode.refresh,
-        "Client requested an output mode"
-    );
-    match &state.mode_request_tx {
-        Some(tx) => tx
-            .send(Command::ModeRequest {
-                width: mode.size.w,
-                height: mode.size.h,
-                refresh_mhz: mode.refresh,
-            })
-            .is_ok(),
-        None => false,
-    }
-}
-
-/// How long a [`maybe_follow_client_size`] request stays "pending" -- guarding against a
-/// second request for the same size -- before it is assumed lost and tried again. Cleared
-/// earlier, on success, by [`apply_output_mode`].
-const FOLLOW_CLIENT_SIZE_PENDING_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// [`Command::FollowClientSize`]'s behaviour: when `state.follow_client_size` is set, treat
-/// a resize of the mapped, CURRENTLY-FULLSCREEN app-root toplevel's own committed buffer as
-/// an implicit mode request, for a nested guest display server that speaks no
-/// `wlr-output-management` at all but still resizes its own window when the user picks a
-/// resolution inside it -- the resize IS the request. Resolution only: the candidate mode is
-/// chosen by size, with its refresh picked nearest the CURRENT mode's, so refresh stays as
-/// close to unchanged as possible.
-///
-/// Called from the commit handler for `window` exactly when its root `wl_surface` is the one
-/// that just committed (see `wayland/handlers/compositor.rs`). With the flag off this is a
-/// complete no-op -- the very first check -- so behaviour is byte-for-byte identical to
-/// before this existed.
-///
-/// It is a FALLBACK only: while any client holds a live `zwlr_output_manager_v1`
-/// ([`OutputManagementState::has_bound_managers`]) it never requests, because such a guest
-/// asks for modes explicitly, and a buffer it commits mid-switch -- a stale one at the old
-/// size, say, after a failed reallocation -- would otherwise bounce the display straight
-/// back.
-///
-/// Guards, in order: the flag must be on and `output_modes` non-empty; the toplevel's current
-/// (acked) state must be fullscreen; the committed size is read post-viewport (the same
-/// `RendererSurfaceState::surface_size` `window_fullscreen_fit` compares against, which is
-/// already physical pixels after any `wp_viewport` destination); a size equal to the
-/// CURRENT mode is the echo of an already-applied move, never a new request; a size not
-/// among the advertised `output_modes` is never requested; and a size that already has a
-/// request outstanding (not yet cleared by `apply_output_mode` or the 3-second timeout) is
-/// not re-requested.
-pub(crate) fn maybe_follow_client_size(state: &mut State, window: &Window) {
-    if !state.follow_client_size || state.output_modes.is_empty() {
-        return;
-    }
-    let Some(output) = state.output.clone() else {
-        return;
-    };
-    let Some(current) = output.current_mode() else {
-        return;
-    };
-    let Some(toplevel) = window.toplevel() else {
-        return;
-    };
-
-    let is_fullscreen = with_states(toplevel.wl_surface(), |states| {
-        states
-            .data_map
-            .get::<XdgToplevelSurfaceData>()
-            .and_then(|attrs| attrs.lock().ok())
-            .map(|attrs| attrs.current.states.contains(XdgState::Fullscreen))
-            .unwrap_or(false)
-    });
-    if !is_fullscreen {
-        return;
-    }
-
-    let Some(surface_size) =
-        with_renderer_surface_state(toplevel.wl_surface(), |s| s.surface_size()).flatten()
-    else {
-        return;
-    };
-    // Post-viewport, physical pixels -- see `window_fullscreen_fit`'s identical read.
-    let committed: Size<i32, Physical> = (surface_size.w, surface_size.h).into();
-
-    if committed == current.size {
-        // The echo after the output was already moved -- never a new request.
-        return;
-    }
-
-    if let Some((pending_size, issued_at)) = state.pending_follow_request {
-        if issued_at.elapsed() < FOLLOW_CLIENT_SIZE_PENDING_TIMEOUT {
-            if pending_size == committed {
-                // Already outstanding for this size.
-                return;
-            }
-        } else {
-            state.pending_follow_request = None;
-        }
-    }
-
-    let Some(candidate) = state
-        .output_modes
-        .iter()
-        .filter(|m| m.size == committed)
-        .min_by_key(|m| (m.refresh - current.refresh).abs())
-        .copied()
-    else {
-        // Not one of the advertised modes.
-        return;
-    };
-
-    if state.output_mgmt.has_bound_managers() {
-        // A guest that speaks wlr-output-management asks for modes itself; a buffer it
-        // commits mid-switch (e.g. a stale one at the old size) is not a request.
-        tracing::debug!(
-            committed_width = committed.w,
-            committed_height = committed.h,
-            "follow-client-size: not following the client's resize, a wlr-output-management manager is bound"
-        );
-        return;
-    }
-
-    tracing::info!(
-        committed_width = committed.w,
-        committed_height = committed.h,
-        width = candidate.size.w,
-        height = candidate.size.h,
-        refresh_mhz = candidate.refresh,
-        "follow-client-size: following the client's resize as a mode request"
-    );
-    if request_mode(state, candidate) {
-        state.pending_follow_request = Some((committed, Instant::now()));
-    }
 }
 
 /// Send the initial configure to any toplevel still parked in `pending_windows` that has
@@ -1494,13 +1239,6 @@ fn advertise_mode_ladder(
         };
         if !desired.contains(&mode) {
             desired.push(mode);
-        }
-    }
-    // The display's real mode set rides along unfiltered: it is what the session may be
-    // moved to, so an entry larger than the current encode size is exactly the point.
-    for mode in &state.output_modes {
-        if !desired.contains(mode) {
-            desired.push(*mode);
         }
     }
 
@@ -1821,7 +1559,6 @@ pub(crate) fn init(
     devices_tx: Sender<Vec<CString>>,
     envs_tx: Sender<Vec<CString>>,
     hdr_state_tx: Sender<Command>,
-    mode_request_tx: Sender<Command>,
     app_surface_commits: Arc<AtomicU64>,
     renderer_degraded: Arc<AtomicU64>,
     vulkan_share: Arc<VulkanShare>,
@@ -1850,9 +1587,6 @@ pub(crate) fn init(
     if std::env::var("WOLF_HDR_CM").is_ok() {
         state.hdr_state_tx = Some(hdr_state_tx);
     }
-    // The mode-request reverse channel is always wired: a client applying an output
-    // configuration is an ordinary event, not a feature flag.
-    state.mode_request_tx = Some(mode_request_tx);
 
     // init event loop
     state
@@ -1876,14 +1610,6 @@ pub(crate) fn init(
                 Event::Msg(Command::ModeLadder(ladder)) => {
                     tracing::info!(?ladder, "Applying requested mode ladder");
                     apply_mode_ladder(state, &ladder);
-                }
-                Event::Msg(Command::OutputModes(modes)) => {
-                    tracing::info!(?modes, "Applying advertised output mode set");
-                    apply_output_modes(state, &modes);
-                }
-                Event::Msg(Command::FollowClientSize(enabled)) => {
-                    tracing::info!(enabled, "Setting follow-client-size");
-                    state.follow_client_size = enabled;
                 }
                 Event::Msg(Command::UiScale(scale)) => {
                     tracing::info!(scale, "Applying requested UI scale");
@@ -2175,7 +1901,7 @@ pub(crate) fn init(
                 }
                 // Reverse-direction signal: only ever sent compositor -> element over the
                 // dedicated `hdr_state_tx` channel, never received on this command channel.
-                Event::Msg(Command::HdrState { .. }) | Event::Msg(Command::ModeRequest { .. }) => {}
+                Event::Msg(Command::HdrState { .. }) => {}
             };
         })
         .unwrap();
