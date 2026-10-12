@@ -161,6 +161,15 @@ impl<T: Clone> MaybeRecv<T> {
     }
 }
 
+/// Spawn the compositor thread under its own kernel name (15 bytes at most), so a crash
+/// or a profile names it instead of whichever thread created the element.
+fn spawn_compositor(f: impl FnOnce() + Send + 'static) -> JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("wayland-display".into())
+        .spawn(f)
+        .expect("failed to spawn the compositor thread")
+}
+
 impl WaylandDisplay {
     pub fn new(render_node: Option<String>) -> Result<WaylandDisplay, CreateDrmNodeError> {
         let (channel_tx, channel_rx) = std::sync::mpsc::sync_channel(0);
@@ -182,7 +191,7 @@ impl WaylandDisplay {
             &render_node.unwrap_or_else(|| String::from("/dev/dri/renderD128")),
         )?;
 
-        let thread_handle = std::thread::spawn(move || {
+        let thread_handle = spawn_compositor(move || {
             if let Err(err) = std::panic::catch_unwind(|| {
                 // calloops channel is not "UnwindSafe", but the std channel is... *sigh* lets workaround it creatively
                 let (command_tx, command_src) = smithay::reexports::calloop::channel::channel();
@@ -238,7 +247,7 @@ impl WaylandDisplay {
             &render_node.unwrap_or_else(|| String::from("/dev/dri/renderD128")),
         )?;
 
-        let thread_handle = std::thread::spawn(move || {
+        let thread_handle = spawn_compositor(move || {
             comp::init(
                 commands_rx,
                 render_target,
