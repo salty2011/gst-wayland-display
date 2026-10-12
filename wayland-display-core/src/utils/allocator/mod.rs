@@ -8,8 +8,10 @@ use crate::utils::device::PCIVendor;
 use crate::utils::device::gpu::GPUDevice;
 use crate::utils::vulkan_nv12::{PixFmt, VulkanNv12};
 use gst::Buffer as GstBuffer;
+use gst::prelude::ObjectExt as _;
 use gst_video::{VideoFormat, VideoInfo, VideoInfoDmaDrm, VideoMeta};
 use gstreamer_allocators::{DmaBufAllocator, DmaBufAllocatorExtManual};
+use gstreamer_vulkan::prelude::VulkanDeviceExt as _;
 use smithay::backend::allocator::dmabuf::{Dmabuf, DmabufAllocator};
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::{Allocator, Buffer, Fourcc};
@@ -599,6 +601,9 @@ impl GsNv12Buf {
     }
 }
 
+/// GObject data key under which a `GstVulkanInstance` holds the compositor's EGL display.
+const EGL_DISPLAY_KEEPALIVE: &str = "wayland-display-egl-display";
+
 /// NV12 output as `memory:VulkanImage` on the downstream encoder's shared `GstVulkanDevice`
 /// (the Vulkan-encode/interpipe path). Renders the scene into an RGBA dmabuf like
 /// [`GsNv12Buf`], but the Vulkan converter writes into the encoder's own encode-src image
@@ -656,6 +661,19 @@ impl GsVulkanBuf {
         // This element's shared device must already have been absorbed from a GstContext
         // (8th gwd patch: read THIS element's per-element share, not a process-global slot).
         let dev = vulkan_share.shared_device()?;
+        // The EGL display must outlive the Vulkan instance (quasar #570). NVIDIA's Vulkan driver
+        // keeps an EGL context of its own on this same per-device display and destroys it when
+        // the process's last instance goes, which is after this compositor is gone; smithay
+        // terminates the display with its last handle, and the driver's eglDestroyContext then
+        // fails EGL_NOT_INITIALIZED. A handle parked on the instance is dropped at its finalize.
+        if let Some(instance) = dev.instance() {
+            unsafe {
+                instance.set_data(
+                    EGL_DISPLAY_KEEPALIVE,
+                    renderer.egl_context().display().clone(),
+                )
+            };
+        }
         let raw = crate::utils::vulkan_share::raw_handles(&dev)?;
         // NV12 (8-bit, vulkanh264enc) or P010 (10-bit, vulkanh265enc Main-10) per the
         // negotiated memory:VulkanImage format.
