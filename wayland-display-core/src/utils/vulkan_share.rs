@@ -28,6 +28,7 @@ use gst::prelude::*;
 use gstreamer_vulkan::prelude::*;
 use gstreamer_vulkan::{VulkanDevice, VulkanInstance, VulkanPhysicalDevice, VulkanQueue};
 use gstreamer_vulkan_sys as gstvk;
+use std::ffi::{CStr, c_void};
 use std::sync::{Arc, Mutex, OnceLock};
 
 /// Devices that have already logged the encode-src readable-flags fallback.
@@ -372,6 +373,40 @@ impl VulkanShare {
         *self.device.lock().unwrap() = None;
         *self.instance.lock().unwrap() = None;
     }
+}
+
+/// Build the `ash` function table for `device`. Every `ash::Device` in this crate comes from
+/// here, never from `ash::Device::load` or `ash::Instance::create_device`.
+///
+/// Those two ask the loader for `vkGetDeviceQueue2`, and Vulkan-Loader before 1.4.345 answers
+/// that one name by walking every instance in the process under a lock that instance creation
+/// does not take. A `vkEnumeratePhysicalDevices` on another thread frees the record of each
+/// driver without a physical device mid-walk, and the lookup reads it: SIGSEGV in
+/// `loader_get_icd_and_device` (quasar #267). Nothing here calls `get_device_queue2`, so its
+/// slot keeps ash's panicking stub. Go back to `ash::Device::load` once no supported loader
+/// is older than 1.4.345.
+pub(crate) unsafe fn load_device(instance: &ash::Instance, device: vk::Device) -> ash::Device {
+    let get_device_proc_addr = instance.fp_v1_0().get_device_proc_addr;
+    load_device_with(
+        |name| std::mem::transmute(get_device_proc_addr(device, name.as_ptr())),
+        device,
+    )
+}
+
+unsafe fn load_device_with(
+    mut lookup: impl FnMut(&CStr) -> *const c_void,
+    device: vk::Device,
+) -> ash::Device {
+    ash::Device::load_with(
+        |name| {
+            if name == c"vkGetDeviceQueue2" {
+                std::ptr::null()
+            } else {
+                lookup(name)
+            }
+        },
+        device,
+    )
 }
 
 /// Extract the raw `VkInstance`/`VkPhysicalDevice`/`VkDevice` + a graphics-capable queue
@@ -828,6 +863,101 @@ pub fn recover_vk_image(buffer: &gst::Buffer) -> Option<vk::Image> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The table is built without asking for `vkGetDeviceQueue2` (see `load_device`). Needs
+    /// no Vulkan: the lookup is a recorder and every slot gets ash's stub.
+    #[test]
+    fn device_table_is_built_without_looking_up_get_device_queue2() {
+        let mut asked = Vec::new();
+        let _table = unsafe {
+            load_device_with(
+                |name| {
+                    asked.push(name.to_owned());
+                    std::ptr::null()
+                },
+                vk::Device::null(),
+            )
+        };
+        let asked_for = |name: &CStr| asked.iter().any(|n| n.as_c_str() == name);
+        // Its 1.0 sibling proves this is the device name list, not an empty one.
+        assert!(asked_for(c"vkGetDeviceQueue"));
+        assert!(asked_for(c"vkCreateSampler"));
+        assert!(!asked_for(c"vkGetDeviceQueue2"));
+    }
+
+    /// The quasar #267 race on a real loader: one thread builds device tables while another
+    /// creates instances and enumerates their devices. On Vulkan-Loader 1.4.341 with a driver
+    /// that has no device installed, the same loop over `ash::Device::load` dies of SIGSEGV
+    /// within seconds; this one must not. Skips where no Vulkan device exists (no loader, or
+    /// no software driver such as lavapipe).
+    #[test]
+    fn device_table_survives_instance_churn_on_another_thread() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        const RUN_FOR: std::time::Duration = std::time::Duration::from_secs(1);
+
+        unsafe {
+            let Ok(entry) = ash::Entry::load() else {
+                eprintln!("skipped: no Vulkan loader");
+                return;
+            };
+            let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
+            let info = vk::InstanceCreateInfo::default().application_info(&app);
+            let Ok(instance) = entry.create_instance(&info, None) else {
+                eprintln!("skipped: no Vulkan instance");
+                return;
+            };
+            let Some(physical) = instance
+                .enumerate_physical_devices()
+                .ok()
+                .and_then(|d| d.first().copied())
+            else {
+                eprintln!("skipped: no Vulkan physical device");
+                instance.destroy_instance(None);
+                return;
+            };
+            let priorities = [1.0f32];
+            let queues = [vk::DeviceQueueCreateInfo::default().queue_priorities(&priorities)];
+            let mut device = vk::Device::null();
+            (instance.fp_v1_0().create_device)(
+                physical,
+                &vk::DeviceCreateInfo::default().queue_create_infos(&queues),
+                std::ptr::null(),
+                &mut device,
+            )
+            .result()
+            .expect("create a device on the first physical device");
+
+            let stop = AtomicBool::new(false);
+            let (tables, instances) = std::thread::scope(|s| {
+                let churn = s.spawn(|| {
+                    let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
+                    let info = vk::InstanceCreateInfo::default().application_info(&app);
+                    let mut made = 0u32;
+                    while !stop.load(Ordering::Relaxed) {
+                        if let Ok(other) = entry.create_instance(&info, None) {
+                            let _ = other.enumerate_physical_devices();
+                            other.destroy_instance(None);
+                            made += 1;
+                        }
+                    }
+                    made
+                });
+                let started = std::time::Instant::now();
+                let mut tables = 0u32;
+                while started.elapsed() < RUN_FOR {
+                    let table = load_device(&instance, device);
+                    assert_ne!(table.handle(), vk::Device::null());
+                    tables += 1;
+                }
+                stop.store(true, Ordering::Relaxed);
+                (tables, churn.join().unwrap())
+            });
+            assert!(tables > 0 && instances > 0);
+
+            load_device(&instance, device).destroy_device(None);
+            instance.destroy_instance(None);
+        }
+    }
 
     /// Per-element ownership, GPU-free half of spec §4 rung 1: two `VulkanShare`s are
     /// independent objects (distinct backing storage), each starts with no device, and

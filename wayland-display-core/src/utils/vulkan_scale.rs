@@ -189,7 +189,7 @@ impl VulkanScaler {
     ) -> Result<Self, Err> {
         let entry = ash::Entry::load()?;
         let instance = ash::Instance::load(entry.static_fn(), raw.instance);
-        let device = ash::Device::load(instance.fp_v1_0(), raw.device);
+        let device = super::vulkan_share::load_device(&instance, raw.device);
         let memp = instance.get_physical_device_memory_properties(raw.physical);
 
         // Two sampled sources (Y, UV) + two storage destinations (Y, UV).
