@@ -885,6 +885,44 @@ mod tests {
         assert!(!asked_for(c"vkGetDeviceQueue2"));
     }
 
+    /// Guards the rule in `load_device`'s doc: a direct `ash::Device::load` or
+    /// `Instance::create_device` anywhere in the workspace brings quasar #267 back.
+    #[test]
+    fn every_device_table_comes_from_load_device() {
+        // Split, or this file would match itself.
+        let banned = [concat!("Device::", "load("), concat!(".create_", "device(")];
+        let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let mut dirs = vec![workspace.to_path_buf()];
+        let (mut scanned, mut hits) = (0, Vec::new());
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if !["target", ".git"].contains(&entry.file_name().to_str().unwrap_or("")) {
+                        dirs.push(path);
+                    }
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    scanned += 1;
+                    let source = std::fs::read_to_string(&path).unwrap();
+                    for (n, line) in source.lines().enumerate() {
+                        let code = line.split("//").next().unwrap();
+                        if banned.iter().any(|b| code.contains(b)) {
+                            hits.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(scanned > 20, "only {scanned} source files scanned");
+        assert!(
+            hits.is_empty(),
+            "build the device table with vulkan_share::load_device:\n{}",
+            hits.join("\n")
+        );
+    }
+
     /// The quasar #267 race on a real loader: one thread builds device tables while another
     /// creates instances and enumerates their devices. On Vulkan-Loader 1.4.341 with a driver
     /// that has no device installed, the same loop over `ash::Device::load` dies of SIGSEGV
