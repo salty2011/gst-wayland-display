@@ -132,6 +132,8 @@ pub struct Settings {
     /// Extra `wl_output` modes to advertise, so an in-app resolution menu has a list to
     /// offer. Empty = none (the historical behaviour). See `forward_display_geometry`.
     mode_ladder: Vec<(i32, i32)>,
+    /// Show the fixed test picture while no client surface is mapped. Default off.
+    test_picture: bool,
     #[cfg(feature = "cuda")]
     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
     #[cfg(feature = "cuda")]
@@ -461,6 +463,16 @@ impl ObjectImpl for WaylandDisplaySrc {
                     )
                     .default_value(Some(""))
                     .build(),
+                glib::ParamSpecBoolean::builder("test-picture")
+                    .nick("Test picture")
+                    .blurb(
+                        "Show a fixed 16x9 grid of four colours while no client surface is \
+                         mapped, instead of the black clear colour, so a consumer that \
+                         decodes its own encode can tell moved pixels from intact ones. A \
+                         mapped client surface always replaces it. Live-writable. Default off.",
+                    )
+                    .default_value(false)
+                    .build(),
                 glib::ParamSpecUInt64::builder("app-surface-commits")
                     .nick("Application surface buffer commits")
                     .blurb(
@@ -617,6 +629,13 @@ impl ObjectImpl for WaylandDisplaySrc {
                     state.display.set_ui_scale(scale);
                 }
             }
+            "test-picture" => {
+                let on = value.get::<bool>().expect("Type checked upstream");
+                self.settings.lock().unwrap().test_picture = on;
+                if let Some(state) = self.state.lock().unwrap().as_ref() {
+                    state.display.set_test_picture(on);
+                }
+            }
             "mode-ladder" => {
                 let raw = value
                     .get::<Option<String>>()
@@ -704,6 +723,7 @@ impl ObjectImpl for WaylandDisplaySrc {
                 let settings = self.settings.lock().unwrap();
                 settings.ui_scale.unwrap_or(1.0).to_value()
             }
+            "test-picture" => self.settings.lock().unwrap().test_picture.to_value(),
             "mode-ladder" => {
                 let settings = self.settings.lock().unwrap();
                 settings
@@ -999,15 +1019,19 @@ impl WaylandDisplaySrc {
     /// applies the mode exactly once per negotiation. A partial pair (only one dimension
     /// set) is deliberately not forwarded; see `set_property`.
     fn forward_display_geometry(&self) {
-        let (width, height, ui_scale, mode_ladder) = {
+        let (width, height, ui_scale, mode_ladder, test_picture) = {
             let settings = self.settings.lock().unwrap();
             (
                 settings.render_width,
                 settings.render_height,
                 settings.ui_scale,
                 settings.mode_ladder.clone(),
+                settings.test_picture,
             )
         };
+        if test_picture {
+            let _ = self.command_tx.send(Command::TestPicture(true));
+        }
         if width > 0 && height > 0 {
             let _ = self.command_tx.send(Command::RenderSize { width, height });
         }

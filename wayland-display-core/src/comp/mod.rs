@@ -85,6 +85,7 @@ use tracing::debug;
 mod focus;
 mod input;
 mod rendering;
+mod test_picture;
 
 pub use self::focus::*;
 pub use self::input::*;
@@ -231,6 +232,8 @@ pub struct State {
     /// Shared lifetime counter exported by waylanddisplaysrc. Only mapped
     /// top-level application buffer commits increment it.
     pub(crate) app_surface_commits: Arc<AtomicU64>,
+    /// The `test-picture` property: draw `test_picture` while no client surface is mapped.
+    pub(crate) test_picture: bool,
     /// This element's Vulkan-encode device share (8th gwd patch). A clone of the gst element's
     /// own `Arc<VulkanShare>`, so the compositor thread reads the SAME per-element device the
     /// element mints — not a process-global singleton. Read in `apply_video_info` when building
@@ -543,6 +546,7 @@ impl State {
             hdr_state_tx: None,
             last_hdr_state: false,
             app_surface_commits: Arc::new(AtomicU64::new(0)),
+            test_picture: false,
             vulkan_share: VulkanShare::new(),
             hdr_candidate_since: None,
         }
@@ -1614,6 +1618,9 @@ pub(crate) fn init(
                 Event::Msg(Command::UiScale(scale)) => {
                     tracing::info!(scale, "Applying requested UI scale");
                     apply_ui_scale(state, scale);
+                }
+                Event::Msg(Command::TestPicture(on)) => {
+                    state.test_picture = on;
                 }
                 Event::Msg(Command::InputDevice(path)) => {
                     tracing::info!(path, "Adding input device.");

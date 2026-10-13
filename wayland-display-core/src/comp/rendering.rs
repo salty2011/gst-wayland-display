@@ -1,6 +1,8 @@
 use std::time::{Duration, Instant};
 
-use super::{State, effective_render_size, fit_offset_physical, window_fullscreen_fit};
+use super::{
+    State, effective_render_size, fit_offset_physical, test_picture, window_fullscreen_fit,
+};
 use crate::utils::allocator::GsBuffer;
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::renderer::gles::{GlesError, GlesRenderer, GlesTarget};
@@ -427,6 +429,22 @@ impl State {
                     ))
                 }),
         );
+
+        // Bottom-most and in encode space: the test picture, only while no client surface is
+        // mapped, so a real session never shows it.
+        if self.test_picture && self.space.elements().next().is_none() {
+            elements.extend(test_picture::cells(encode_size.w, encode_size.h).map(
+                |(geo, [r, g, b])| {
+                    FrameElements::Overlay(CursorElement::Solid(SolidColorRenderElement::new(
+                        Id::new(),
+                        geo,
+                        CommitCounter::default(),
+                        Color32F::new(r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0),
+                        Kind::Unspecified,
+                    )))
+                },
+            ));
+        }
 
         let mut output_buffer = self.output_buffer.clone().expect("Output buffer not set");
 
