@@ -3,9 +3,14 @@ use smithay::backend::drm::{DrmNode, NodeType};
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
 use smithay::backend::renderer::gles::GlesRenderer;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 
-static EGL_DISPLAYS: Lazy<Mutex<HashMap<Option<DrmNode>, Weak<EGLDisplay>>>> =
+/// One EGL display per render node, never dropped (quasar #570). smithay terminates a
+/// display with its last handle. NVIDIA's Vulkan driver keeps an EGL context of its own on
+/// the same per-device display and destroys it with the process's last Vulkan instance,
+/// which fails EGL_NOT_INITIALIZED on a display terminated first. Holding the handle for the
+/// life of the process does not depend on which is torn down last.
+static EGL_DISPLAYS: Lazy<Mutex<HashMap<Option<DrmNode>, Arc<EGLDisplay>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 pub fn get_egl_device_for_node(drm_node: &DrmNode) -> EGLDevice {
@@ -21,12 +26,8 @@ pub fn get_egl_device_for_node(drm_node: &DrmNode) -> EGLDevice {
 
 pub fn setup_renderer(render_node: Option<DrmNode>) -> GlesRenderer {
     let mut displays = EGL_DISPLAYS.lock().unwrap();
-    let maybe_display = displays
-        .get(&render_node)
-        .and_then(|weak_display| weak_display.upgrade());
-
-    let egl = match maybe_display {
-        Some(display) => display,
+    let egl = match displays.get(&render_node) {
+        Some(display) => display.clone(),
         None => {
             let device = match render_node.as_ref() {
                 Some(render_node) => get_egl_device_for_node(render_node),
@@ -42,7 +43,7 @@ pub fn setup_renderer(render_node: Option<DrmNode>) -> GlesRenderer {
             };
             let egl = unsafe { EGLDisplay::new(device).expect("Failed to create EGLDisplay") };
             let display = Arc::new(egl);
-            displays.insert(render_node, Arc::downgrade(&display));
+            displays.insert(render_node, display.clone());
             display
         }
     };
@@ -52,4 +53,27 @@ pub fn setup_renderer(render_node: Option<DrmNode>) -> GlesRenderer {
     let context = EGLContext::new(&egl).expect("Failed to initialize EGL context");
 
     unsafe { GlesRenderer::new(context) }.expect("Failed to initialize renderer")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smithay::backend::egl::ffi;
+
+    /// A display terminated with its last renderer answers no query; a held one does.
+    #[test]
+    fn the_egl_display_outlives_its_last_renderer() {
+        let renderer = setup_renderer(None);
+        let handle = renderer.egl_context().display().get_display_handle().handle;
+        drop(renderer);
+
+        let vendor = unsafe { ffi::egl::QueryString(handle, ffi::egl::VENDOR as i32) };
+        assert!(!vendor.is_null(), "the display was terminated");
+
+        let again = setup_renderer(None);
+        assert_eq!(
+            again.egl_context().display().get_display_handle().handle,
+            handle
+        );
+    }
 }
