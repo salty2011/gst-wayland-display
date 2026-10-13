@@ -667,12 +667,12 @@ impl GsVulkanBuf {
         // terminates the display with its last handle, and the driver's eglDestroyContext then
         // fails EGL_NOT_INITIALIZED. A handle parked on the instance is dropped at its finalize.
         if let Some(instance) = dev.instance() {
-            unsafe {
-                instance.set_data(
-                    EGL_DISPLAY_KEEPALIVE,
-                    renderer.egl_context().display().clone(),
-                )
-            };
+            // Dropped on whichever thread finalizes the instance, so it must be `Send`.
+            fn assert_send<T: Send>(value: T) -> T {
+                value
+            }
+            let display = assert_send(renderer.egl_context().display().clone());
+            unsafe { instance.set_data(EGL_DISPLAY_KEEPALIVE, display) };
         }
         let raw = crate::utils::vulkan_share::raw_handles(&dev)?;
         // NV12 (8-bit, vulkanh264enc) or P010 (10-bit, vulkanh265enc Main-10) per the
