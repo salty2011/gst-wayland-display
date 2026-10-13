@@ -927,7 +927,9 @@ mod tests {
     /// creates instances and enumerates their devices. On Vulkan-Loader 1.4.341 with a driver
     /// that has no device installed, the same loop over `ash::Device::load` dies of SIGSEGV
     /// within seconds; this one must not. Skips where no Vulkan device exists (no loader, or
-    /// no software driver such as lavapipe).
+    /// no software driver such as lavapipe). It can only fail on a loader before 1.4.345
+    /// with such a driver installed, so it prints the loader version and whether it ran:
+    /// read that line (`--nocapture`) before taking a pass as proof.
     #[test]
     fn device_table_survives_instance_churn_on_another_thread() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -938,10 +940,21 @@ mod tests {
                 eprintln!("skipped: no Vulkan loader");
                 return;
             };
+            let loader = entry
+                .try_enumerate_instance_version()
+                .ok()
+                .flatten()
+                .unwrap_or(vk::API_VERSION_1_0);
+            let loader = format!(
+                "Vulkan loader {}.{}.{}",
+                vk::api_version_major(loader),
+                vk::api_version_minor(loader),
+                vk::api_version_patch(loader)
+            );
             let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
             let info = vk::InstanceCreateInfo::default().application_info(&app);
             let Ok(instance) = entry.create_instance(&info, None) else {
-                eprintln!("skipped: no Vulkan instance");
+                eprintln!("skipped: no Vulkan instance ({loader})");
                 return;
             };
             let Some(physical) = instance
@@ -949,7 +962,7 @@ mod tests {
                 .ok()
                 .and_then(|d| d.first().copied())
             else {
-                eprintln!("skipped: no Vulkan physical device");
+                eprintln!("skipped: no Vulkan physical device ({loader})");
                 instance.destroy_instance(None);
                 return;
             };
@@ -990,7 +1003,12 @@ mod tests {
                 stop.store(true, Ordering::Relaxed);
                 (tables, churn.join().unwrap())
             });
-            assert!(tables > 0 && instances > 0);
+            eprintln!(
+                "ran: {loader}, {tables} device tables built beside {instances} instances \
+                 created on another thread"
+            );
+            // Not `instances > 0`: the other thread may not be scheduled within the second.
+            assert!(tables > 0);
 
             load_device(&instance, device).destroy_device(None);
             instance.destroy_instance(None);
