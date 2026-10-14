@@ -1257,6 +1257,83 @@ mod tests {
         assert_eq!(buf_meta.n_planes(), 1);
     }
 
+    /// Clears the whole RGBA target to `color` and waits for the GPU.
+    fn clear_target(
+        renderer: &mut GlesRenderer,
+        rgba: &mut Dmabuf,
+        w: i32,
+        h: i32,
+        color: [f32; 4],
+    ) {
+        let mut framebuffer = renderer.bind(rgba).expect("Failed to bind dmabuf");
+        let mut frame = renderer
+            .render(&mut framebuffer, (w, h).into(), Transform::Normal)
+            .expect("Failed to create render frame");
+        frame
+            .clear(color.into(), &[Rectangle::from_size((w, h).into())])
+            .expect("Render error");
+        frame
+            .finish()
+            .expect("Failed to finish render frame")
+            .wait()
+            .expect("Synchronization error");
+    }
+
+    /// quasar #617: the converter never uses an RGBA import that reads 0 at every texel, and
+    /// without overlapping conversions one import serves the whole ring.
+    #[test]
+    #[ignore = "needs a GPU with Vulkan dmabuf import; run via ci/harness.sh gpu"]
+    fn nv12_converter_refuses_an_import_that_reads_nothing() {
+        test_init();
+
+        let Some(render_node) = pick_render_node(&["nvidia", "amdgpu", "i915", "xe"]) else {
+            skip!("no GPU render node");
+        };
+        let Some(&modifier) =
+            crate::utils::vulkan_nv12::supported_nv12_modifiers(Some(render_node.minor())).first()
+        else {
+            skip!("no NV12 export modifier on this GPU");
+        };
+        let (w, h) = (64, 64);
+        let drm_format = if modifier == 0 {
+            "NV12".to_string()
+        } else {
+            format!("NV12:{modifier:#018x}")
+        };
+        let caps = gst_video::VideoCapsBuilder::new()
+            .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
+            .format(VideoFormat::DmaDrm)
+            .field("drm-format", drm_format.as_str())
+            .width(w)
+            .height(h)
+            .pixel_aspect_ratio(1.into())
+            .framerate(gst::Fraction::new(30, 1))
+            .build();
+        let info = VideoInfoDmaDrm::from_caps(&caps).expect("Failed to create video info");
+        let mut renderer = setup_renderer(Some(render_node));
+        let Some(mut nv12) = GsNv12Buf::new(&mut renderer, render_node, info, PixFmt::Nv12) else {
+            skip!("no NV12 converter for {drm_format} on this GPU");
+        };
+
+        clear_target(&mut renderer, &mut nv12.rgba, w, h, [0.0; 4]);
+        let err = nv12
+            .vulkan
+            .lock()
+            .unwrap()
+            .convert(&nv12.rgba, false)
+            .expect_err("an import reading 0 at every texel was used");
+        assert!(err.to_string().contains("quasar #617"), "{err}");
+
+        clear_target(&mut renderer, &mut nv12.rgba, w, h, [0.0, 0.0, 0.0, 1.0]);
+        let mut converter = nv12.vulkan.lock().unwrap();
+        converter
+            .convert(&nv12.rgba, false)
+            .expect("an opaque target converts");
+        // The failed conversion took slot 0, so this one ran on slot 1.
+        let (held, overlap) = converter.held_imports();
+        assert_eq!(held, if overlap { vec![1] } else { vec![0] });
+    }
+
     /// Free-slot search: round robin from `next`, skipping held slots, `None` when all held.
     #[test]
     fn pick_aged_slot_prefers_the_oldest_release_past_the_holdback() {

@@ -1094,8 +1094,8 @@ impl VulkanNv12 {
 
     unsafe fn convert_inner(&mut self, rgba: &Dmabuf, pq_passthrough: bool) -> Result<(), Err> {
         // Cache key: the source dmabuf's primary fd. The compositor renders into a single
-        // stable RGBA buffer, so this is constant across frames and each slot's import is
-        // built only once.
+        // stable RGBA buffer, so this is constant across frames and an import is built once
+        // per holder (`import_slot`).
         let key_fd = rgba.handles().next().ok_or("no fd")?.as_fd().as_raw_fd();
 
         // pick the next export ring slot and reclaim its previous (RING-frames-old) work
@@ -1169,15 +1169,16 @@ impl VulkanNv12 {
             }
         }
 
-        // Ensure the cached RGBA import matches the current dmabuf. Its holder is idle here
-        // (this slot's fence was waited above, and without overlap every earlier conversion
-        // has finished), so freeing/recreating is safe. The compositor finished rendering
-        // this frame before `convert`, so a fresh import is read back on real output.
+        // Ensure the cached RGBA import matches the current dmabuf. Its holder is idle here, so
+        // freeing/recreating is safe: with overlap it is this slot, whose fence was waited
+        // above; without overlap every conversion waits its fence before `convert` returns.
+        // The compositor finished rendering this frame before `convert`, so a fresh import is
+        // read back on real output.
         let held = self.import_slot(idx);
         let stale = !matches!(&self.outputs[held].import, Some((fd, _)) if *fd == key_fd);
         if stale {
             self.free_import(held);
-            let import = self.create_checked_import(rgba)?;
+            let import = self.create_checked_import(held, rgba)?;
             self.outputs[held].import = Some((key_fd, import));
         }
         let (import_img, _import_mem, view) = self.outputs[held].import.as_ref().unwrap().1;
@@ -1202,7 +1203,8 @@ impl VulkanNv12 {
 
         // Bind this slot's source (binding 0) to the cached import view. Bindings 1,2 (the
         // compute output planes) were written once at slot creation and are constant. Safe
-        // to update now: this slot's previous submit is complete (waited above).
+        // to update now: this slot's previous submit is complete (waited above with overlap,
+        // at the end of its own `convert` without).
         let src_info = [vk::DescriptorImageInfo::default()
             .sampler(self.sampler)
             .image_view(view)
@@ -1583,6 +1585,15 @@ impl VulkanNv12 {
         Ok(())
     }
 
+    /// The slots that hold an import, and whether conversions overlap.
+    #[cfg(test)]
+    pub(crate) fn held_imports(&self) -> (Vec<usize>, bool) {
+        let held = (0..self.outputs.len())
+            .filter(|&i| self.outputs[i].import.is_some())
+            .collect();
+        (held, self.implicit_sync)
+    }
+
     /// The slot whose cached import slot `idx` samples. Overlapping conversions (implicit
     /// sync) need one per slot, so each frame's layout transition of the import stays behind
     /// that slot's fence. Otherwise every conversion finishes before the next starts and all
@@ -1592,48 +1603,80 @@ impl VulkanNv12 {
         if self.implicit_sync { idx } else { 0 }
     }
 
-    /// `create_import`, read back before use. NVIDIA can fail an import's GPU mapping and
-    /// still return VK_SUCCESS; that image reads 0 at every texel (quasar #617). The
-    /// compositor clears its output to opaque black every frame, so a sound import never does.
-    unsafe fn create_checked_import(&self, rgba: &Dmabuf) -> Result<Import, Err> {
+    /// `create_import`, read back before use where the modifier can be a copy source. NVIDIA
+    /// can fail an import's GPU mapping and still return VK_SUCCESS; that image reads 0 at
+    /// every texel (quasar #617). The compositor renders with buffer age 0, so every pixel no
+    /// opaque element covers is its opaque black clear: a sound import has a non-zero byte.
+    unsafe fn create_checked_import(&self, held: usize, rgba: &Dmabuf) -> Result<Import, Err> {
         let format = rgba_vk_format(rgba.format().code).ok_or("unsupported RGBA fourcc")?;
         let modifier: u64 = rgba.format().modifier.into();
-        let checkable = self.import_copyable(format, modifier);
-        if !checkable {
-            tracing::debug!(
-                "VulkanNv12: modifier {modifier:#x} cannot be a copy source; import not read back"
-            );
-        }
+        let checkable = std::cell::Cell::new(self.import_copyable(format, modifier));
         let attempt = std::cell::Cell::new(0);
         first_sound(
             IMPORT_TRIES,
             || {
                 attempt.set(attempt.get() + 1);
-                self.create_import(rgba, checkable)
+                if checkable.get() {
+                    match self.create_import(rgba, true) {
+                        Ok(import) => return Ok(import),
+                        // The format query said yes but the driver refused the usage: a
+                        // refused flag must never fail a launch, so import as before, unchecked.
+                        Err(e) => {
+                            tracing::warn!(
+                                token = "vulkan-import-copy-source-refused",
+                                slot = held,
+                                modifier = format!("{modifier:#x}"),
+                                "VulkanNv12: RGBA import with read-back refused ({e}); importing it unchecked"
+                            );
+                            checkable.set(false);
+                        }
+                    }
+                }
+                self.create_import(rgba, false)
             },
             |import| {
-                if !checkable {
-                    return None;
-                }
-                match self.probe_import(import.0, format) {
-                    Ok(bytes) if bytes.iter().all(|&b| b == 0) => {
-                        tracing::warn!(
-                            token = "vulkan-import-reads-nothing",
-                            attempt = attempt.get(),
-                            tries = IMPORT_TRIES,
-                            "VulkanNv12: RGBA import reads 0 at every probed texel (driver failed its mapping, quasar #617); importing again"
-                        );
-                        Some(false)
+                let sound = if checkable.get() {
+                    match self.probe_import(import.0, format) {
+                        Ok(bytes) => Some(bytes.iter().any(|&b| b != 0)),
+                        Err(e) => {
+                            tracing::warn!(
+                                token = "vulkan-import-probe-failed",
+                                slot = held,
+                                "VulkanNv12: RGBA import read-back failed: {e}"
+                            );
+                            None
+                        }
                     }
-                    Ok(_) => Some(true),
-                    Err(e) => {
-                        tracing::warn!(
-                            token = "vulkan-import-probe-failed",
-                            "VulkanNv12: RGBA import read-back failed: {e}"
-                        );
-                        None
-                    }
+                } else {
+                    None
+                };
+                tracing::info!(
+                    token = "vulkan-import-checked",
+                    slot = held,
+                    checkable = checkable.get(),
+                    attempt = attempt.get(),
+                    verdict = match sound {
+                        Some(true) => "sound",
+                        Some(false) => "zero",
+                        None => "unjudged",
+                    },
+                    "VulkanNv12: RGBA import"
+                );
+                if sound == Some(false) {
+                    tracing::warn!(
+                        token = "vulkan-import-reads-nothing",
+                        slot = held,
+                        attempt = attempt.get(),
+                        tries = IMPORT_TRIES,
+                        "VulkanNv12: RGBA import reads 0 at every probed texel, the driver failed its mapping (quasar #617); {}",
+                        if attempt.get() >= IMPORT_TRIES {
+                            "giving up"
+                        } else {
+                            "importing again"
+                        }
+                    );
                 }
+                sound
             },
             |import| self.destroy_import(import),
         )
@@ -1825,54 +1868,68 @@ impl VulkanNv12 {
             .plane_layouts(&plane_layout);
         let mut extmem = vk::ExternalMemoryImageCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-        let img = self.device.create_image(
-            &vk::ImageCreateInfo::default()
-                .image_type(vk::ImageType::TYPE_2D)
-                .format(pd_format)
-                .extent(vk::Extent3D {
-                    width: self.width,
-                    height: self.height,
-                    depth: 1,
-                })
-                .mip_levels(1)
-                .array_layers(1)
-                .samples(vk::SampleCountFlags::TYPE_1)
-                .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
-                .usage(if copy_source {
-                    vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC
-                } else {
-                    vk::ImageUsageFlags::SAMPLED
-                })
-                .initial_layout(vk::ImageLayout::UNDEFINED)
-                .push_next(&mut extmem)
-                .push_next(&mut explicit),
-            None,
-        )?;
-        let mr = self.device.get_image_memory_requirements(img);
-        let ext_fd = ash::khr::external_memory_fd::Device::new(&self.instance, &self.device);
-        let mut fd_props = vk::MemoryFdPropertiesKHR::default();
-        ext_fd.get_memory_fd_properties(
-            vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
-            src_fd,
-            &mut fd_props,
-        )?;
-        let allowed = mr.memory_type_bits & fd_props.memory_type_bits;
-        let mt = (0..self.memp.memory_type_count)
-            .find(|&i| allowed & (1 << i) != 0)
-            .ok_or("no import-compatible memory type")?;
-        let mut import_info = vk::ImportMemoryFdInfoKHR::default()
-            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-            .fd(src_fd);
-        let mem = self.device.allocate_memory(
-            &vk::MemoryAllocateInfo::default()
-                .allocation_size(mr.size)
-                .memory_type_index(mt)
-                .push_next(&mut import_info),
-            None,
-        )?;
-        self.device.bind_image_memory(img, mem, 0)?;
-        let view = plane_view(&self.device, img, pd_format, vk::ImageAspectFlags::COLOR)?;
-        Ok((img, mem, view))
+        // On any failure below, release what was made: the image, the memory, and the fd until
+        // a successful import takes it.
+        let (mut img, mut mem, mut fd_taken) = (vk::Image::null(), vk::DeviceMemory::null(), false);
+        let result = (|| -> Result<Import, Err> {
+            img = self.device.create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(pd_format)
+                    .extent(vk::Extent3D {
+                        width: self.width,
+                        height: self.height,
+                        depth: 1,
+                    })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT)
+                    .usage(if copy_source {
+                        vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC
+                    } else {
+                        vk::ImageUsageFlags::SAMPLED
+                    })
+                    .initial_layout(vk::ImageLayout::UNDEFINED)
+                    .push_next(&mut extmem)
+                    .push_next(&mut explicit),
+                None,
+            )?;
+            let mr = self.device.get_image_memory_requirements(img);
+            let ext_fd = ash::khr::external_memory_fd::Device::new(&self.instance, &self.device);
+            let mut fd_props = vk::MemoryFdPropertiesKHR::default();
+            ext_fd.get_memory_fd_properties(
+                vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                src_fd,
+                &mut fd_props,
+            )?;
+            let allowed = mr.memory_type_bits & fd_props.memory_type_bits;
+            let mt = (0..self.memp.memory_type_count)
+                .find(|&i| allowed & (1 << i) != 0)
+                .ok_or("no import-compatible memory type")?;
+            let mut import_info = vk::ImportMemoryFdInfoKHR::default()
+                .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
+                .fd(src_fd);
+            mem = self.device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(mr.size)
+                    .memory_type_index(mt)
+                    .push_next(&mut import_info),
+                None,
+            )?;
+            fd_taken = true;
+            self.device.bind_image_memory(img, mem, 0)?;
+            let view = plane_view(&self.device, img, pd_format, vk::ImageAspectFlags::COLOR)?;
+            Ok((img, mem, view))
+        })();
+        if result.is_err() {
+            self.device.destroy_image(img, None);
+            self.device.free_memory(mem, None);
+            if !fd_taken {
+                libc::close(src_fd);
+            }
+        }
+        result
     }
 
     /// Export the submit's signal semaphore as a SYNC_FD and import it onto slot `idx`'s
@@ -2028,6 +2085,13 @@ mod tests {
                 "release 3"
             ]
         );
+    }
+
+    #[test]
+    fn an_unjudged_import_after_a_bad_one_is_used_and_the_bad_one_released() {
+        let (result, log) = run_first_sound(&[Some(false), None]);
+        assert_eq!(result, Ok(2));
+        assert_eq!(log, ["make 1", "make 2", "release 1"]);
     }
 
     #[test]
@@ -2271,9 +2335,9 @@ impl Drop for VulkanNv12 {
 
 // --- helpers ---
 
-/// Makes up to `tries` imports until one is sound. An unsound one is held until the loop ends,
-/// so the next import cannot be placed on its address range, then released. `sound` returns
-/// `None` when it cannot judge, and that import is used.
+/// Makes up to `tries` imports until one is sound. An unsound one is held until the loop ends
+/// and then released, so each retry is made while the earlier ones are still alive. `sound`
+/// returns `None` when it cannot judge, and that import is used.
 fn first_sound<T>(
     tries: usize,
     mut make: impl FnMut() -> Result<T, Err>,
@@ -2290,7 +2354,7 @@ fn first_sound<T>(
             break Ok(item);
         }
         bad.push(item);
-        if bad.len() == tries {
+        if bad.len() >= tries {
             break Err(format!("VulkanNv12: all {tries} RGBA imports read 0 (quasar #617)").into());
         }
     };
