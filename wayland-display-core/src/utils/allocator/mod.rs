@@ -1040,6 +1040,17 @@ mod tests {
         ($($a:tt)*) => {{ eprintln!("skip: {}", format!($($a)*)); return; }};
     }
 
+    /// `skip!`, except that it fails when `NV12_TEST_NODE` is set: ci/harness.sh gpu sets it
+    /// once it has found a GPU, and a skip there would read as a pass (quasar #680).
+    macro_rules! skip_or_fail {
+        ($($a:tt)*) => {{
+            if std::env::var_os("NV12_TEST_NODE").is_some() {
+                panic!("NV12_TEST_NODE is set but the test cannot run: {}", format!($($a)*));
+            }
+            skip!($($a)*)
+        }};
+    }
+
     /// A render node whose kernel driver is one of `drivers`, for hardware-gated
     /// tests -- so they target the right GPU on a multi-GPU host instead of a
     /// hardcoded `renderD12x` that may be a different vendor.
@@ -1287,12 +1298,12 @@ mod tests {
         test_init();
 
         let Some(render_node) = pick_render_node(&["nvidia", "amdgpu", "i915", "xe"]) else {
-            skip!("no GPU render node");
+            skip_or_fail!("no GPU render node");
         };
         let Some(&modifier) =
             crate::utils::vulkan_nv12::supported_nv12_modifiers(Some(render_node.minor())).first()
         else {
-            skip!("no NV12 export modifier on this GPU");
+            skip_or_fail!("no NV12 export modifier on this GPU");
         };
         let (w, h) = (64, 64);
         let drm_format = if modifier == 0 {
@@ -1312,7 +1323,7 @@ mod tests {
         let info = VideoInfoDmaDrm::from_caps(&caps).expect("Failed to create video info");
         let mut renderer = setup_renderer(Some(render_node));
         let Some(mut nv12) = GsNv12Buf::new(&mut renderer, render_node, info, PixFmt::Nv12) else {
-            skip!("no NV12 converter for {drm_format} on this GPU");
+            skip_or_fail!("no NV12 converter for {drm_format} on this GPU");
         };
 
         clear_target(&mut renderer, &mut nv12.rgba, w, h, [0.0; 4]);

@@ -1607,6 +1607,8 @@ impl VulkanNv12 {
     /// can fail an import's GPU mapping and still return VK_SUCCESS; that image reads 0 at
     /// every texel (quasar #617). The compositor renders with buffer age 0, so every pixel no
     /// opaque element covers is its opaque black clear: a sound import has a non-zero byte.
+    /// A refused read-back usage imports again without it, unchecked; running out of memory
+    /// or objects does not (`copy_source_refused`).
     unsafe fn create_checked_import(&self, held: usize, rgba: &Dmabuf) -> Result<Import, Err> {
         let format = rgba_vk_format(rgba.format().code).ok_or("unsupported RGBA fourcc")?;
         let modifier: u64 = rgba.format().modifier.into();
@@ -1619,6 +1621,9 @@ impl VulkanNv12 {
                 if checkable.get() {
                     match self.create_import(rgba, true) {
                         Ok(import) => return Ok(import),
+                        // Running out is not a refusal: the conversion fails, as any failed
+                        // import does, rather than stream an import nobody checked.
+                        Err(e) if !copy_source_refused(&e) => return Err(e),
                         // The format query said yes but the driver refused the usage: a
                         // refused flag must never fail a launch, so import as before, unchecked.
                         Err(e) => {
@@ -1626,7 +1631,7 @@ impl VulkanNv12 {
                                 token = "vulkan-import-copy-source-refused",
                                 slot = held,
                                 modifier = format!("{modifier:#x}"),
-                                "VulkanNv12: RGBA import with read-back refused ({e}); importing it unchecked"
+                                "VulkanNv12: RGBA import with read-back refused ({e}); importing it unchecked (running out of memory or objects fails the conversion instead)"
                             );
                             checkable.set(false);
                         }
@@ -2101,6 +2106,31 @@ mod tests {
         assert_eq!(log, ["make 1", "make 2", "release 1"]);
     }
 
+    #[test]
+    fn only_a_refusal_falls_back_to_an_unchecked_import() {
+        // As `create_import` returns them: `?` on a Vulkan call is this `From`, which boxes
+        // the vk::Result itself.
+        let vk_err = |r: vk::Result| Err::from(r);
+        for r in [
+            vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+            vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+            vk::Result::ERROR_TOO_MANY_OBJECTS,
+        ] {
+            assert!(!copy_source_refused(&vk_err(r)), "{r:?}");
+        }
+        for r in [
+            vk::Result::ERROR_FORMAT_NOT_SUPPORTED,
+            vk::Result::ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT,
+            vk::Result::ERROR_INVALID_EXTERNAL_HANDLE,
+            vk::Result::ERROR_UNKNOWN,
+        ] {
+            assert!(copy_source_refused(&vk_err(r)), "{r:?}");
+        }
+        assert!(copy_source_refused(
+            &"no import-compatible memory type".into()
+        ));
+    }
+
     /// The budget is G1_BUDGET_FRAMES frame intervals of the negotiated framerate.
     #[test]
     fn budget_is_two_frame_intervals_of_the_negotiated_framerate() {
@@ -2334,6 +2364,21 @@ impl Drop for VulkanNv12 {
 }
 
 // --- helpers ---
+
+/// Whether a failed copy-source import may be made again without the read-back usage
+/// (quasar #680). Which error a driver returns for a usage it refuses is undefined, so every
+/// error counts as a refusal except running out of memory or objects: an import made after
+/// that would stream unchecked.
+fn copy_source_refused(e: &Err) -> bool {
+    !matches!(
+        e.downcast_ref::<vk::Result>().copied(),
+        Some(
+            vk::Result::ERROR_OUT_OF_HOST_MEMORY
+                | vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
+                | vk::Result::ERROR_TOO_MANY_OBJECTS
+        )
+    )
+}
 
 /// Makes up to `tries` imports until one is sound. An unsound one is held until the loop ends
 /// and then released, so each retry is made while the earlier ones are still alive. `sound`

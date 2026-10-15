@@ -35,9 +35,11 @@ ci/harness.sh -v              # stream sub-command output
 | any    | any with `vulkanh264enc` | `vulkan=true ! vulkanh264enc` (shared-device NV12 `memory:VulkanImage`, zero-copy) |
 
 A vendor with no render node, or whose encoder element is missing, is skipped
-(reported, not failed). The Vulkan-encode row is vendor-agnostic — it runs
-wherever `vulkanh264enc` registers (an nvidia render node, or Intel with
-`ANV_VIDEO_ENCODE=1`); the `integration` phase prefers the nvidia node.
+(reported, not failed). A phase left with nothing to run (no GPU, no tool) reads
+`SKIP` in the summary, never `PASS`, and does not fail the run. The Vulkan-encode
+row is vendor-agnostic — it runs wherever `vulkanh264enc` registers (an nvidia
+render node, or Intel with `ANV_VIDEO_ENCODE=1`); the `integration` phase
+prefers the nvidia node.
 
 ## Host prerequisites
 
