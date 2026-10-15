@@ -3,7 +3,7 @@ use smithay::backend::drm::{DrmNode, NodeType};
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
 use smithay::backend::renderer::gles::GlesRenderer;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 /// One EGL display per render node, never dropped (quasar #570). smithay terminates a
 /// display with its last handle. NVIDIA's Vulkan driver keeps an EGL context of its own on
@@ -24,9 +24,14 @@ pub fn get_egl_device_for_node(drm_node: &DrmNode) -> EGLDevice {
         .expect("Unable to find EGLDevice for drm-node")
 }
 
-pub fn setup_renderer(render_node: Option<DrmNode>) -> GlesRenderer {
-    let mut displays = EGL_DISPLAYS.lock().unwrap();
-    let egl = match displays.get(&render_node) {
+/// The table survives a panic of another caller: nothing in it is left half-written.
+fn displays() -> MutexGuard<'static, HashMap<Option<DrmNode>, Arc<EGLDisplay>>> {
+    EGL_DISPLAYS.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn held_display(render_node: Option<DrmNode>) -> Arc<EGLDisplay> {
+    let mut displays = displays();
+    match displays.get(&render_node) {
         Some(display) => display.clone(),
         None => {
             let device = match render_node.as_ref() {
@@ -46,11 +51,19 @@ pub fn setup_renderer(render_node: Option<DrmNode>) -> GlesRenderer {
             displays.insert(render_node, display.clone());
             display
         }
-    };
+    }
+}
+
+pub fn setup_renderer(render_node: Option<DrmNode>) -> GlesRenderer {
+    let egl = held_display(render_node);
     // GLES2 is fine for HDR: fp16/10-bit dmabufs import via EGLImage (bypassing the GLES core
     // texture-format limits), so they're in the renderer's importable set already. (A GLES3
     // context fails to configure in this headless/surfaceless EGL setup and isn't needed.)
-    let context = EGLContext::new(&egl).expect("Failed to initialize EGL context");
+    let context = EGLContext::new(&egl).unwrap_or_else(|err| {
+        // A display that went bad (a GPU reset) is not kept: the next session makes its own.
+        displays().remove(&render_node);
+        panic!("Failed to initialize EGL context: {err}")
+    });
 
     unsafe { GlesRenderer::new(context) }.expect("Failed to initialize renderer")
 }
@@ -75,5 +88,16 @@ mod tests {
             again.egl_context().display().get_display_handle().handle,
             handle
         );
+    }
+    /// A caller that panicked holding the table does not take every later session down.
+    #[test]
+    fn a_panic_holding_the_display_table_does_not_poison_it() {
+        let _ = std::thread::spawn(|| {
+            let _held = EGL_DISPLAYS.lock().unwrap();
+            panic!("a caller died holding the table");
+        })
+        .join();
+        assert!(EGL_DISPLAYS.is_poisoned());
+        drop(setup_renderer(None));
     }
 }
