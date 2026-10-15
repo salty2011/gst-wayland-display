@@ -57,7 +57,8 @@
 #     -v, --verbose                   stream sub-command output
 #     -h, --help                      this help
 #
-# Exit status is non-zero if any selected phase failed.
+# Exit status is non-zero if any selected phase failed. A phase with nothing to
+# run here (no GPU, no tool) reads SKIP in the summary, not PASS, and does not fail.
 set -uo pipefail
 
 # --- locate repo root (this script lives in <root>/ci) -----------------------
@@ -94,10 +95,14 @@ warn() { printf '%sWARN%s %s\n' "$c_ylw" "$c_reset" "$*"; }
 err()  { printf '%sFAIL%s %s\n' "$c_red" "$c_reset" "$*" >&2; }
 
 declare -A RESULT  # phase -> PASS/FAIL/SKIP
+SKIPPED=77          # a phase's status when it had nothing to run (no GPU, no tool)
 run_phase() {       # run_phase <name> <fn>
-  local name="$1" fn="$2"
+  local name="$1" fn="$2" rc
   log "phase: $name"
-  if "$fn"; then RESULT[$name]=PASS; else
+  "$fn"; rc=$?
+  if [[ $rc -eq 0 ]]; then RESULT[$name]=PASS
+  elif [[ $rc -eq $SKIPPED ]]; then RESULT[$name]=SKIP
+  else
     RESULT[$name]=FAIL; err "phase $name failed"
     [[ $KEEP_GOING -eq 1 ]] || return 1
   fi
@@ -117,7 +122,7 @@ sh_run() {
 CARGO="${CARGO:-cargo}"
 LIBCLANG="${LIBCLANG_PATH:-}"
 HAVE_NVIDIA=0
-declare -A NODE_FOR_VENDOR  # vendor -> /dev/dri/renderDNNN
+declare -A NODE_FOR_VENDOR=()  # vendor -> /dev/dri/renderDNNN; set, so `set -u` reads none as 0
 
 detect_env() {
   command -v "$CARGO" >/dev/null || { err "cargo not found (install rustup)"; return 1; }
@@ -210,7 +215,7 @@ phase_detect() {
 phase_lint() {
   if ! "$CARGO" fmt --version >/dev/null 2>&1; then
     warn "rustfmt not installed (rustup component add rustfmt); skipping lint"
-    return 0
+    return $SKIPPED
   fi
   sh_run "$CARGO" fmt --all -- --check
 }
@@ -232,7 +237,7 @@ phase_unit() {
 }
 
 phase_gpu() {
-  if [[ ${#NODE_FOR_VENDOR[@]} -eq 0 ]]; then warn "no GPU; skipping"; return 0; fi
+  if [[ ${#NODE_FOR_VENDOR[@]} -eq 0 ]]; then warn "no GPU; skipping"; return $SKIPPED; fi
   local node="${FORCE_NODE:-${NODE_FOR_VENDOR[amd]:-${NODE_FOR_VENDOR[intel]:-${NODE_FOR_VENDOR[nvidia]:-}}}}"
   local rel; rel="$([[ $PROFILE == release ]] && echo --release)"
   log "  GPU-gated Rust tests on $node"
@@ -248,6 +253,7 @@ phase_gpu() {
 # (G_DEBUG=fatal-criticals turns the teardown double-unref class into a crash).
 run_to_eos() { # run_to_eos <label> <pipeline...>
   local label="$1"; shift
+  RAN_TO_EOS=$((RAN_TO_EOS + 1))
   local log_out rc
   log_out="$(GST_PLUGIN_PATH="$PLUGIN_DIR" G_DEBUG=fatal-criticals RUST_BACKTRACE=1 \
     timeout 90 gst-launch-1.0 -e "$@" 2>&1)"; rc=$?
@@ -263,10 +269,11 @@ run_to_eos() { # run_to_eos <label> <pipeline...>
 }
 
 phase_integration() {
-  if [[ ${#NODE_FOR_VENDOR[@]} -eq 0 ]]; then warn "no GPU; skipping"; return 0; fi
-  command -v gst-inspect-1.0 >/dev/null || { warn "no gst-launch; skipping"; return 0; }
+  if [[ ${#NODE_FOR_VENDOR[@]} -eq 0 ]]; then warn "no GPU; skipping"; return $SKIPPED; fi
+  command -v gst-inspect-1.0 >/dev/null || { warn "no gst-launch; skipping"; return $SKIPPED; }
   ginspect waylanddisplaysrc || { err "plugin not built (run 'build' first)"; return 1; }
   local ok=1 node res="width=1280,height=720,framerate=60/1"
+  RAN_TO_EOS=0
 
   # AMD / Intel: the VA encoder pulls NV12 straight from the source dmabuf.
   if [[ -n "${NODE_FOR_VENDOR[amd]:-}" ]] && gst-inspect-1.0 vah265enc >/dev/null 2>&1; then
@@ -296,18 +303,19 @@ phase_integration() {
         num-buffers=30 ! vulkanh264enc ! fakesink || ok=0
     fi
   fi
-  [[ $ok -eq 1 ]]
+  [[ $ok -eq 1 ]] || return 1
+  [[ $RAN_TO_EOS -gt 0 ]] || { warn "no encoder element for any GPU; skipping"; return $SKIPPED; }
 }
 
 # --- benchmark ---------------------------------------------------------------
 phase_bench() {
-  if [[ ${#NODE_FOR_VENDOR[@]} -eq 0 ]]; then warn "no GPU; skipping"; return 0; fi
-  [[ -f benchmark/conv-timing.patch ]] || { warn "no benchmark; skipping"; return 0; }
+  if [[ ${#NODE_FOR_VENDOR[@]} -eq 0 ]]; then warn "no GPU; skipping"; return $SKIPPED; fi
+  [[ -f benchmark/conv-timing.patch ]] || { warn "no benchmark; skipping"; return $SKIPPED; }
   local applied=0
   if git apply --check benchmark/conv-timing.patch 2>/dev/null; then
     git apply benchmark/conv-timing.patch && applied=1
   else
-    warn "conv-timing.patch does not apply cleanly; skipping bench"; return 0
+    warn "conv-timing.patch does not apply cleanly; skipping bench"; return $SKIPPED
   fi
   sh_run "$CARGO" build -p gst-plugin-wayland-display $(feature_args) || { [[ $applied -eq 1 ]] && git apply -R benchmark/conv-timing.patch; return 1; }
 
