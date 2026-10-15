@@ -885,12 +885,21 @@ mod tests {
         assert!(!asked_for(c"vkGetDeviceQueue2"));
     }
 
-    /// Guards the rule in `load_device`'s doc: a direct `ash::Device::load` or
-    /// `Instance::create_device` anywhere in the workspace brings quasar #267 back.
+    /// Guards the rule in `load_device`'s doc: a direct `ash::Device::load`/`load_with` or
+    /// `Instance::create_device` anywhere in the workspace brings quasar #267 back. The one
+    /// table load allowed is `load_device_with`'s own. Not caught: a type alias of
+    /// `ash::Device`, or a call split across lines.
     #[test]
     fn every_device_table_comes_from_load_device() {
         // Split, or this file would match itself.
-        let banned = [concat!("Device::", "load("), concat!(".create_", "device(")];
+        let banned = [
+            concat!("Device::", "load"),
+            concat!("Device>::", "load"),
+            concat!(".create_", "device("),
+            concat!(".create_", "device::"),
+            concat!("::create_", "device("),
+        ];
+        let allowed = concat!("ash::Device::", "load_with(");
         let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap();
@@ -916,6 +925,11 @@ mod tests {
             }
         }
         assert!(scanned > 20, "only {scanned} source files scanned");
+        let own = hits
+            .iter()
+            .position(|h| h.contains("utils/vulkan_share.rs:") && h.contains(allowed))
+            .expect("load_device_with no longer builds the table");
+        hits.remove(own);
         assert!(
             hits.is_empty(),
             "build the device table with vulkan_share::load_device:\n{}",
