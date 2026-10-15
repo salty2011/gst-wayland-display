@@ -36,7 +36,8 @@ ci/harness.sh -v              # stream sub-command output
 
 A vendor with no render node, or whose encoder element is missing, is skipped
 (reported, not failed). A phase left with nothing to run (no GPU, no tool) reads
-`SKIP` in the summary, never `PASS`, and does not fail the run. The Vulkan-encode
+`SKIP` in the summary, never `PASS`, and does not fail the run; a selected phase
+that never recorded a result reads `NOT RUN` and fails it. The Vulkan-encode
 row is vendor-agnostic — it runs wherever `vulkanh264enc` registers (an nvidia
 render node, or Intel with `ANV_VIDEO_ENCODE=1`); the `integration` phase
 prefers the nvidia node.

@@ -1623,7 +1623,15 @@ impl VulkanNv12 {
                         Ok(import) => return Ok(import),
                         // Running out is not a refusal: the conversion fails, as any failed
                         // import does, rather than stream an import nobody checked.
-                        Err(e) if !copy_source_refused(&e) => return Err(e),
+                        Err(e) if !copy_source_refused(&e) => {
+                            tracing::warn!(
+                                token = "vulkan-import-copy-source-exhausted",
+                                slot = held,
+                                modifier = format!("{modifier:#x}"),
+                                "VulkanNv12: RGBA import with read-back ran out of memory or objects ({e}); failing the conversion"
+                            );
+                            return Err(e);
+                        }
                         // The format query said yes but the driver refused the usage: a
                         // refused flag must never fail a launch, so import as before, unchecked.
                         Err(e) => {

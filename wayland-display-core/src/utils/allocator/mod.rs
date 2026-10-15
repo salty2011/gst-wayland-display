@@ -1297,8 +1297,14 @@ mod tests {
     fn nv12_converter_refuses_an_import_that_reads_nothing() {
         test_init();
 
-        let Some(render_node) = pick_render_node(&["nvidia", "amdgpu", "i915", "xe"]) else {
-            skip_or_fail!("no GPU render node");
+        // The harness names the node it found: test that one, never another GPU on the box.
+        let render_node = match std::env::var("NV12_TEST_NODE") {
+            Ok(path) => DrmNode::from_path(&path)
+                .unwrap_or_else(|e| panic!("NV12_TEST_NODE={path}: cannot open it: {e}")),
+            Err(_) => match pick_render_node(&["nvidia", "amdgpu", "i915", "xe"]) {
+                Some(node) => node,
+                None => skip!("no supported render node"),
+            },
         };
         let Some(&modifier) =
             crate::utils::vulkan_nv12::supported_nv12_modifiers(Some(render_node.minor())).first()

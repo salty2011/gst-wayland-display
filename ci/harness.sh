@@ -59,6 +59,7 @@
 #
 # Exit status is non-zero if any selected phase failed. A phase with nothing to
 # run here (no GPU, no tool) reads SKIP in the summary, not PASS, and does not fail.
+# A selected phase that never recorded a result reads NOT RUN and fails the run.
 set -uo pipefail
 
 # --- locate repo root (this script lives in <root>/ci) -----------------------
@@ -356,9 +357,9 @@ done
 echo
 log "summary"
 for p in "${PHASES[@]}"; do
-  r="${RESULT[$p]:-SKIP}"
-  col="$c_ylw"; [[ "$r" == PASS ]] && col="$c_grn"; [[ "$r" == FAIL ]] && col="$c_red"
+  r="${RESULT[$p]:-NOT RUN}"  # no result: the loop stopped early or was aborted
+  col="$c_red"; [[ "$r" == PASS ]] && col="$c_grn"; [[ "$r" == SKIP ]] && col="$c_ylw"
   printf '  %-12s %s%s%s\n' "$p" "$col" "$r" "$c_reset"
-  [[ "$r" == FAIL ]] && overall=1
+  [[ "$r" == PASS || "$r" == SKIP ]] || overall=1
 done
 exit $overall
