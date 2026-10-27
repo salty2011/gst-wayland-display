@@ -134,6 +134,10 @@ pub struct Settings {
     mode_ladder: Vec<(i32, i32)>,
     /// Show the fixed test picture while no client surface is mapped. Default off.
     test_picture: bool,
+    /// XKB layout and variant for the session keymap, read at `start()`. Empty layout =
+    /// the default (US) keymap, as before.
+    keyboard_layout: String,
+    keyboard_variant: String,
     #[cfg(feature = "cuda")]
     cuda_context: Option<Arc<Mutex<cuda::CUDAContext>>>,
     #[cfg(feature = "cuda")]
@@ -473,6 +477,25 @@ impl ObjectImpl for WaylandDisplaySrc {
                     )
                     .default_value(false)
                     .build(),
+                glib::ParamSpecString::builder("keyboard-layout")
+                    .nick("Keyboard layout")
+                    .blurb(
+                        "XKB layout of the keymap clients get (e.g. \"de\"). Empty = the \
+                         default US keymap. A layout or variant that does not compile falls \
+                         back to US with a warning. Read when the element starts.",
+                    )
+                    .default_value(Some(""))
+                    .mutable_ready()
+                    .build(),
+                glib::ParamSpecString::builder("keyboard-variant")
+                    .nick("Keyboard variant")
+                    .blurb(
+                        "XKB variant of keyboard-layout (e.g. \"nodeadkeys\"). Empty = the \
+                         layout's default variant. Ignored while keyboard-layout is empty.",
+                    )
+                    .default_value(Some(""))
+                    .mutable_ready()
+                    .build(),
                 glib::ParamSpecUInt64::builder("app-surface-commits")
                     .nick("Application surface buffer commits")
                     .blurb(
@@ -629,6 +652,18 @@ impl ObjectImpl for WaylandDisplaySrc {
                     state.display.set_ui_scale(scale);
                 }
             }
+            "keyboard-layout" => {
+                self.settings.lock().unwrap().keyboard_layout = value
+                    .get::<Option<String>>()
+                    .expect("Type checked upstream")
+                    .unwrap_or_default();
+            }
+            "keyboard-variant" => {
+                self.settings.lock().unwrap().keyboard_variant = value
+                    .get::<Option<String>>()
+                    .expect("Type checked upstream")
+                    .unwrap_or_default();
+            }
             "test-picture" => {
                 let on = value.get::<bool>().expect("Type checked upstream");
                 self.settings.lock().unwrap().test_picture = on;
@@ -724,6 +759,8 @@ impl ObjectImpl for WaylandDisplaySrc {
                 settings.ui_scale.unwrap_or(1.0).to_value()
             }
             "test-picture" => self.settings.lock().unwrap().test_picture.to_value(),
+            "keyboard-layout" => self.settings.lock().unwrap().keyboard_layout.to_value(),
+            "keyboard-variant" => self.settings.lock().unwrap().keyboard_variant.to_value(),
             "mode-ladder" => {
                 let settings = self.settings.lock().unwrap();
                 settings
@@ -1627,6 +1664,20 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                 )
             ));
         };
+
+        // Sent before the app is launched; a keyboard bound earlier is sent the new keymap.
+        let (layout, variant) = {
+            let settings = self.settings.lock().unwrap();
+            (
+                settings.keyboard_layout.clone(),
+                settings.keyboard_variant.clone(),
+            )
+        };
+        if !layout.is_empty() {
+            let _ = self
+                .command_tx
+                .send(Command::KeyboardLayout { layout, variant });
+        }
 
         // For a downstream VA encoder, adopt its GstVaDisplay so our NV12 buffers can
         // carry a VA surface on the *same* display -- the encoder then reuses one surface
