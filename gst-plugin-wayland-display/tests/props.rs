@@ -235,3 +235,14 @@ fn test_picture_is_off_by_default_and_reads_back() {
     src.set_property("test-picture", true);
     assert!(src.property::<bool>("test-picture"));
 }
+
+#[test]
+fn keyboard_layout_defaults_to_empty_and_reads_back() {
+    let src = make_src();
+    assert_eq!(src.property::<String>("keyboard-layout"), "");
+    assert_eq!(src.property::<String>("keyboard-variant"), "");
+    src.set_property("keyboard-layout", "de");
+    src.set_property("keyboard-variant", "nodeadkeys");
+    assert_eq!(src.property::<String>("keyboard-layout"), "de");
+    assert_eq!(src.property::<String>("keyboard-variant"), "nodeadkeys");
+}

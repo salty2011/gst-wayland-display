@@ -1622,6 +1622,9 @@ pub(crate) fn init(
                 Event::Msg(Command::TestPicture(on)) => {
                     state.test_picture = on;
                 }
+                Event::Msg(Command::KeyboardLayout { layout, variant }) => {
+                    state.set_keyboard_layout(&layout, &variant);
+                }
                 Event::Msg(Command::InputDevice(path)) => {
                     tracing::info!(path, "Adding input device.");
                     state.input_context.path_add_device(&path);

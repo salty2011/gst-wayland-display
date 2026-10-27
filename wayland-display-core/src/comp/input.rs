@@ -2,7 +2,7 @@ use super::{State, focus::FocusTarget};
 use smithay::backend::input::Keycode;
 use smithay::backend::libinput::LibinputInputBackend;
 use smithay::desktop::{Window, space::SpaceElement};
-use smithay::input::keyboard::Keysym;
+use smithay::input::keyboard::{Keysym, XkbConfig};
 use smithay::reexports::input::event::pointer::PointerEventTrait;
 use smithay::wayland::seat::WaylandFocus;
 use smithay::{
@@ -88,6 +88,28 @@ impl LibinputInterface for NixInterface {
 }
 
 impl State {
+    /// Rebuild the seat's keymap from an XKB layout and variant (`"de"`, `"nodeadkeys"`).
+    /// A pair that does not compile logs a WARN and leaves the default keymap (US).
+    pub fn set_keyboard_layout(&mut self, layout: &str, variant: &str) {
+        let keyboard = self.seat.get_keyboard().unwrap();
+        let config = XkbConfig {
+            layout,
+            variant,
+            ..XkbConfig::default()
+        };
+        if let Err(err) = keyboard.set_xkb_config(self, config) {
+            tracing::warn!(
+                layout,
+                variant,
+                ?err,
+                "Keyboard layout does not compile; using the default (US) keymap"
+            );
+            let _ = keyboard.set_xkb_config(self, XkbConfig::default());
+        } else {
+            tracing::info!(layout, variant, "Applied keyboard layout");
+        }
+    }
+
     pub fn scancode_to_keycode(&self, scancode: u32) -> Keycode {
         // see: https://github.com/rust-x-bindings/xkbcommon-rs/blob/cb449998d8a3de375d492fb7ec015b2925f38ddb/src/xkb/mod.rs#L50-L58
         Keycode::new(scancode + 8)
@@ -821,6 +843,55 @@ mod tests {
         let x11_keysym = xkb_state.key_get_one_sym(x11_key_code);
 
         assert_eq!(Keysym::a, x11_keysym);
+    }
+
+    /// The first keysym the seat's current keymap gives an evdev scancode.
+    fn sym_for(state: &mut State, scancode: u32) -> Keysym {
+        let keycode = state.scancode_to_keycode(scancode);
+        let kb = state.seat.get_keyboard().unwrap();
+        kb.with_xkb_state(state, |ctx| {
+            let xkb = ctx.xkb().lock().unwrap();
+            xkb.raw_syms_for_key_in_layout(keycode, xkb.active_layout())[0]
+        })
+    }
+
+    // Evdev scancodes, from `input-event-codes.h`.
+    const KEY_Y: u32 = 21;
+    const KEY_SEMICOLON: u32 = 39;
+    const KEY_Z: u32 = 44;
+
+    #[test]
+    fn keyboard_layout_builds_the_keymap() {
+        let mut harness = TestState::new();
+        let state = harness.state();
+        assert_eq!(sym_for(state, KEY_Y), Keysym::y);
+
+        state.set_keyboard_layout("de", "");
+        assert_eq!(sym_for(state, KEY_Y), Keysym::z);
+        assert_eq!(sym_for(state, KEY_Z), Keysym::y);
+        assert_eq!(sym_for(state, KEY_SEMICOLON), Keysym::odiaeresis);
+
+        state.set_keyboard_layout("de", "nodeadkeys");
+        let kb = state.seat.get_keyboard().unwrap();
+        let name = kb.with_xkb_state(state, |ctx| {
+            let xkb = ctx.xkb().lock().unwrap();
+            xkb.layout_name(xkb.active_layout()).to_owned()
+        });
+        assert_eq!(name, "German (no dead keys)");
+    }
+
+    #[test]
+    fn keyboard_layout_that_does_not_compile_falls_back_to_us() {
+        let mut harness = TestState::new();
+        let state = harness.state();
+
+        for (layout, variant) in [("de", "no-such-variant"), ("no-such-layout", "")] {
+            state.set_keyboard_layout("de", "");
+            assert_eq!(sym_for(state, KEY_Y), Keysym::z);
+            state.set_keyboard_layout(layout, variant);
+            assert_eq!(sym_for(state, KEY_Y), Keysym::y, "{layout}({variant})");
+            assert_eq!(sym_for(state, KEY_SEMICOLON), Keysym::semicolon);
+        }
     }
 
     #[test]

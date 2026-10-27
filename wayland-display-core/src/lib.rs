@@ -54,6 +54,12 @@ pub enum Command {
     /// Element -> compositor: show the test picture (`comp::test_picture`) while no client
     /// surface is mapped. Off by default.
     TestPicture(bool),
+    /// Element -> compositor: build the keymap from this XKB layout and variant. A pair
+    /// that does not compile keeps the default (US) keymap and logs a WARN.
+    KeyboardLayout {
+        layout: String,
+        variant: String,
+    },
     Buffer(
         SyncSender<Result<gst::Buffer, SwapBuffersError>>,
         Option<Tracer>,
