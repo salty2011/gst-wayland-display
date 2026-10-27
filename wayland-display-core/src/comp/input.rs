@@ -2,7 +2,7 @@ use super::{State, focus::FocusTarget};
 use smithay::backend::input::Keycode;
 use smithay::backend::libinput::LibinputInputBackend;
 use smithay::desktop::{Window, space::SpaceElement};
-use smithay::input::keyboard::{Keysym, XkbConfig};
+use smithay::input::keyboard::{Keysym, KeysymHandle, XkbConfig};
 use smithay::reexports::input::event::pointer::PointerEventTrait;
 use smithay::wayland::seat::WaylandFocus;
 use smithay::{
@@ -12,7 +12,7 @@ use smithay::{
         TouchSlot,
     },
     input::{
-        keyboard::{FilterResult, keysyms},
+        keyboard::FilterResult,
         pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent},
         touch::{DownEvent, MotionEvent as TouchMotionEvent, UpEvent},
     },
@@ -87,6 +87,16 @@ impl LibinputInterface for NixInterface {
     }
 }
 
+/// The Q of Ctrl+Shift+Q: the key labelled q where the layout has Latin letters (AZERTY's
+/// is on the US A key), else the key in the US Q position (`ru`, `gr`).
+fn is_close_key(handle: &KeysymHandle<'_>) -> bool {
+    const KEY_Q: u32 = 16;
+    match handle.raw_latin_sym_or_raw_current_sym() {
+        Some(sym) if sym.key_char().is_some_and(|c| c.is_ascii()) => sym == Keysym::q,
+        _ => handle.raw_code() == Keycode::new(KEY_Q + 8),
+    }
+}
+
 impl State {
     /// Rebuild the seat's keymap from an XKB layout and variant (`"de"`, `"nodeadkeys"`).
     /// A pair that does not compile logs a WARN and leaves the default keymap (US).
@@ -131,7 +141,7 @@ impl State {
                         match handle.modified_sym() {
                             Keysym::Tab => {
                                 if let Some(element) = data.space.elements().last().cloned() {
-                                    data.surpressed_keys.insert(keysyms::KEY_Tab);
+                                    data.surpressed_keys.insert(handle.raw_code().raw());
                                     let location = data.space.element_location(&element).unwrap();
                                     data.space.map_element(element.clone(), location, true);
                                     data.seat.get_keyboard().unwrap().set_focus(
@@ -142,7 +152,7 @@ impl State {
                                     return FilterResult::Intercept(());
                                 }
                             }
-                            Keysym::Q => {
+                            _ if is_close_key(&handle) => {
                                 if let Some(target) =
                                     data.seat.get_keyboard().unwrap().current_focus()
                                 {
@@ -152,7 +162,7 @@ impl State {
                                         }
                                         _ => return FilterResult::Forward,
                                     };
-                                    data.surpressed_keys.insert(keysyms::KEY_Q);
+                                    data.surpressed_keys.insert(handle.raw_code().raw());
                                     return FilterResult::Intercept(());
                                 }
                             }
@@ -160,7 +170,8 @@ impl State {
                         }
                     }
                 } else {
-                    if data.surpressed_keys.remove(&handle.modified_sym().raw()) {
+                    // By keycode: the release's keysym can differ (Shift let go first, a non-Latin layout).
+                    if data.surpressed_keys.remove(&handle.raw_code().raw()) {
                         return FilterResult::Intercept(());
                     }
                 }
@@ -891,6 +902,53 @@ mod tests {
             state.set_keyboard_layout(layout, variant);
             assert_eq!(sym_for(state, KEY_Y), Keysym::y, "{layout}({variant})");
             assert_eq!(sym_for(state, KEY_SEMICOLON), Keysym::semicolon);
+        }
+    }
+
+    #[test]
+    fn close_shortcut_key_follows_the_label_or_the_us_position() {
+        const KEY_Q: u32 = 16;
+        const KEY_A: u32 = 30;
+        const CTRL_SHIFT: [u32; 2] = [29, 42];
+        let mut harness = TestState::new();
+        let state = harness.state();
+        for (layout, scancode, want) in [
+            ("us", KEY_Q, true),
+            ("de", KEY_Q, true),
+            ("fr", KEY_A, true),
+            ("fr", KEY_Q, false),
+            ("ru", KEY_Q, true),
+            ("ru", KEY_A, false),
+        ] {
+            state.set_keyboard_layout(layout, "");
+            let kb = state.seat.get_keyboard().unwrap();
+            let press = |state: &mut State, scancode: u32, key_state| {
+                let keycode = state.scancode_to_keycode(scancode);
+                kb.input::<(), _>(
+                    state,
+                    keycode,
+                    key_state,
+                    SERIAL_COUNTER.next_serial(),
+                    0,
+                    |_, _, _| FilterResult::Forward,
+                );
+            };
+            for m in CTRL_SHIFT {
+                press(state, m, KeyState::Pressed);
+            }
+            let keycode = state.scancode_to_keycode(scancode);
+            let got = kb.input::<bool, _>(
+                state,
+                keycode,
+                KeyState::Pressed,
+                SERIAL_COUNTER.next_serial(),
+                0,
+                |_, _, handle| FilterResult::Intercept(is_close_key(&handle)),
+            );
+            for k in [scancode, CTRL_SHIFT[0], CTRL_SHIFT[1]] {
+                press(state, k, KeyState::Released);
+            }
+            assert_eq!(got, Some(want), "{layout} scancode {scancode}");
         }
     }
 
