@@ -1255,6 +1255,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
                 .features([gstreamer_allocators::CAPS_FEATURE_MEMORY_DMABUF])
                 .format(VideoFormat::DmaDrm)
                 .field("drm-format", drm)
+                .field("colorimetry", nv12_colorimetry())
                 .height_range(..i32::MAX)
                 .width_range(..i32::MAX)
                 .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
@@ -1389,6 +1390,7 @@ impl BaseSrcImpl for WaylandDisplaySrc {
             let nv12_vk = gst_video::VideoCapsBuilder::new()
                 .features(["memory:VulkanImage"])
                 .format(VideoFormat::Nv12)
+                .field("colorimetry", nv12_colorimetry())
                 .height_range(..i32::MAX)
                 .width_range(..i32::MAX)
                 .framerate_range(Fraction::new(1, 1)..Fraction::new(i32::MAX, 1))
@@ -2327,5 +2329,51 @@ mod tests {
             "waylanddisplaysrc render-node={node} num-buffers=30 \
              ! vulkanupload ! vulkancolorconvert ! {enc} ! {parse} ! fakesink sync=false"
         ));
+    }
+}
+
+/// Colorimetries the converter's NV12 output can carry: limited range, sRGB/BT.709 content.
+/// BT.601 comes first, so it stays the default (bit-comparable with the GLES/VA/CUDA paths);
+/// a downstream that asks for `colorimetry=bt709` gets the BT.709 matrix instead. Without
+/// the field, downstream assumes BT.709 for HD sizes and the colours shift.
+fn nv12_colorimetry() -> gst::List {
+    let limited = |matrix| {
+        gst_video::VideoColorimetry::new(
+            gst_video::VideoColorRange::Range16_235,
+            matrix,
+            gst_video::VideoTransferFunction::Bt709,
+            gst_video::VideoColorPrimaries::Bt709,
+        )
+        .to_string()
+    };
+    gst::List::new([
+        limited(gst_video::VideoColorMatrix::Bt601),
+        limited(gst_video::VideoColorMatrix::Bt709),
+    ])
+}
+
+#[cfg(test)]
+mod colorimetry_tests {
+    #[test]
+    fn nv12_offers_bt601_first_then_bt709() {
+        gst::init().unwrap();
+        let list = super::nv12_colorimetry();
+        let names: Vec<String> = list.iter().map(|v| v.get().unwrap()).collect();
+        let matrix = |s: &str| s.parse::<gst_video::VideoColorimetry>().unwrap().matrix();
+        assert_eq!(matrix(&names[0]), gst_video::VideoColorMatrix::Bt601);
+        // The exact string a downstream capsfilter writes to ask for BT.709.
+        assert_eq!(names[1], "bt709");
+        let mut caps = gst_video::VideoCapsBuilder::new()
+            .format(gst_video::VideoFormat::Nv12)
+            .width(64)
+            .height(64)
+            .field("colorimetry", list)
+            .build();
+        caps.fixate();
+        let fixed = gst_video::VideoInfo::from_caps(&caps).unwrap();
+        assert_eq!(
+            fixed.colorimetry().matrix(),
+            gst_video::VideoColorMatrix::Bt601
+        );
     }
 }
