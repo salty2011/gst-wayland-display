@@ -184,7 +184,7 @@ pub enum PixFmt {
 
 impl PixFmt {
     /// The multiplanar Vulkan format of the output/scratch image.
-    fn image_format(self) -> vk::Format {
+    pub(crate) fn image_format(self) -> vk::Format {
         match self {
             PixFmt::Nv12 => vk::Format::G8_B8R8_2PLANE_420_UNORM,
             PixFmt::P010 => vk::Format::G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16,
@@ -194,7 +194,7 @@ impl PixFmt {
     /// the plane is `R10X6_UNORM_PACK16`; we view it as `R16_UNORM` -- both are in Vulkan's
     /// 16-bit format-compatibility class, so the view is size/class-compatible -- and a
     /// normalized store lands across all 16 bits (the P010 reader takes the top 10).
-    fn y_view_format(self) -> vk::Format {
+    pub(crate) fn y_view_format(self) -> vk::Format {
         match self {
             PixFmt::Nv12 => vk::Format::R8_UNORM,
             PixFmt::P010 => vk::Format::R16_UNORM,
@@ -202,7 +202,7 @@ impl PixFmt {
     }
     /// Per-plane storage-view format for the interleaved Cb/Cr plane (`R10X6G10X6` <-> R16G16,
     /// 32-bit class, compatible).
-    fn uv_view_format(self) -> vk::Format {
+    pub(crate) fn uv_view_format(self) -> vk::Format {
         match self {
             PixFmt::Nv12 => vk::Format::R8G8_UNORM,
             PixFmt::P010 => vk::Format::R16G16_UNORM,
@@ -2689,7 +2689,7 @@ unsafe fn build_compute_pipeline(
 /// compute scratch and, on the direct path, as the export image itself (with `usage`
 /// extended for export). The image is `MUTABLE_FORMAT` with a view-format list so the planes
 /// can be stored through the size/class-compatible single-component views.
-unsafe fn create_storage(
+pub(crate) unsafe fn create_storage(
     device: &ash::Device,
     memp: &vk::PhysicalDeviceMemoryProperties,
     width: u32,
@@ -3185,7 +3185,7 @@ fn mem_type(
         .ok_or_else(|| "no suitable memory type".into())
 }
 
-unsafe fn plane_view(
+pub(crate) unsafe fn plane_view(
     device: &ash::Device,
     image: vk::Image,
     format: vk::Format,
@@ -3207,7 +3207,7 @@ unsafe fn plane_view(
     )?)
 }
 
-fn plane_layers(aspect: vk::ImageAspectFlags) -> vk::ImageSubresourceLayers {
+pub(crate) fn plane_layers(aspect: vk::ImageAspectFlags) -> vk::ImageSubresourceLayers {
     vk::ImageSubresourceLayers::default()
         .aspect_mask(aspect)
         .mip_level(0)
@@ -3215,7 +3215,10 @@ fn plane_layers(aspect: vk::ImageAspectFlags) -> vk::ImageSubresourceLayers {
         .layer_count(1)
 }
 
-fn dsl_bind(binding: u32, ty: vk::DescriptorType) -> vk::DescriptorSetLayoutBinding<'static> {
+pub(crate) fn dsl_bind(
+    binding: u32,
+    ty: vk::DescriptorType,
+) -> vk::DescriptorSetLayoutBinding<'static> {
     vk::DescriptorSetLayoutBinding::default()
         .binding(binding)
         .descriptor_type(ty)
@@ -3223,19 +3226,19 @@ fn dsl_bind(binding: u32, ty: vk::DescriptorType) -> vk::DescriptorSetLayoutBind
         .stage_flags(vk::ShaderStageFlags::COMPUTE)
 }
 
-fn pool_size(ty: vk::DescriptorType, count: u32) -> vk::DescriptorPoolSize {
+pub(crate) fn pool_size(ty: vk::DescriptorType, count: u32) -> vk::DescriptorPoolSize {
     vk::DescriptorPoolSize::default()
         .ty(ty)
         .descriptor_count(count)
 }
 
-fn image_info(view: vk::ImageView) -> vk::DescriptorImageInfo {
+pub(crate) fn image_info(view: vk::ImageView) -> vk::DescriptorImageInfo {
     vk::DescriptorImageInfo::default()
         .image_view(view)
         .image_layout(vk::ImageLayout::GENERAL)
 }
 
-fn write_img<'a>(
+pub(crate) fn write_img<'a>(
     set: vk::DescriptorSet,
     binding: u32,
     ty: vk::DescriptorType,
@@ -3248,7 +3251,7 @@ fn write_img<'a>(
         .image_info(info)
 }
 
-fn img_barrier(
+pub(crate) fn img_barrier(
     image: vk::Image,
     aspect: vk::ImageAspectFlags,
     from: vk::ImageLayout,
