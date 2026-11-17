@@ -13,6 +13,7 @@ mod test_mode_ladder;
 mod test_pointer;
 mod test_render_device;
 mod test_render_size;
+mod test_render_teardown;
 mod test_resolution;
 mod test_tablet;
 mod test_tablet_pr64;
