@@ -2511,8 +2511,8 @@ impl Drop for VulkanNv12 {
 
 // --- helpers ---
 
-/// Whether a failed copy-source import may be made again without the read-back usage
-///. Which error a driver returns for a usage it refuses is undefined, so every
+/// Whether a failed copy-source import may be made again without the read-back usage.
+/// Which error a driver returns for a usage it refuses is undefined, so every
 /// error counts as a refusal except running out of memory or objects: an import made after
 /// that would stream unchecked.
 fn copy_source_refused(e: &Err) -> bool {
