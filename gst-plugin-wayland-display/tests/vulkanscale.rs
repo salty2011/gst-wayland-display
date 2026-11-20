@@ -56,7 +56,16 @@ fn ensure_runtime_dir() {
 }
 
 fn render_node_for(drivers: &[&str]) -> Option<String> {
+    // ci/harness.sh pins the GPU under test; honour it so a multi-GPU host validates each.
+    let selected =
+        std::env::var_os("VULKAN_ENC_NODE").or_else(|| std::env::var_os("NV12_TEST_NODE"));
     for e in std::fs::read_dir("/dev/dri").ok()?.flatten() {
+        if selected
+            .as_ref()
+            .is_some_and(|node| e.path() != std::path::Path::new(node))
+        {
+            continue;
+        }
         let name = e.file_name().to_string_lossy().into_owned();
         if !name.starts_with("renderD") {
             continue;
@@ -73,6 +82,45 @@ fn render_node_for(drivers: &[&str]) -> Option<String> {
         }
     }
     None
+}
+
+/// The Vulkan video element `vulkan<codec><role>` (`kind` is e.g. `h264enc`, `h265dec`) on
+/// the GPU behind `node`. GStreamer gives only the first Vulkan device the plain name; the
+/// others register as `vulkan<codec>device<N><role>`, with the device name at the end of
+/// the long name, so on a multi-GPU host the plain element may be on another GPU or absent.
+fn vulkan_element(kind: &str, node: &str) -> Option<String> {
+    let card = node.rsplit('/').next()?;
+    let vendor = match std::fs::read_to_string(format!("/sys/class/drm/{card}/device/vendor"))
+        .ok()?
+        .trim()
+    {
+        "0x10de" => "NVIDIA",
+        "0x1002" => "AMD",
+        "0x8086" => "Intel",
+        _ => return None,
+    };
+    let (codec, role) = kind.split_at(kind.len().checked_sub(3)?);
+    let prefix = format!("vulkan{codec}");
+    gst::ElementFactory::factories_with_type(gst::ElementFactoryType::ANY, gst::Rank::NONE)
+        .into_iter()
+        .filter(|f| {
+            let name = f.name();
+            let Some(index) = name
+                .strip_prefix(prefix.as_str())
+                .and_then(|n| n.strip_suffix(role))
+            else {
+                return false;
+            };
+            index.is_empty()
+                || index
+                    .strip_prefix("device")
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .find(|f| {
+            f.metadata(gst::ELEMENT_METADATA_LONGNAME)
+                .is_some_and(|l| l.contains(&format!(" on {vendor}")))
+        })
+        .map(|f| f.name().to_string())
 }
 
 fn have(element: &str) -> bool {
@@ -475,55 +523,75 @@ fn equal_size_is_passthrough() {
     assert!(passthrough, "equal in/out size must engage passthrough");
 }
 
-/// A scaled frame leaves with the PTS and duration it came in with. `prepare_output_buffer`
+/// A scaled frame leaves with the PTS, DTS and duration it came in with. `prepare_output_buffer`
 /// is overridden, so GstBaseTransform copies no metadata: without the explicit stamp the
 /// frames carry no PTS, the RTP timestamps stop advancing and a browser drops the stream's
-/// frames as duplicates (quasar #981).
+/// frames as duplicates (quasar #981). The compositor sets no DTS or duration, so a probe on
+/// the scaler's sink gives every input frame a known one, and each setter in the element
+/// then has to be what carries it across.
 #[test]
-#[ignore = "needs a GPU with vulkanh264enc; run via ci/harness.sh gpu"]
+#[ignore = "needs a GPU with a Vulkan h264 encoder; run via ci/harness.sh gpu"]
 fn scaled_buffers_keep_the_input_timestamps() {
+    const FRAMES: usize = 30;
+    const DURATION: gst::ClockTime = gst::ClockTime::from_nseconds(16_666_667);
+    type Stamp = (
+        Option<gst::ClockTime>,
+        Option<gst::ClockTime>,
+        Option<gst::ClockTime>,
+    );
     init();
     let Some(node) = render_node_for(&["nvidia", "amdgpu"]) else {
         skip!("no nvidia or amd render node")
     };
-    if !have("vulkanh264enc") {
-        skip!("no vulkanh264enc");
-    }
+    let Some(enc) = vulkan_element("h264enc", &node) else {
+        skip!("no Vulkan h264 encoder on {node}")
+    };
     let desc = format!(
-        "waylanddisplaysrc render-node={node} vulkan=true num-buffers=30 \
+        "waylanddisplaysrc render-node={node} vulkan=true num-buffers={FRAMES} \
          ! video/x-raw(memory:VulkanImage),format=NV12,width=1920,height=1080,framerate=60/1 \
          ! vulkanscale name=scale \
          ! capsfilter caps=video/x-raw\\(memory:VulkanImage\\),format=NV12,width=1280,height=720 \
-         ! vulkanh264enc ! h264parse ! fakesink sync=false"
+         ! {enc} ! h264parse ! fakesink sync=false"
     );
     let pipeline = gst::parse::launch(&desc)
         .expect("parse")
         .downcast::<gst::Pipeline>()
         .unwrap();
     let scale = pipeline.by_name("scale").unwrap();
-    let stamps = |pad: &str| {
-        let seen = Arc::new(Mutex::new(Vec::<(
-            Option<gst::ClockTime>,
-            Option<gst::ClockTime>,
-        )>::new()));
-        let s = Arc::clone(&seen);
-        scale
-            .static_pad(pad)
-            .unwrap()
-            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
-                if let Some(gst::PadProbeData::Buffer(b)) = &info.data {
-                    s.lock().unwrap().push((b.pts(), b.duration()));
-                }
-                gst::PadProbeReturn::Ok
-            });
-        seen
-    };
-    let (before, after) = (stamps("sink"), stamps("src"));
+    let before = Arc::new(Mutex::new(Vec::<Stamp>::new()));
+    let after = Arc::new(Mutex::new(Vec::<Stamp>::new()));
+    let seen = Arc::clone(&before);
+    scale
+        .static_pad("sink")
+        .unwrap()
+        .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(gst::PadProbeData::Buffer(b)) = &mut info.data {
+                let b = b.make_mut();
+                b.set_dts(b.pts());
+                b.set_duration(DURATION);
+                seen.lock().unwrap().push((b.pts(), b.dts(), b.duration()));
+            }
+            gst::PadProbeReturn::Ok
+        });
+    let seen = Arc::clone(&after);
+    scale
+        .static_pad("src")
+        .unwrap()
+        .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            if let Some(gst::PadProbeData::Buffer(b)) = &info.data {
+                seen.lock().unwrap().push((b.pts(), b.dts(), b.duration()));
+            }
+            gst::PadProbeReturn::Ok
+        });
     pipeline.set_state(gst::State::Playing).expect("playing");
     let bus = pipeline.bus().unwrap();
+    let mut eos = false;
     for msg in bus.iter_timed(gst::ClockTime::from_seconds(30)) {
         match msg.view() {
-            gst::MessageView::Eos(..) => break,
+            gst::MessageView::Eos(..) => {
+                eos = true;
+                break;
+            }
             gst::MessageView::Error(e) => {
                 let _ = pipeline.set_state(gst::State::Null);
                 panic!("{}: {:?}", e.error(), e.debug());
@@ -533,13 +601,21 @@ fn scaled_buffers_keep_the_input_timestamps() {
     }
     let _ = pipeline.set_state(gst::State::Null);
     let (before, after) = (before.lock().unwrap(), after.lock().unwrap());
-    assert!(!after.is_empty(), "no scaled buffers reached the probe");
+    assert!(eos, "pipeline did not reach EOS");
+    assert_eq!(before.len(), FRAMES, "the source must deliver every frame");
+    assert_eq!(after.len(), FRAMES, "every frame must leave the scaler");
     assert_eq!(
         *before, *after,
-        "the scaled buffers must carry the input's PTS and duration"
+        "the scaled buffers must carry the input's PTS, DTS and duration"
     );
     assert!(
-        after.iter().all(|(pts, _)| pts.is_some()),
-        "a scaled buffer has no PTS"
+        after
+            .iter()
+            .all(|(pts, dts, dur)| pts.is_some() && dts.is_some() && *dur == Some(DURATION)),
+        "a scaled buffer lost its PTS, DTS or duration: {after:?}"
+    );
+    assert!(
+        after.windows(2).all(|w| w[0].0 < w[1].0),
+        "PTS must strictly increase across the scaled frames: {after:?}"
     );
 }
