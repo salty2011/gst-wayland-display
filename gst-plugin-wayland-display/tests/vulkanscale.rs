@@ -474,3 +474,72 @@ fn equal_size_is_passthrough() {
     assert!(eos, "pipeline did not reach EOS");
     assert!(passthrough, "equal in/out size must engage passthrough");
 }
+
+/// A scaled frame leaves with the PTS and duration it came in with. `prepare_output_buffer`
+/// is overridden, so GstBaseTransform copies no metadata: without the explicit stamp the
+/// frames carry no PTS, the RTP timestamps stop advancing and a browser drops the stream's
+/// frames as duplicates (quasar #981).
+#[test]
+#[ignore = "needs a GPU with vulkanh264enc; run via ci/harness.sh gpu"]
+fn scaled_buffers_keep_the_input_timestamps() {
+    init();
+    let Some(node) = render_node_for(&["nvidia", "amdgpu"]) else {
+        skip!("no nvidia or amd render node")
+    };
+    if !have("vulkanh264enc") {
+        skip!("no vulkanh264enc");
+    }
+    let desc = format!(
+        "waylanddisplaysrc render-node={node} vulkan=true num-buffers=30 \
+         ! video/x-raw(memory:VulkanImage),format=NV12,width=1920,height=1080,framerate=60/1 \
+         ! vulkanscale name=scale \
+         ! capsfilter caps=video/x-raw\\(memory:VulkanImage\\),format=NV12,width=1280,height=720 \
+         ! vulkanh264enc ! h264parse ! fakesink sync=false"
+    );
+    let pipeline = gst::parse::launch(&desc)
+        .expect("parse")
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+    let scale = pipeline.by_name("scale").unwrap();
+    let stamps = |pad: &str| {
+        let seen = Arc::new(Mutex::new(Vec::<(
+            Option<gst::ClockTime>,
+            Option<gst::ClockTime>,
+        )>::new()));
+        let s = Arc::clone(&seen);
+        scale
+            .static_pad(pad)
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+                if let Some(gst::PadProbeData::Buffer(b)) = &info.data {
+                    s.lock().unwrap().push((b.pts(), b.duration()));
+                }
+                gst::PadProbeReturn::Ok
+            });
+        seen
+    };
+    let (before, after) = (stamps("sink"), stamps("src"));
+    pipeline.set_state(gst::State::Playing).expect("playing");
+    let bus = pipeline.bus().unwrap();
+    for msg in bus.iter_timed(gst::ClockTime::from_seconds(30)) {
+        match msg.view() {
+            gst::MessageView::Eos(..) => break,
+            gst::MessageView::Error(e) => {
+                let _ = pipeline.set_state(gst::State::Null);
+                panic!("{}: {:?}", e.error(), e.debug());
+            }
+            _ => {}
+        }
+    }
+    let _ = pipeline.set_state(gst::State::Null);
+    let (before, after) = (before.lock().unwrap(), after.lock().unwrap());
+    assert!(!after.is_empty(), "no scaled buffers reached the probe");
+    assert_eq!(
+        *before, *after,
+        "the scaled buffers must carry the input's PTS and duration"
+    );
+    assert!(
+        after.iter().all(|(pts, _)| pts.is_some()),
+        "a scaled buffer has no PTS"
+    );
+}

@@ -345,10 +345,20 @@ impl BaseTransformImpl for VulkanScale {
             gst_base::subclass::base_transform::InputBuffer::Readable(b) => b.to_owned(),
             gst_base::subclass::base_transform::InputBuffer::Writable(b) => b.to_owned(),
         };
-        let out = self.scale(&inbuf).map_err(|e| {
+        let mut out = self.scale(&inbuf).map_err(|e| {
             gst::element_imp_error!(self, gst::ResourceError::Failed, ["{e}"]);
             gst::FlowError::Error
         })?;
+        // A subclass that overrides `prepare_output_buffer` gets no `copy_metadata` from
+        // GstBaseTransform: the buffer leaves with no PTS/DTS, so the encoder's output and the
+        // RTP payloader's timestamps stand still and a browser drops every frame but the first
+        // of each stretch as a duplicate (quasar #981: the picture froze while it kept decoding).
+        // `scale` hands back a fresh header copy, so it is ours to stamp.
+        if let Some(o) = out.get_mut() {
+            o.set_pts(inbuf.pts());
+            o.set_dts(inbuf.dts());
+            o.set_duration(inbuf.duration());
+        }
         Ok(gst_base::subclass::base_transform::PrepareOutputBufferSuccess::Buffer(out))
     }
 
